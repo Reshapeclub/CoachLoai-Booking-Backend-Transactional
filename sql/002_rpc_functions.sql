@@ -409,6 +409,13 @@ begin
   )
   select count(*)::int into v_inserted_weeks from inserted;
 
+  -- Zero weekly tokens for paused weeks
+  delete from tokens t
+  where t.member_id = v_membership.member_id
+    and t.source = 'weekly'
+    and t.week_start >= p_start_week
+    and t.week_start <= p_end_week_inclusive;
+
   for v_booking in
     select b.id as booking_id, b.member_id, b.session_id
     from bookings b

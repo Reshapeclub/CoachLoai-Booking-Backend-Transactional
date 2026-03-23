@@ -5,9 +5,20 @@ export const updateSessionTypeSchema = z.object({
   defaultCapacity: z.number().int().min(1).optional(),
   defaultDurationMins: z.union([z.literal(30), z.literal(45), z.literal(60)]).optional(),
 }).refine((v) => Object.keys(v).length > 0, { message: "At least one field must be provided" });
-export const createSessionSchema = z.object({ sessionTypeId: z.string().min(1), coachId: z.string().min(1), locationId: z.string().nullable().optional(), start: z.string().datetime(), durationMins: z.union([z.literal(30), z.literal(45), z.literal(60)]).optional(), capacity: z.number().int().min(1).optional() });
+export const createSessionSchema = z.object({
+  sessionTypeId: z.string().min(1),
+  coachId: z.string().min(1),
+  locationId: z.string().nullable().optional(),
+  start: z.string().datetime(),
+  durationMins: z.union([z.literal(30), z.literal(45), z.literal(60)]).optional(),
+  capacity: z.number().int().min(1).optional(),
+  allowOvertime: z.boolean().optional(),
+});
 export const setCapacitySchema = z.object({ capacity: z.number().int().min(1) });
-export const setCoachSchema = z.object({ newCoachId: z.string().min(1) });
+export const setCoachSchema = z.object({
+  newCoachId: z.string().min(1),
+  allowOvertime: z.boolean().optional(),
+});
 export const setSessionTypeSchema = z.object({ newSessionTypeId: z.string().min(1) });
 export const refundModeSchema = z.object({ refund: z.enum(["refund","charge"]) });
 export const createMembershipSchema = z.object({

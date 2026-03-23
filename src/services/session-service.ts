@@ -1,5 +1,6 @@
 import { supabaseAdmin } from "../db/supabase.js";
 import { HttpError } from "../lib/http-error.js";
+import { validateCoachForSession } from "./coach-roster-validator.js";
 
 export class SessionService {
   async listSessionTypes() {
@@ -64,27 +65,115 @@ export class SessionService {
     return data;
   }
 
-  async createSession(input: { sessionTypeId: string; tokenTypeId: string; coachUserId: string; locationId?: string|null; startAt: string; endAt: string; capacity: number; }) {
-    const { data, error } = await supabaseAdmin.from('sessions').insert({ session_type_id: input.sessionTypeId, token_type_id: input.tokenTypeId, coach_user_id: input.coachUserId, location_id: input.locationId ?? null, start_at: input.startAt, end_at: input.endAt, capacity: input.capacity }).select().single();
-    if (error) throw new HttpError(500, 'Failed to create session', error);
+  async createSession(input: {
+    sessionTypeId: string;
+    tokenTypeId: string;
+    coachUserId: string;
+    locationId?: string | null;
+    startAt: string;
+    endAt: string;
+    capacity: number;
+    allowOvertime?: boolean;
+  }) {
+    await validateCoachForSession({
+      coachUserId: input.coachUserId,
+      sessionTypeId: input.sessionTypeId,
+      locationId: input.locationId ?? null,
+      startAt: input.startAt,
+      endAt: input.endAt,
+      allowOvertime: input.allowOvertime,
+    });
+    const { data, error } = await supabaseAdmin
+      .from("sessions")
+      .insert({
+        session_type_id: input.sessionTypeId,
+        token_type_id: input.tokenTypeId,
+        coach_user_id: input.coachUserId,
+        location_id: input.locationId ?? null,
+        start_at: input.startAt,
+        end_at: input.endAt,
+        capacity: input.capacity,
+      })
+      .select()
+      .single();
+    if (error) throw new HttpError(500, "Failed to create session", error);
     return data;
   }
 
   async setCapacity(sessionId: string, capacity: number) {
-    const { data, error } = await supabaseAdmin.from('sessions').update({ capacity }).eq('id', sessionId).select().single();
-    if (error) throw new HttpError(500, 'Failed to update capacity', error);
+    const { count, error: countErr } = await supabaseAdmin
+      .from("bookings")
+      .select("*", { count: "exact", head: true })
+      .eq("session_id", sessionId)
+      .eq("status", "booked");
+    if (countErr) throw new HttpError(500, "Failed to check booked count", countErr);
+    const bookedCount = count ?? 0;
+    if (capacity < bookedCount)
+      throw new HttpError(400, `Capacity cannot be less than current booked count (${bookedCount})`);
+    const { data, error } = await supabaseAdmin
+      .from("sessions")
+      .update({ capacity })
+      .eq("id", sessionId)
+      .select()
+      .single();
+    if (error) throw new HttpError(500, "Failed to update capacity", error);
     return data;
   }
 
-  async setCoach(sessionId: string, coachUserId: string) {
-    const { data, error } = await supabaseAdmin.from('sessions').update({ coach_user_id: coachUserId }).eq('id', sessionId).select().single();
-    if (error) throw new HttpError(500, 'Failed to update coach', error);
+  async setCoach(
+    sessionId: string,
+    coachUserId: string,
+    opts?: { allowOvertime?: boolean }
+  ) {
+    const { data: session, error: fetchErr } = await supabaseAdmin
+      .from("sessions")
+      .select("session_type_id, location_id, start_at, end_at")
+      .eq("id", sessionId)
+      .single();
+    if (fetchErr || !session)
+      throw new HttpError(404, "Session not found");
+    await validateCoachForSession({
+      coachUserId,
+      sessionTypeId: session.session_type_id,
+      locationId: session.location_id,
+      startAt: session.start_at,
+      endAt: session.end_at,
+      excludeSessionId: sessionId,
+      allowOvertime: opts?.allowOvertime,
+    });
+    const { data, error } = await supabaseAdmin
+      .from("sessions")
+      .update({ coach_user_id: coachUserId })
+      .eq("id", sessionId)
+      .select()
+      .single();
+    if (error) throw new HttpError(500, "Failed to update coach", error);
     return data;
   }
 
   async setSessionType(sessionId: string, sessionTypeId: string, tokenTypeId: string) {
-    const { data, error } = await supabaseAdmin.from('sessions').update({ session_type_id: sessionTypeId, token_type_id: tokenTypeId }).eq('id', sessionId).select().single();
-    if (error) throw new HttpError(500, 'Failed to update session type', error);
+    const { data: session, error: fetchErr } = await supabaseAdmin
+      .from("sessions")
+      .select("coach_user_id, location_id, start_at, end_at")
+      .eq("id", sessionId)
+      .single();
+    if (fetchErr || !session)
+      throw new HttpError(404, "Session not found");
+    await validateCoachForSession({
+      coachUserId: session.coach_user_id,
+      sessionTypeId,
+      locationId: session.location_id,
+      startAt: session.start_at,
+      endAt: session.end_at,
+      excludeSessionId: sessionId,
+    });
+    const { data, error } = await supabaseAdmin
+      .from("sessions")
+      .update({ session_type_id: sessionTypeId, token_type_id: tokenTypeId })
+      .eq("id", sessionId)
+      .select()
+      .single();
+    if (error) throw new HttpError(500, "Failed to update session type", error);
     return data;
   }
 
