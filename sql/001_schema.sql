@@ -31,6 +31,19 @@ create table if not exists profiles (
   created_at timestamptz not null default now()
 );
 
+do $$
+begin
+  alter table profiles add column if not exists location_id uuid references locations(id);
+  if not exists (select 1 from information_schema.columns where table_name = 'profiles' and column_name = 'full_name') then
+    alter table profiles add column full_name text generated always as (trim(coalesce(first_name, '') || ' '::text || coalesce(last_name, ''))) stored;
+  end if;
+  alter table profiles drop constraint if exists profiles_role_check;
+  alter table profiles add constraint profiles_role_check check (
+    role = any (array['member'::text, 'coach'::text, 'admin'::text])
+  );
+exception when others then null;
+end $$;
+
 create table if not exists member_memberships (
   id uuid not null default gen_random_uuid(),
   member_id uuid not null,

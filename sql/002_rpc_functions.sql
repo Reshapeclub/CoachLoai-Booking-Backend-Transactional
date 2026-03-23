@@ -158,7 +158,9 @@ begin
   values ('member', p_member_id, 'booking.create', jsonb_build_object('bookingId', v_booking_id, 'sessionId', v_session.id));
 
   insert into notifications(member_id, channel, type, payload)
-  values (p_member_id, 'in_app', 'booking_confirmed', jsonb_build_object('bookingId', v_booking_id, 'sessionId', v_session.id));
+  values
+    (p_member_id, 'in_app', 'booking_confirmed', jsonb_build_object('bookingId', v_booking_id, 'sessionId', v_session.id)),
+    (p_member_id, 'email', 'booking_confirmed', jsonb_build_object('bookingId', v_booking_id, 'sessionId', v_session.id));
 
   return jsonb_build_object('ok', true, 'bookingId', v_booking_id, 'sessionId', v_session.id, 'tokenId', v_token_id, 'tokenWeekStart', v_token_week_start);
 end;
@@ -180,6 +182,9 @@ begin
   if (extract(epoch from (v_session.start_at - p_now)) / 3600.0) <= 12 then
     insert into notifications(member_id, channel, type, payload)
     select w.member_id, 'in_app', 'waitlist_space_available', jsonb_build_object('sessionId', p_session_id)
+    from waiting_list_entries w where w.session_id = p_session_id;
+    insert into notifications(member_id, channel, type, payload)
+    select w.member_id, 'email', 'waitlist_space_available', jsonb_build_object('sessionId', p_session_id)
     from waiting_list_entries w where w.session_id = p_session_id;
     return jsonb_build_object('ok', true, 'mode', 'notify_only');
   end if;
@@ -228,7 +233,9 @@ begin
   values ('member', p_member_id, 'booking.cancel', jsonb_build_object('bookingId', v_booking.id, 'refundApplied', v_refund));
 
   insert into notifications(member_id, channel, type, payload)
-  values (p_member_id, 'in_app', 'booking_cancelled', jsonb_build_object('bookingId', v_booking.id, 'refundApplied', v_refund));
+  values
+    (p_member_id, 'in_app', 'booking_cancelled', jsonb_build_object('bookingId', v_booking.id, 'refundApplied', v_refund)),
+    (p_member_id, 'email', 'booking_cancelled', jsonb_build_object('bookingId', v_booking.id, 'refundApplied', v_refund));
 
   v_waitlist_result := clm_process_waitlist_after_opening(v_session.id, p_now);
   return jsonb_build_object('ok', true, 'bookingId', v_booking.id, 'refundApplied', v_refund, 'waitlist', v_waitlist_result);
@@ -418,7 +425,9 @@ begin
     insert into audit_logs(actor_type, actor_id, action, meta)
     values ('system', null, 'booking.cancelled_by_pause', jsonb_build_object('bookingId', v_booking.booking_id, 'membershipId', p_membership_id, 'refundApplied', false));
     insert into notifications(member_id, channel, type, payload)
-    values (v_booking.member_id, 'in_app', 'booking_cancelled', jsonb_build_object('bookingId', v_booking.booking_id, 'refundApplied', false, 'reason', 'membership_paused'));
+    values
+      (v_booking.member_id, 'in_app', 'booking_cancelled', jsonb_build_object('bookingId', v_booking.booking_id, 'refundApplied', false, 'reason', 'membership_paused')),
+      (v_booking.member_id, 'email', 'booking_cancelled', jsonb_build_object('bookingId', v_booking.booking_id, 'refundApplied', false, 'reason', 'membership_paused'));
   end loop;
 
   foreach v_sid in array (select distinct unnest(v_session_ids))

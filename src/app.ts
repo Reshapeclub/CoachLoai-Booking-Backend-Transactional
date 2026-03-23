@@ -5,6 +5,7 @@ import routes from "./routes/index.js";
 import { env } from "./config/env.js";
 import { errorHandler } from "./middleware/error-handler.js";
 import { runWeeklyTokenGeneration } from "./jobs/weekly-token-generation.js";
+import { runNotificationSend } from "./jobs/notification-send.js";
 
 const app = express();
 app.use(cors());
@@ -27,6 +28,15 @@ cron.schedule("0 0 * * 1", async () => {
     console.log("[cron] Weekly token generation completed");
   } catch (err) {
     console.error("[cron] Weekly token generation failed:", err);
+  }
+});
+
+// Notification send: every 30 seconds (email queue)
+cron.schedule("*/30 * * * * *", async () => {
+  try {
+    //await runNotificationSend();
+  } catch (err) {
+    console.error("[cron] Notification send failed:", err);
   }
 });
 

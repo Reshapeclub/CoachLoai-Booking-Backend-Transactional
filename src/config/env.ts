@@ -17,6 +17,7 @@ export const env = {
   STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY ?? "",
   STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET ?? "",
   EMAIL_PROVIDER_API_KEY: process.env.EMAIL_PROVIDER_API_KEY ?? "",
+  EMAIL_FROM: process.env.EMAIL_FROM ?? "noreply@example.com",
   PUSH_PROVIDER_API_KEY: process.env.PUSH_PROVIDER_API_KEY ?? "",
   JWT_SECRET: process.env.JWT_SECRET ?? "",
 } as const;
