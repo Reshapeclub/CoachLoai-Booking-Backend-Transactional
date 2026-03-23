@@ -1,0 +1,29 @@
+{
+  "name": "clm-booking-backend-transactional",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/app.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/app.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.56.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "jose": "^6.2.2",
+    "node-cron": "^4.2.1",
+    "stripe": "^18.3.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.3.0",
+    "@types/node-cron": "^3.0.11",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
+}
