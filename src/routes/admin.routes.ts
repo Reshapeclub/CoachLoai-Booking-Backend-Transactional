@@ -23,6 +23,7 @@ import {
   addCoachAvailabilitySchema,
   addCoachHolidaySchema,
   addCoachSessionTypeSchema,
+  adminBookingsListQuerySchema,
 } from "../validators/admin.schemas.js";
 import { SessionService } from "../services/session-service.js";
 import { CoachService } from "../services/coach-service.js";
@@ -53,6 +54,9 @@ router.patch('/sessions/:sessionId/capacity', async (req,res,next)=>{ try { cons
 router.patch('/sessions/:sessionId/coach', async (req,res,next)=>{ try { const body=validate(setCoachSchema, req.body); res.json({ ok:true, data: await sessionService.setCoach(req.params.sessionId, body.newCoachId, { allowOvertime: body.allowOvertime }) }); } catch(e){ next(e);} });
 router.patch('/sessions/:sessionId/type', async (req,res,next)=>{ try { const body=validate(setSessionTypeSchema, req.body); const { data: st, error } = await supabaseAdmin.from('session_types').select('*').eq('id', body.newSessionTypeId).single(); if (error || !st) throw new HttpError(404, 'Session type not found'); res.json({ ok:true, data: await sessionService.setSessionType(req.params.sessionId, body.newSessionTypeId, st.token_type_id) }); } catch(e){ next(e);} });
 router.post('/sessions/:sessionId/cancel', async (req,res,next)=>{ try { const body=validate(refundModeSchema, req.body); res.json(await bookingService.adminCancelSession({ sessionId:req.params.sessionId, refund:body.refund, adminId:req.user!.id })); } catch(e){ next(e);} });
+// Admin fetch bookings routes
+router.get('/bookings', async (req,res,next)=>{ try { const q=validate(adminBookingsListQuerySchema, req.query); res.json({ ok:true, data: await bookingService.listAdminBookings({ from:q.from, to:q.to, memberId:q.memberId, sessionId:q.sessionId, status:q.status, limit:q.limit }) }); } catch(e){ next(e);} });
+router.get('/bookings/:bookingId', async (req,res,next)=>{ try { res.json({ ok:true, data: await bookingService.getAdminBookingById(req.params.bookingId) }); } catch(e){ next(e);} });
 router.post('/bookings/:bookingId/remove-member', async (req,res,next)=>{ try { const body=validate(refundModeSchema, req.body); res.json(await bookingService.adminRemoveMember({ bookingId:req.params.bookingId, refund:body.refund, adminId:req.user!.id })); } catch(e){ next(e);} });
 // Admin membership routes
 router.post('/memberships', async (req,res,next)=>{ try { const body=validate(createMembershipSchema, req.body); res.json({ ok:true, data: await membershipService.createMembership({ memberId: body.memberId, mode: body.mode, currentPackage: body.currentPackage, startDate: body.startDate, endDate: body.endDate }) }); } catch(e){ next(e);} });

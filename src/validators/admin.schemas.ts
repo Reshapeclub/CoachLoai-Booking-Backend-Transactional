@@ -83,3 +83,12 @@ export const addCoachSessionTypeSchema = z.object({
   coachUserId: z.string().uuid(),
   sessionTypeId: z.string().uuid(),
 });
+
+export const adminBookingsListQuerySchema = z.object({
+  from: z.string().datetime().optional(),
+  to: z.string().datetime().optional(),
+  memberId: z.string().uuid().optional(),
+  sessionId: z.string().uuid().optional(),
+  status: z.enum(["booked", "cancelled", "no_show"]).optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional(),
+});

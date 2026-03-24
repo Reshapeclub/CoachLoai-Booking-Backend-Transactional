@@ -31,10 +31,10 @@ export class BookingService {
       await Promise.all([
         activeMembershipId
           ? supabaseAdmin
-              .from("member_memberships")
-              .select("*")
-              .eq("id", activeMembershipId)
-              .single()
+            .from("member_memberships")
+            .select("*")
+            .eq("id", activeMembershipId)
+            .single()
           : Promise.resolve({ data: null }),
         supabaseAdmin
           .from("bookings")
@@ -163,6 +163,57 @@ export class BookingService {
     let query = supabaseAdmin.from("bookings").select("*, sessions(*, session_types(*))").eq("member_id", memberId).order("booked_at", { ascending: false });
     if (status === "upcoming") query = query.eq("status", "booked");
     if (status === "past") query = query.neq("status", "booked");
+    const { data, error } = await query;
+    if (error) throw new HttpError(500, "Failed to fetch bookings", error);
+    return data ?? [];
+  }
+
+  async getAdminBookingById(bookingId: string) {
+    const { data, error } = await supabaseAdmin
+      .from("bookings")
+      .select(
+        "*, sessions(*, session_types(*)), profiles!bookings_member_id_fkey(id, full_name, email, first_name, last_name, phone, role, location_id)"
+      )
+      .eq("id", bookingId)
+      .maybeSingle();
+    if (error) throw new HttpError(500, "Failed to fetch booking", error);
+    if (!data) throw new HttpError(404, "Booking not found");
+    return data;
+  }
+
+  async listAdminBookings(filters: {
+    from?: string;
+    to?: string;
+    memberId?: string;
+    sessionId?: string;
+    status?: "booked" | "cancelled" | "no_show";
+    limit?: number;
+  }) {
+    const limit = Math.min(filters.limit ?? 200, 500);
+    let sessionIdsInRange: string[] | undefined;
+    if (filters.from != null || filters.to != null) {
+      let sq = supabaseAdmin.from("sessions").select("id");
+      if (filters.from) sq = sq.gte("start_at", filters.from);
+      if (filters.to) sq = sq.lte("start_at", filters.to);
+      const { data: sessRows, error: sessErr } = await sq;
+      if (sessErr) throw new HttpError(500, "Failed to resolve sessions for date filter", sessErr);
+      sessionIdsInRange = (sessRows ?? []).map((r) => (r as { id: string }).id);
+      if (sessionIdsInRange.length === 0) return [];
+    }
+
+    let query = supabaseAdmin
+      .from("bookings")
+      .select(
+        "*, sessions(*, session_types(*)), profiles!bookings_member_id_fkey(id, full_name, email, first_name, last_name, phone, role, location_id)"
+      )
+      .order("booked_at", { ascending: false })
+      .limit(limit);
+
+    if (filters.memberId) query = query.eq("member_id", filters.memberId);
+    if (filters.sessionId) query = query.eq("session_id", filters.sessionId);
+    if (filters.status) query = query.eq("status", filters.status);
+    if (sessionIdsInRange) query = query.in("session_id", sessionIdsInRange);
+
     const { data, error } = await query;
     if (error) throw new HttpError(500, "Failed to fetch bookings", error);
     return data ?? [];
