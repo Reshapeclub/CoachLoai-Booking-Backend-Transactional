@@ -5,6 +5,7 @@ import { supabaseAdmin } from "../db/supabase.js";
 
 export class StripeService {
   private stripe = env.STRIPE_SECRET_KEY ? new Stripe(env.STRIPE_SECRET_KEY) : null;
+
   async createCheckoutSession(input: { memberId: string; membershipId: string; tokenTypeId: string; quantity: number; }) {
     if (!this.stripe) throw new HttpError(500, 'Stripe is not configured');
     const { data: sessionType, error: sessionTypeError } = await supabaseAdmin
@@ -45,6 +46,7 @@ export class StripeService {
       }],
       metadata: { memberId: input.memberId, membershipId: input.membershipId, tokenTypeId: input.tokenTypeId, quantity: String(input.quantity) }
     });
+    console.log(session, "<<<<<<<<<<<<<<<<SESSION_CREATED");
     return session;
   }
 }

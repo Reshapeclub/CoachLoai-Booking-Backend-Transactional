@@ -315,6 +315,7 @@ as $$
 declare
   v_booking record;
   v_count int := 0;
+  v_session_updated int;
 begin
   if p_refund not in ('refund','charge') then raise exception 'Invalid refund mode'; end if;
   for v_booking in select * from bookings where session_id = p_session_id and status = 'booked' for update loop
@@ -327,6 +328,13 @@ begin
   end loop;
 
   delete from waiting_list_entries where session_id = p_session_id;
+
+  update sessions set is_cancelled = true where id = p_session_id;
+  get diagnostics v_session_updated = row_count;
+  if v_session_updated = 0 then
+    raise exception 'Session not found';
+  end if;
+
   insert into audit_logs(actor_type, actor_id, action, meta)
   values ('admin', p_admin_id, 'session.cancel', jsonb_build_object('sessionId', p_session_id, 'refundMode', p_refund, 'removedBookings', v_count));
 

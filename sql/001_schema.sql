@@ -25,24 +25,72 @@ create table if not exists locations (
 create table if not exists profiles (
   id uuid primary key default gen_random_uuid(),
   role text not null check (role in ('member','coach','admin')),
+  first_name text not null,
+  last_name text not null,
   full_name text not null,
-  email text unique,
+  dob date not null,
+  sex text not null,
+  photo_url text,
+  marketing_opt_in boolean default false,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  result boolean,
+  "answersSectionsIds" jsonb,
+  adherence_rate integer default 1,
+  workouts_completed integer default 0,
+  hydration_delta_percent integer default 0,
+  email text not null,
+  notes jsonb,
+  allowed_food_groups jsonb,
+  last_check_in_date timestamptz default now(),
+  phone text,
+  "isReviewUser" boolean not null default false,
   location_id uuid references locations(id),
-  created_at timestamptz not null default now()
+  constraint profiles_email_key unique (email),
+  constraint profiles_sex_check check (sex = any (array['male'::text, 'female'::text]))
 );
 
 do $$
 begin
+  alter table profiles add column if not exists role text;
+  alter table profiles add column if not exists full_name text;
   alter table profiles add column if not exists location_id uuid references locations(id);
-  if not exists (select 1 from information_schema.columns where table_name = 'profiles' and column_name = 'full_name') then
-    alter table profiles add column full_name text generated always as (trim(coalesce(first_name, '') || ' '::text || coalesce(last_name, ''))) stored;
+  update profiles set role = coalesce(role, 'member') where role is null;
+
+  update profiles
+  set full_name = trim(both from concat_ws(' ', nullif(trim(coalesce(first_name, '')), ''), nullif(trim(coalesce(last_name, '')), '')))
+  where full_name is null or btrim(coalesce(full_name, '')) = '';
+  if not exists (select 1 from pg_constraint where conname = 'profiles_role_check') then
+    alter table profiles add constraint profiles_role_check check (
+      role = any (array['member'::text, 'coach'::text, 'admin'::text])
+    );
   end if;
-  alter table profiles drop constraint if exists profiles_role_check;
-  alter table profiles add constraint profiles_role_check check (
-    role = any (array['member'::text, 'coach'::text, 'admin'::text])
-  );
 exception when others then null;
 end $$;
+
+-- Keep full_name in sync whenever first_name / last_name are set or changed (inserts + those updates).
+create or replace function clm_profiles_sync_full_name()
+returns trigger
+language plpgsql
+as $$
+declare
+  v text;
+begin
+  v := trim(both from concat_ws(
+    ' ',
+    nullif(trim(coalesce(NEW.first_name, '')), ''),
+    nullif(trim(coalesce(NEW.last_name, '')), '')
+  ));
+  NEW.full_name := case when v = '' then '-' else v end;
+  return NEW;
+end;
+$$;
+
+drop trigger if exists profiles_sync_full_name on profiles;
+create trigger profiles_sync_full_name
+  before insert or update of first_name, last_name on profiles
+  for each row
+  execute procedure clm_profiles_sync_full_name();
 
 create table if not exists member_memberships (
   id uuid not null default gen_random_uuid(),
@@ -85,6 +133,10 @@ create table if not exists session_types (
   token_type_id uuid not null unique,
   default_capacity int not null check (default_capacity > 0),
   default_duration_mins int not null check (default_duration_mins in (30,45,60)),
+  color text null,
+  icon text null,
+  display_order int not null default 0 check (display_order >= 0),
+  is_active boolean not null default true,
   created_at timestamptz not null default now()
 );
 
@@ -149,6 +201,8 @@ create table if not exists sessions (
   end_at timestamptz not null,
   capacity int not null check (capacity > 0),
   created_at timestamptz not null default now(),
+  is_cancelled boolean not null default false,
+  is_online boolean not null default false,
   check (end_at > start_at)
 );
 create index if not exists idx_sessions_start_at on sessions(start_at);
@@ -200,6 +254,7 @@ create table if not exists track_meetings (
   booked_at timestamptz not null default now(),
   meeting_start timestamptz not null,
   meeting_end timestamptz not null,
+  status text not null check (status in ('booked','cancelled','no_show')),
   check (meeting_end > meeting_start)
 );
 

@@ -17,11 +17,11 @@ app.use((req, res, next) => {
   }
   return express.json()(req, res, next);
 });
-app.get('/health', (_req,res)=> res.json({ ok:true, service:'clm-booking-backend-transactional' }));
+app.get('/health', (_req, res) => res.json({ ok: true, service: 'clm-booking-backend-transactional' }));
 app.use(routes);
 app.use(errorHandler);
 
-// Weekly token generation: every Monday at 00:00 UTC
+// Weekly token generation: every Monday at 00:00 UK time
 cron.schedule("0 0 * * 1", async () => {
   try {
     await runWeeklyTokenGeneration();
@@ -29,15 +29,16 @@ cron.schedule("0 0 * * 1", async () => {
   } catch (err) {
     console.error("[cron] Weekly token generation failed:", err);
   }
-});
+}, { timezone: "Europe/London" });
 
 // Notification send: every 30 seconds (email queue)
 cron.schedule("*/30 * * * * *", async () => {
   try {
     //await runNotificationSend();
+    //console.log("[cron] Notification send completed");
   } catch (err) {
     console.error("[cron] Notification send failed:", err);
   }
 });
 
-app.listen(env.PORT, ()=> console.log(`CLM Booking Backend Transactional running on port ${env.PORT}`));
+app.listen(env.PORT, () => console.log(`CLM Booking Backend Transactional running on port ${env.PORT}`));

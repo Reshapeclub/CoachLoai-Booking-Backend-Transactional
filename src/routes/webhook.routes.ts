@@ -18,7 +18,6 @@ router.post("/stripe", async (req, res, next) => {
     if (!env.STRIPE_SECRET_KEY) throw new HttpError(500, "Stripe not configured");
     if (!env.STRIPE_WEBHOOK_SECRET) throw new HttpError(500, "Stripe webhook secret not configured");
 
-    // With `express.raw`, req.body should be a Buffer.
     const rawBody = req.body;
     const bodyBuffer = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(rawBody);
 
@@ -28,24 +27,22 @@ router.post("/stripe", async (req, res, next) => {
       getStripeSignature(req),
       env.STRIPE_WEBHOOK_SECRET
     );
-
-    // Only handle checkout completion events (minimal set for now).
+    console.log(event.type, "<<<<<<<<<<<<<<<<EVENT");
     switch (event.type) {
       case "checkout.session.completed":
       case "checkout.session.async_payment_succeeded": {
         const session = event.data.object as any;
+        console.log(session, "<<<<<<<<<<<<<<<<SESSION");
         const metadata = session?.metadata ?? {};
-
+        console.log(metadata, "<<<<<<<<<<<<<<<<METADATA");
         const memberId = metadata.memberId;
         const membershipId = metadata.membershipId;
         const tokenTypeId = metadata.tokenTypeId;
         const quantity = Number(metadata.quantity);
         const stripeSessionId = session?.id;
-
         if (!memberId || !membershipId || !tokenTypeId || !stripeSessionId || !Number.isFinite(quantity)) {
           throw new HttpError(400, "Missing required metadata on Stripe checkout session");
         }
-
         await tokenService.issuePurchasedTokensFromStripeSession({
           stripeSessionId,
           memberId,
@@ -57,7 +54,6 @@ router.post("/stripe", async (req, res, next) => {
         break;
       }
       default:
-        // Ignore events we don't care about for now.
         break;
     }
 
