@@ -8,12 +8,6 @@ begin
   if not exists (select 1 from pg_type where typname = 'plan_tier') then
     create type plan_tier as enum ('structure', 'pace', 'performance');
   end if;
-  if not exists (select 1 from pg_type where typname = 'plan_type') then
-    create type plan_type as enum ('fixed', 'rolling');
-  end if;
-  if not exists (select 1 from pg_type where typname = 'plan_status') then
-    create type plan_status as enum ('active', 'queued', 'completed', 'cancelled');
-  end if;
 end $$;
 
 create table if not exists locations (
@@ -202,10 +196,17 @@ create table if not exists sessions (
   capacity int not null check (capacity > 0),
   created_at timestamptz not null default now(),
   is_cancelled boolean not null default false,
-  is_online boolean not null default false,
+  "is_online" boolean not null default false,
   check (end_at > start_at)
 );
 create index if not exists idx_sessions_start_at on sessions(start_at);
+
+do $$
+begin
+  alter table sessions add column if not exists is_cancelled boolean not null default false;
+  alter table sessions add column if not exists "is_online" boolean not null default false;
+exception when others then null;
+end $$;
 
 create table if not exists tokens (
   id uuid primary key default gen_random_uuid(),
