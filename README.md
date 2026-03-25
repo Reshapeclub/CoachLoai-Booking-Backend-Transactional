@@ -16,8 +16,5 @@ Implemented:
 - notification queue writes inside transactional flows
 
 Still needed before live production:
-- real Supabase JWT verification
-- raw-body Stripe webhook verification
-- production notification provider integration
 - test coverage and load testing
 - exact UI payload refinements if your app differs

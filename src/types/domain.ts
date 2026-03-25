@@ -4,6 +4,6 @@ export type MeetingTier = "performance" | "pace" | "structure";
 
 export interface RequestUser {
   id: string;
-  role: Role;
+  role?: Role;
   email?: string;
 }

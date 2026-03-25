@@ -1,6 +1,6 @@
 import { Router } from "express";
-import { requireAuth } from "../middleware/auth.js";
-import { requireRole } from "../middleware/roles.js";
+import { requireAdminAuth } from "../middleware/auth.js";
+import { requireAdminTableAccess } from "../middleware/roles.js";
 import { validate } from "../utils/validate.js";
 import {
   createSessionTypeSchema,
@@ -40,7 +40,7 @@ const membershipService = new MembershipService();
 const tokenService = new TokenService();
 const bookingService = new BookingService();
 
-router.use(requireAuth, requireRole('admin'));
+router.use(requireAdminAuth, requireAdminTableAccess());
 // Admin session types routes
 router.get('/session-types', async (req,res,next)=>{ try { res.json({ ok:true, data: await sessionService.listSessionTypes() }); } catch(e){ next(e);} });
 router.post('/session-types', async (req,res,next)=>{ try { const body=validate(createSessionTypeSchema, req.body); res.json({ ok:true, data: await sessionService.createSessionType(body) }); } catch(e){ next(e);} });

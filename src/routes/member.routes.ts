@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth.js";
-import { requireRole } from "../middleware/roles.js";
+import { requireProfileRole } from "../middleware/roles.js";
 import { validate } from "../utils/validate.js";
 import { createBookingSchema, joinWaitlistSchema, purchaseTokensCheckoutSchema, createMeetingSchema } from "../validators/member.schemas.js";
 import { BookingService } from "../services/booking-service.js";
@@ -16,7 +16,7 @@ const stripeService = new StripeService();
 const meetingService = new MeetingService();
 const sessionService = new SessionService();
 
-router.use(requireAuth, requireRole('member'));
+router.use(requireAuth, requireProfileRole('member'));
 
 // Member booking routes
 router.get('/booking-context', async (req, res, next) => { try { res.json({ ok: true, data: await bookingService.getBookingContext(req.user!.id) }); } catch (e) { next(e); } });

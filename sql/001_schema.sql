@@ -18,7 +18,7 @@ create table if not exists locations (
 
 create table if not exists profiles (
   id uuid primary key default gen_random_uuid(),
-  role text not null check (role in ('member','coach','admin')),
+  role text not null default 'member' check (role in ('member','coach','admin')),
   first_name text not null,
   last_name text not null,
   full_name text not null,
@@ -46,7 +46,8 @@ create table if not exists profiles (
 
 do $$
 begin
-  alter table profiles add column if not exists role text;
+  alter table profiles add column if not exists role text default 'member';
+  alter table profiles alter column role set default 'member';
   alter table profiles add column if not exists full_name text;
   alter table profiles add column if not exists location_id uuid references locations(id);
   update profiles set role = coalesce(role, 'member') where role is null;
