@@ -32,6 +32,7 @@ import { TokenService } from "../services/token-service.js";
 import { BookingService } from "../services/booking-service.js";
 import { supabaseAdmin } from "../db/supabase.js";
 import { HttpError } from "../lib/http-error.js";
+import { runWeeklyTokenGeneration } from "../jobs/weekly-token-generation.js";
 
 const router = Router();
 const sessionService = new SessionService();
@@ -67,6 +68,8 @@ router.post('/memberships/:membershipId/terminate', async (req,res,next)=>{ try 
 router.post('/memberships/:membershipId/session-allowances', async (req,res,next)=>{ try { const body=validate(addSessionAllowanceSchema, req.body); res.json({ ok:true, data: await membershipService.addSessionAllowance({ membershipId: req.params.membershipId, tokenTypeId: body.tokenTypeId, weeklyAllowance: body.weeklyAllowance }) }); } catch(e){ next(e);} });
 router.post('/memberships/:membershipId/session-types/:sessionTypeId', async (req,res,next)=>{ try { const { membershipId, sessionTypeId } = validate(addAllowedSessionTypeSchema, { membershipId: req.params.membershipId, sessionTypeId: req.params.sessionTypeId }); res.json({ ok:true, data: await membershipService.addAllowedSessionType({ membershipId, sessionTypeId }) }); } catch(e){ next(e);} });
 router.post('/tokens/issue', async (req,res,next)=>{ try { const body=validate(issueTokensSchema, req.body); res.json({ ok:true, data: await tokenService.issueAdminTokens({ memberId:body.memberId, tokenTypeId:body.tokenTypeId, quantity:body.quantity, expiryAt:body.expiry }) }); } catch(e){ next(e);} });
+// Admin token generation routes for testing will be removed later
+router.get('/tokens/generate-weekly', async (req,res,next)=>{ try { const result = await runWeeklyTokenGeneration(); res.json({ ok:true, data: result }); } catch(e){ next(e);} });
 // Admin member routes
 router.get('/members/:memberId/tokens', async (req,res,next)=>{ try { res.json({ ok:true, data: await tokenService.getWallet(req.params.memberId) }); } catch(e){ next(e);} });
 router.post('/members/:memberId/session-types/:sessionTypeId', async (req,res,next)=>{ try { const { memberId, sessionTypeId } = validate(addMemberSessionTagSchema, req.params); const { data, error } = await supabaseAdmin.from('member_session_tags').upsert({ member_id: memberId, session_type_id: sessionTypeId }, { onConflict: 'member_id,session_type_id' }).select().single(); if (error) throw new HttpError(500, 'Failed to add session type for member', error); res.json({ ok: true, data }); } catch(e){ next(e);} });
