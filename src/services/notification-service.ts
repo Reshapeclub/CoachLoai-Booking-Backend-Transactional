@@ -1,5 +1,6 @@
 import { supabaseAdmin } from "../db/supabase.js";
 import { sendEmail, isEmailConfigured } from "./email-provider.js";
+import { env } from "../config/env.js";
 
 type NotificationType =
   | "booking_confirmed"
@@ -13,10 +14,21 @@ function buildEmailContent(
 ): { subject: string; text: string } {
   const name = typeof fullName === "string" && fullName.trim() ? fullName.trim() : "there";
   const greeting = `Hi ${name},\n\n`;
+  const bookingId = typeof payload.bookingId === "string" && payload.bookingId.trim() ? payload.bookingId.trim() : "";
+  const addToCalendarUrl =
+    typeof payload.addToCalendarUrl === "string" && payload.addToCalendarUrl.trim()
+      ? payload.addToCalendarUrl.trim()
+      : bookingId
+        ? `${env.APP_BASE_URL.replace(/\/$/, "")}/calendar/booking/${encodeURIComponent(bookingId)}.ics`
+        : "";
   let body: string;
   switch (type) {
     case "booking_confirmed":
-      body = `Your booking has been confirmed.\n\nBooking ID: ${payload.bookingId ?? "—"}\nSession ID: ${payload.sessionId ?? "—"}`;
+      body = `Your booking has been confirmed.\n\nBooking ID: ${payload.bookingId ?? "—"}\nSession ID: ${payload.sessionId ?? "—"}${
+        addToCalendarUrl
+          ? `\n\nAdd to calendar: ${addToCalendarUrl}`
+          : ""
+      }`;
       break;
     case "booking_cancelled":
       body = `Your booking has been cancelled.\n\nBooking ID: ${payload.bookingId ?? "—"}\nRefund applied: ${payload.refundApplied === true ? "Yes" : "No"}${payload.reason ? `\nReason: ${payload.reason}` : ""}`;
