@@ -92,3 +92,60 @@ export const adminBookingsListQuerySchema = z.object({
   status: z.enum(["booked", "cancelled", "no_show"]).optional(),
   limit: z.coerce.number().int().min(1).max(500).optional(),
 });
+
+export const createMeetingTypeSchema = z.object({
+  name: z.string().min(1),
+  code: z.string().min(1),
+  durationMins: z.number().int().min(1),
+  description: z.string().optional(),
+  color: z.string().optional(),
+  icon: z.string().optional(),
+  displayOrder: z.number().int().min(0).optional(),
+  isActive: z.boolean().optional(),
+});
+
+export const updateMeetingTypeSchema = z
+  .object({
+    name: z.string().min(1).optional(),
+    code: z.string().min(1).optional(),
+    durationMins: z.number().int().min(1).optional(),
+    description: z.string().nullable().optional(),
+    color: z.string().nullable().optional(),
+    icon: z.string().nullable().optional(),
+    displayOrder: z.number().int().min(0).optional(),
+    isActive: z.boolean().optional(),
+  })
+  .refine((v) => Object.keys(v).length > 0, { message: "At least one field must be provided" });
+
+export const adminMeetingSlotsQuerySchema = z.object({
+  meetingTypeId: z.string().uuid().optional(),
+  locationId: z.string().uuid().optional(),
+  from: z.string().datetime().optional(),
+  to: z.string().datetime().optional(),
+});
+
+export const createMeetingSlotSchema = z
+  .object({
+    meetingTypeId: z.string().uuid(),
+    locationId: z.string().uuid(),
+    slotStart: z.string().datetime(),
+    slotEnd: z.string().datetime(),
+    capacity: z.number().int().min(1).optional(),
+    isActive: z.boolean().optional(),
+  })
+  .refine((v) => new Date(v.slotEnd) > new Date(v.slotStart), { message: "slotEnd must be after slotStart" });
+
+export const updateMeetingSlotSchema = z
+  .object({
+    meetingTypeId: z.string().uuid().optional(),
+    locationId: z.string().uuid().optional(),
+    slotStart: z.string().datetime().optional(),
+    slotEnd: z.string().datetime().optional(),
+    capacity: z.number().int().min(1).optional(),
+    isActive: z.boolean().optional(),
+  })
+  .refine((v) => Object.keys(v).length > 0, { message: "At least one field must be provided" })
+  .refine(
+    (v) => !v.slotStart || !v.slotEnd || new Date(v.slotEnd) > new Date(v.slotStart),
+    { message: "slotEnd must be after slotStart" }
+  );

@@ -24,12 +24,18 @@ import {
   addCoachHolidaySchema,
   addCoachSessionTypeSchema,
   adminBookingsListQuerySchema,
+  createMeetingTypeSchema,
+  updateMeetingTypeSchema,
+  adminMeetingSlotsQuerySchema,
+  createMeetingSlotSchema,
+  updateMeetingSlotSchema,
 } from "../validators/admin.schemas.js";
 import { SessionService } from "../services/session-service.js";
 import { CoachService } from "../services/coach-service.js";
 import { MembershipService } from "../services/membership-service.js";
 import { TokenService } from "../services/token-service.js";
 import { BookingService } from "../services/booking-service.js";
+import { MeetingService } from "../services/meeting-service.js";
 import { supabaseAdmin } from "../db/supabase.js";
 import { HttpError } from "../lib/http-error.js";
 import { runWeeklyTokenGeneration } from "../jobs/weekly-token-generation.js";
@@ -40,6 +46,7 @@ const coachService = new CoachService();
 const membershipService = new MembershipService();
 const tokenService = new TokenService();
 const bookingService = new BookingService();
+const meetingService = new MeetingService();
 
 router.use(requireAdminAuth, requireAdminTableAccess());
 // Admin session types routes
@@ -91,5 +98,13 @@ router.get('/coaches/:coachUserId/session-types', async (req,res,next)=>{ try { 
 router.post('/coaches/:coachUserId/session-types/:sessionTypeId', async (req,res,next)=>{ try { const { coachUserId, sessionTypeId } = validate(addCoachSessionTypeSchema, { coachUserId: req.params.coachUserId, sessionTypeId: req.params.sessionTypeId }); res.json({ ok:true, data: await coachService.addCoachAllowedSessionType({ coachUserId, sessionTypeId }) }); } catch(e){ next(e);} });
 router.delete('/coaches/:coachUserId/session-types/:sessionTypeId', async (req,res,next)=>{ try { await coachService.removeCoachAllowedSessionType(req.params.coachUserId, req.params.sessionTypeId); res.json({ ok: true }); } catch(e){ next(e);} });
 router.get('/locations', async (req,res,next)=>{ try { res.json({ ok:true, data: await sessionService.listLocations() }); } catch(e){ next(e);} });
+// Admin meeting routes
+router.get('/meeting-types', async (req,res,next)=>{ try { res.json({ ok:true, data: await meetingService.listMeetingTypesAdmin() }); } catch(e){ next(e);} });
+router.post('/meeting-types', async (req,res,next)=>{ try { const body=validate(createMeetingTypeSchema, req.body); res.json({ ok:true, data: await meetingService.createMeetingType(body) }); } catch(e){ next(e);} });
+router.patch('/meeting-types/:meetingTypeId', async (req,res,next)=>{ try { const body=validate(updateMeetingTypeSchema, req.body); res.json({ ok:true, data: await meetingService.updateMeetingType(req.params.meetingTypeId, body) }); } catch(e){ next(e);} });
+router.get('/meeting-slots', async (req,res,next)=>{ try { const q=validate(adminMeetingSlotsQuerySchema, req.query); res.json({ ok:true, data: await meetingService.listMeetingSlotsAdmin({ meetingTypeId: q.meetingTypeId, locationId: q.locationId, from: q.from, to: q.to }) }); } catch(e){ next(e);} });
+router.post('/meeting-slots', async (req,res,next)=>{ try { const body=validate(createMeetingSlotSchema, req.body); res.json({ ok:true, data: await meetingService.createMeetingSlot(body) }); } catch(e){ next(e);} });
+router.patch('/meeting-slots/:meetingSlotId', async (req,res,next)=>{ try { const body=validate(updateMeetingSlotSchema, req.body); res.json({ ok:true, data: await meetingService.updateMeetingSlot(req.params.meetingSlotId, body) }); } catch(e){ next(e);} });
+router.delete('/meeting-slots/:meetingSlotId', async (req,res,next)=>{ try { res.json(await meetingService.deleteMeetingSlot(req.params.meetingSlotId)); } catch(e){ next(e);} });
 
 export default router;

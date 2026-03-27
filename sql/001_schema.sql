@@ -252,13 +252,61 @@ create index if not exists idx_waitlist_fifo on waiting_list_entries(session_id,
 create table if not exists track_meetings (
   id uuid primary key default gen_random_uuid(),
   member_id uuid not null references profiles(id) on delete cascade,
-  tier text not null check (tier in ('performance','pace','structure')),
+  tier text,
+  meeting_type_id uuid,
+  location_id uuid references locations(id),
   booked_at timestamptz not null default now(),
   meeting_start timestamptz not null,
   meeting_end timestamptz not null,
-  status text not null check (status in ('booked','cancelled','no_show')),
+  status text not null default 'booked' check (status in ('booked','cancelled','no_show')),
+  check (tier is not null or meeting_type_id is not null),
   check (meeting_end > meeting_start)
 );
+
+create table if not exists meeting_types (
+  id uuid primary key default gen_random_uuid(),
+  name text not null unique,
+  code text not null unique,
+  duration_mins int not null check (duration_mins > 0),
+  description text,
+  color text,
+  icon text,
+  display_order int not null default 0 check (display_order >= 0),
+  is_active boolean not null default true,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists meeting_slots (
+  id uuid primary key default gen_random_uuid(),
+  meeting_type_id uuid not null references meeting_types(id) on delete cascade,
+  location_id uuid not null references locations(id) on delete cascade,
+  slot_start timestamptz not null,
+  slot_end timestamptz not null,
+  capacity int not null default 1 check (capacity > 0),
+  is_active boolean not null default true,
+  created_at timestamptz not null default now(),
+  check (slot_end > slot_start),
+  constraint meeting_slots_unique unique (meeting_type_id, location_id, slot_start)
+);
+
+create index if not exists idx_meeting_slots_lookup
+  on meeting_slots (meeting_type_id, location_id, slot_start);
+
+create index if not exists idx_track_meetings_slot_lookup
+  on track_meetings (meeting_type_id, location_id, meeting_start, status);
+
+do $$
+begin
+  alter table track_meetings add column if not exists meeting_type_id uuid;
+  alter table track_meetings add column if not exists location_id uuid references locations(id);
+  alter table track_meetings alter column status set default 'booked';
+  if not exists (select 1 from pg_constraint where conname = 'track_meetings_meeting_type_id_fkey') then
+    alter table track_meetings
+      add constraint track_meetings_meeting_type_id_fkey
+      foreign key (meeting_type_id) references meeting_types(id);
+  end if;
+exception when others then null;
+end $$;
 
 create table if not exists audit_logs (
   id uuid primary key default gen_random_uuid(),

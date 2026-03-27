@@ -2,6 +2,42 @@ import { supabaseAdmin } from "../db/supabase.js";
 import { HttpError } from "../lib/http-error.js";
 
 export class TokenService {
+  private readonly unitAmountMinorCentsByName: Record<string, number> = {
+    Elite: 3500,
+    Group: 1500,
+    Octave: 2500,
+    "1:1": 9000,
+  };
+
+  async listPurchaseOptions() {
+    const expiryPolicy = this.getPurchaseExpiryPolicy();
+    const { data, error } = await supabaseAdmin
+      .from("session_types")
+      .select("id, name, token_type_id, color, icon, display_order, is_active")
+      .eq("is_active", true)
+      .order("display_order", { ascending: true })
+      .order("created_at", { ascending: true });
+
+    if (error) throw new HttpError(500, "Failed to fetch purchasable session options", error);
+
+    return (data ?? [])
+      .map((item) => {
+        const unitAmountMinorCents = this.unitAmountMinorCentsByName[item.name];
+        if (!unitAmountMinorCents) return null;
+        return {
+          id: item.id,
+          name: item.name,
+          tokenTypeId: item.token_type_id,
+          color: item.color,
+          icon: item.icon ?? (item.name === "Group" ? "👥" : null),
+          unitAmountMinorCents,
+          unitPrice: unitAmountMinorCents / 100,
+          expiryPolicy,
+        };
+      })
+      .filter((item): item is NonNullable<typeof item> => item !== null);
+  }
+
   async getWallet(memberId: string) {
     const { data, error } = await supabaseAdmin
       .from("tokens")
@@ -12,10 +48,83 @@ export class TokenService {
     return data ?? [];
   }
 
+  async getAdditionalSessionsSummary(memberId: string) {
+    const nowIso = new Date().toISOString();
+    const { data: purchasedTokens, error: purchasedError } = await supabaseAdmin
+      .from("tokens")
+      .select("id, quantity, created_at, expiry_at")
+      .eq("member_id", memberId)
+      .eq("source", "purchase")
+      .gt("expiry_at", nowIso)
+      .order("created_at", { ascending: true });
+
+    if (purchasedError) {
+      throw new HttpError(500, "Failed to fetch additional purchased sessions", purchasedError);
+    }
+
+    const tokens = purchasedTokens ?? [];
+    if (tokens.length === 0) {
+      return {
+        totalPurchased: 0,
+        totalUsed: 0,
+        sessionsRemaining: 0,
+        startsAt: null,
+        expiresAt: null,
+      };
+    }
+
+    const tokenIds = tokens.map((t) => t.id);
+    const { data: deductions, error: deductionsError } = await supabaseAdmin
+      .from("booking_token_deductions")
+      .select("token_id, quantity")
+      .in("token_id", tokenIds);
+
+    if (deductionsError) {
+      throw new HttpError(500, "Failed to fetch additional sessions usage", deductionsError);
+    }
+
+    const usedByTokenId = new Map<string, number>();
+    for (const row of deductions ?? []) {
+      usedByTokenId.set(row.token_id, (usedByTokenId.get(row.token_id) ?? 0) + row.quantity);
+    }
+
+    let totalPurchased = 0;
+    let totalUsed = 0;
+    let sessionsRemaining = 0;
+
+    for (const token of tokens) {
+      const usedForToken = usedByTokenId.get(token.id) ?? 0;
+      totalPurchased += token.quantity;
+      totalUsed += usedForToken;
+      sessionsRemaining += Math.max(0, token.quantity - usedForToken);
+    }
+
+    return {
+      totalPurchased,
+      totalUsed,
+      sessionsRemaining,
+      startsAt: tokens[0]?.created_at ?? null,
+      expiresAt: tokens.reduce<string | null>((latest, token) => {
+        if (!latest) return token.expiry_at;
+        return token.expiry_at > latest ? token.expiry_at : latest;
+      }, null),
+    };
+  }
+
   private weeksForQuantity(quantity: number): number {
     if (quantity <= 4) return 4;
     if (quantity <= 8) return 8;
     return 12;
+  }
+
+  private getPurchaseExpiryPolicy() {
+    return {
+      bands: [
+        { minQty: 1, maxQty: 4, expiryWeeks: 4, label: "4 weeks" },
+        { minQty: 5, maxQty: 8, expiryWeeks: 8, label: "8 weeks" },
+        { minQty: 9, maxQty: 12, expiryWeeks: 12, label: "12 weeks" },
+      ]
+    };
   }
 
   private computeExpiryIso(input: {
