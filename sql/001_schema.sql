@@ -218,8 +218,16 @@ create table if not exists tokens (
   created_at timestamptz not null default now(),
   expiry_at timestamptz not null,
   source text not null check (source in ('weekly','admin','purchase')),
-  source_meta jsonb not null default '{}'::jsonb
-);
+  source_meta jsonb not null default '{}'::jsonb,
+  coach_id uuid NULL references coaches(user_id)
+)
+
+do $$
+begin
+  alter table tokens add column if not exists coach_id uuid references coaches(user_id);
+exception when others then null;
+end $$;
+
 create index if not exists idx_tokens_member_type on tokens(member_id, token_type_id);
 
 create table if not exists bookings (

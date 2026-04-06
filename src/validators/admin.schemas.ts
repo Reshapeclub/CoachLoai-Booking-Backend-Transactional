@@ -1,9 +1,19 @@
 import { z } from "zod";
-export const createSessionTypeSchema = z.object({ name: z.string().min(1), defaultCapacity: z.number().int().min(1), defaultDurationMins: z.union([z.literal(30), z.literal(45), z.literal(60)]) });
+export const createSessionTypeSchema = z.object({
+  name: z.string().min(1),
+  defaultCapacity: z.number().int().min(1),
+  defaultDurationMins: z.union([z.literal(30), z.literal(45), z.literal(60)]),
+  color: z.string().nullable().optional(),
+  icon: z.string().nullable().optional(),
+  displayOrder: z.number().int().min(0).optional()
+});
 export const updateSessionTypeSchema = z.object({
   name: z.string().min(1).optional(),
   defaultCapacity: z.number().int().min(1).optional(),
   defaultDurationMins: z.union([z.literal(30), z.literal(45), z.literal(60)]).optional(),
+  color: z.string().nullable().optional(),
+  icon: z.string().nullable().optional(),
+  displayOrder: z.number().int().min(0).optional()
 }).refine((v) => Object.keys(v).length > 0, { message: "At least one field must be provided" });
 export const createSessionSchema = z.object({
   sessionTypeId: z.string().min(1),
@@ -13,6 +23,7 @@ export const createSessionSchema = z.object({
   durationMins: z.union([z.literal(30), z.literal(45), z.literal(60)]).optional(),
   capacity: z.number().int().min(1).optional(),
   allowOvertime: z.boolean().optional(),
+  isOnline: z.boolean().optional(),
 });
 export const setCapacitySchema = z.object({ capacity: z.number().int().min(1) });
 export const setCoachSchema = z.object({
@@ -20,7 +31,7 @@ export const setCoachSchema = z.object({
   allowOvertime: z.boolean().optional(),
 });
 export const setSessionTypeSchema = z.object({ newSessionTypeId: z.string().min(1) });
-export const refundModeSchema = z.object({ refund: z.enum(["refund","charge"]) });
+export const refundModeSchema = z.object({ refund: z.enum(["refund", "charge"]) });
 export const createMembershipSchema = z.object({
   memberId: z.string().min(1),
   mode: z.enum(["inperson", "remote"]),
@@ -46,7 +57,13 @@ export const pauseMembershipSchema = z.object({
 export const terminateMembershipSchema = z.object({
   terminationDate: z.string().datetime(),
 });
-export const issueTokensSchema = z.object({ memberId: z.string().min(1), tokenTypeId: z.string().min(1), quantity: z.number().int().min(1), expiry: z.string().datetime().optional() });
+export const issueTokensSchema = z.object({
+  memberId: z.string().min(1),
+  tokenTypeId: z.string().min(1),
+  quantity: z.number().int().min(1),
+  expiry: z.string().datetime().optional(),
+  coachId: z.string().uuid().optional()
+});
 export const addMemberSessionTagSchema = z.object({
   memberId: z.string().uuid(),
   sessionTypeId: z.string().uuid(),

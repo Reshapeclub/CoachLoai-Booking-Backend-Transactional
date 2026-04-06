@@ -45,18 +45,18 @@ export class TokenService {
       .eq("member_id", memberId)
       .order("created_at", { ascending: false });
     if (error) throw new HttpError(500, "Failed to fetch token wallet", error);
-    return data ?? [];
+    return (data ?? []).filter((t) => t.coach_id !== null);
   }
 
   async getAdditionalSessionsSummary(memberId: string) {
     const nowIso = new Date().toISOString();
     const { data: purchasedTokens, error: purchasedError } = await supabaseAdmin
-      .from("tokens")
-      .select("id, quantity, created_at, expiry_at")
-      .eq("member_id", memberId)
-      .eq("source", "purchase")
-      .gt("expiry_at", nowIso)
-      .order("created_at", { ascending: true });
+      .from('tokens')
+      .select('id, quantity, created_at, expiry_at, coach_id')
+      .eq('member_id', memberId)
+      .not('coach_id', 'is', null)
+      .gt('expiry_at', nowIso)
+      .order('created_at', { ascending: true });
 
     if (purchasedError) {
       throw new HttpError(500, "Failed to fetch additional purchased sessions", purchasedError);
@@ -65,6 +65,8 @@ export class TokenService {
     const tokens = purchasedTokens ?? [];
     if (tokens.length === 0) {
       return {
+        coachId: null,
+        coachName: null,
         totalPurchased: 0,
         totalUsed: 0,
         sessionsRemaining: 0,
@@ -75,9 +77,9 @@ export class TokenService {
 
     const tokenIds = tokens.map((t) => t.id);
     const { data: deductions, error: deductionsError } = await supabaseAdmin
-      .from("booking_token_deductions")
-      .select("token_id, quantity")
-      .in("token_id", tokenIds);
+      .from('booking_token_deductions')
+      .select('token_id, quantity')
+      .in('token_id', tokenIds);
 
     if (deductionsError) {
       throw new HttpError(500, "Failed to fetch additional sessions usage", deductionsError);
@@ -88,27 +90,52 @@ export class TokenService {
       usedByTokenId.set(row.token_id, (usedByTokenId.get(row.token_id) ?? 0) + row.quantity);
     }
 
-    let totalPurchased = 0;
-    let totalUsed = 0;
-    let sessionsRemaining = 0;
+    const coachMap = new Map<string, {
+      coachId: string;
+      coachName?: string;
+      totalPurchased: number;
+      totalUsed: number;
+      sessionsRemaining: number;
+      startsAt: string | null;
+      expiresAt: string | null;
+    }>();
 
     for (const token of tokens) {
-      const usedForToken = usedByTokenId.get(token.id) ?? 0;
-      totalPurchased += token.quantity;
-      totalUsed += usedForToken;
-      sessionsRemaining += Math.max(0, token.quantity - usedForToken);
+      if (!token.coach_id) continue;
+      const coachId = token.coach_id;
+      const entry = coachMap.get(coachId) ?? {
+        coachId,
+        totalPurchased: 0,
+        totalUsed: 0,
+        sessionsRemaining: 0,
+        startsAt: null,
+        expiresAt: null,
+      };
+      const used = usedByTokenId.get(token.id) ?? 0;
+
+      entry.totalPurchased += token.quantity;
+      entry.totalUsed += used;
+      entry.sessionsRemaining += Math.max(0, token.quantity - used);
+
+      if (!entry.startsAt || token.created_at < entry.startsAt) entry.startsAt = token.created_at;
+      if (!entry.expiresAt || token.expiry_at > entry.expiresAt) entry.expiresAt = token.expiry_at;
+
+      coachMap.set(coachId, entry);
     }
 
-    return {
-      totalPurchased,
-      totalUsed,
-      sessionsRemaining,
-      startsAt: tokens[0]?.created_at ?? null,
-      expiresAt: tokens.reduce<string | null>((latest, token) => {
-        if (!latest) return token.expiry_at;
-        return token.expiry_at > latest ? token.expiry_at : latest;
-      }, null),
-    };
+    const coachIds = Array.from(coachMap.keys());
+    if (coachIds.length) {
+      const { data: coaches } = await supabaseAdmin
+        .from('coaches')
+        .select('id, name')
+        .in('id', coachIds);
+      coaches?.forEach(c => {
+        const entry = coachMap.get(c.id);
+        if (entry) entry.coachName = c.name;
+      });
+    }
+    console.log("here")
+    return Array.from(coachMap.values());
   }
 
   private weeksForQuantity(quantity: number): number {
@@ -185,6 +212,7 @@ export class TokenService {
     tokenTypeId: string;
     quantity: number;
     expiryAt?: string;
+    coachId?: string;
   }) {
     const purchaseDate = new Date();
     const { membershipEndDate, membershipTerminationDate } =
@@ -199,10 +227,10 @@ export class TokenService {
 
     const finalExpiryIso = input.expiryAt
       ? (() => {
-          const provided = new Date(input.expiryAt).getTime();
-          const computed = new Date(algorithmExpiryIso).getTime();
-          return new Date(Math.min(provided, computed)).toISOString();
-        })()
+        const provided = new Date(input.expiryAt).getTime();
+        const computed = new Date(algorithmExpiryIso).getTime();
+        return new Date(Math.min(provided, computed)).toISOString();
+      })()
       : algorithmExpiryIso;
 
     const { data, error } = await supabaseAdmin
@@ -214,6 +242,7 @@ export class TokenService {
         expiry_at: finalExpiryIso,
         source: "admin",
         source_meta: { issuedAt: purchaseDate.toISOString() },
+        coach_id: input.coachId ?? null,
       })
       .select()
       .single();
@@ -228,6 +257,7 @@ export class TokenService {
     tokenTypeId: string;
     quantity: number;
     purchaseDate?: Date;
+    coachId?: string;
   }) {
     const { data: existing, error: existingError } = await supabaseAdmin
       .from("tokens")
@@ -268,6 +298,7 @@ export class TokenService {
           stripeSessionId: input.stripeSessionId,
           membershipId: input.membershipId,
         },
+        coach_id: input.coachId ?? null,
       })
       .select()
       .single();

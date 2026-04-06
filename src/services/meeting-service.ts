@@ -243,7 +243,7 @@ export class MeetingService {
   async getEligibility(memberId: string) {
     const { data, error } = await supabaseAdmin
       .from("track_meetings")
-      .select("*")
+      .select("*, meeting_types(*), locations(*)")
       .eq("member_id", memberId)
       .order("meeting_start", { ascending: false });
     if (error) throw new HttpError(500, "Failed to fetch meetings", error);

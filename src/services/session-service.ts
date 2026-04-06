@@ -31,9 +31,17 @@ export class SessionService {
     });
   }
 
-  async createSessionType(input: { name: string; defaultCapacity: number; defaultDurationMins: 30|45|60 }) {
+  async createSessionType(input: { name: string; color?: string | null; icon?: string | null; displayOrder?: number; defaultCapacity: number; defaultDurationMins: 30 | 45 | 60 }) {
     const tokenTypeId = crypto.randomUUID();
-    const { data, error } = await supabaseAdmin.from('session_types').insert({ name: input.name, token_type_id: tokenTypeId, default_capacity: input.defaultCapacity, default_duration_mins: input.defaultDurationMins }).select().single();
+    const { data, error } = await supabaseAdmin.from('session_types').insert({
+      name: input.name,
+      color: input.color ?? null,
+      icon: input.icon ?? null,
+      display_order: input.displayOrder ?? 0,
+      token_type_id: tokenTypeId,
+      default_capacity: input.defaultCapacity,
+      default_duration_mins: input.defaultDurationMins
+    }).select().single();
     if (error) throw new HttpError(500, 'Failed to create session type', error);
     return data;
   }
@@ -42,12 +50,18 @@ export class SessionService {
     sessionTypeId: string,
     input: {
       name?: string;
+      color?: string | null;
+      icon?: string | null;
+      displayOrder?: number;
       defaultCapacity?: number;
       defaultDurationMins?: 30 | 45 | 60;
     }
   ) {
     const updates: Record<string, unknown> = {};
     if (input.name !== undefined) updates.name = input.name;
+    if (input.color !== undefined) updates.color = input.color;
+    if (input.icon !== undefined) updates.icon = input.icon;
+    if (input.displayOrder !== undefined) updates.display_order = input.displayOrder;
     if (input.defaultCapacity !== undefined) {
       updates.default_capacity = input.defaultCapacity;
     }
@@ -74,6 +88,7 @@ export class SessionService {
     endAt: string;
     capacity: number;
     allowOvertime?: boolean;
+    isOnline?: boolean;
   }) {
     await validateCoachForSession({
       coachUserId: input.coachUserId,
@@ -93,6 +108,7 @@ export class SessionService {
         start_at: input.startAt,
         end_at: input.endAt,
         capacity: input.capacity,
+        is_online: input.isOnline ?? false
       })
       .select()
       .single();

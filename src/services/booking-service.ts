@@ -57,7 +57,8 @@ export class BookingService {
     from?: string,
     to?: string,
     sessionTypeId?: string,
-    locationId?: string
+    locationId?: string,
+    isOnline?: boolean
   ) {
     const { data: user, error: userError } = await supabaseAdmin.from("profiles").select("*").eq("id", memberId).single();
     if (userError || !user) throw new HttpError(404, "Member not found");
@@ -69,8 +70,14 @@ export class BookingService {
       .order("start_at", { ascending: true });
     if (to) query = query.lte("start_at", to);
     if (sessionTypeId) query = query.eq("session_type_id", sessionTypeId);
-    const effectiveLocationId = locationId ?? user.location_id;
-    if (effectiveLocationId) query = query.eq("location_id", effectiveLocationId);
+    
+    if (isOnline === true) {
+      query = query.eq("is_online", true);
+    } else {
+      query = query.eq("is_online", false);
+      const effectiveLocationId = locationId ?? user.location_id;
+      if (effectiveLocationId) query = query.eq("location_id", effectiveLocationId);
+    }
 
     const { data: sessions, error } = await query;
     if (error) throw new HttpError(500, "Failed to fetch available sessions", error);
@@ -168,6 +175,113 @@ export class BookingService {
     return data ?? [];
   }
 
+  async getSessionUsage(memberId: string, view: "past" | "upcoming") {
+    const now = new Date();
+    const fourWeeksMs = 4 * 7 * 24 * 60 * 60 * 1000;
+
+    // Determine the date range (4 weeks)
+    const rangeStart = view === "past" ? new Date(now.getTime() - fourWeeksMs) : now;
+    const rangeEnd = view === "past" ? now : new Date(now.getTime() + fourWeeksMs);
+
+    // Fetch bookings within the date range (join sessions for start_at)
+    const { data: bookings, error: bookingsErr } = await supabaseAdmin
+      .from("bookings")
+      .select("id, status, booked_at, session_id, sessions(id, start_at, end_at, session_type_id, session_types(id, name, color))")
+      .eq("member_id", memberId)
+      .gte("sessions.start_at", rangeStart.toISOString())
+      .lte("sessions.start_at", rangeEnd.toISOString());
+    if (bookingsErr) throw new HttpError(500, "Failed to fetch session usage", bookingsErr);
+
+    // Filter to only bookings whose session is actually within the range (inner join filter)
+    const filtered = (bookings ?? []).filter(
+      (b) => (b as Record<string, unknown>).sessions != null
+    );
+
+    // Compute counts
+    let attended = 0;
+    let missed = 0;
+    let cancelled = 0;
+    let upcoming = 0;
+
+    const schedule: Array<{
+      date: string;
+      time: string;
+      status: string;
+      sessionTypeName: string | null;
+      sessionTypeColor: string | null;
+      bookingId: string;
+      sessionId: string;
+    }> = [];
+
+    for (const booking of filtered) {
+      const session = (booking as Record<string, unknown>).sessions as {
+        id: string;
+        start_at: string;
+        end_at: string;
+        session_types?: { id: string; name: string; color: string | null } | null;
+      };
+
+      const sessionStart = new Date(session.start_at);
+      const isPast = sessionStart < now;
+
+      if (booking.status === "cancelled") {
+        cancelled++;
+      } else if (booking.status === "no_show") {
+        missed++;
+      } else if (booking.status === "booked" && isPast) {
+        attended++;
+      } else if (booking.status === "booked" && !isPast) {
+        upcoming++;
+      }
+
+      schedule.push({
+        date: session.start_at.split("T")[0],
+        time: sessionStart.toTimeString().slice(0, 5),
+        status: booking.status === "booked" && isPast ? "attended" : booking.status,
+        sessionTypeName: session.session_types?.name ?? null,
+        sessionTypeColor: session.session_types?.color ?? null,
+        bookingId: booking.id,
+        sessionId: session.id,
+      });
+    }
+
+    // Fetch allowed sessions from membership allowances
+    const { data: activeMembershipId } = await supabaseAdmin.rpc("clm_find_active_membership", {
+      p_member_id: memberId,
+      p_now: now.toISOString(),
+    });
+
+    let allowedPerWeek = 0;
+    if (activeMembershipId) {
+      const { data: allowances } = await supabaseAdmin
+        .from("membership_session_allowances")
+        .select("weekly_allowance")
+        .eq("membership_id", activeMembershipId);
+      allowedPerWeek = (allowances ?? []).reduce((sum, a) => sum + (a.weekly_allowance ?? 0), 0);
+    }
+
+    const allowed = allowedPerWeek * 4;
+
+    if (view === "past") {
+      return {
+        view: "past",
+        attended,
+        missed,
+        cancelled,
+        allowed,
+        schedule,
+      };
+    }
+
+    return {
+      view: "upcoming",
+      used: upcoming,
+      remaining: Math.max(0, allowed - upcoming),
+      allowed,
+      schedule,
+    };
+  }
+
   async getAdminBookingById(bookingId: string) {
     const { data, error } = await supabaseAdmin
       .from("bookings")
@@ -228,6 +342,34 @@ export class BookingService {
     });
     if (error) throw new HttpError(422, "Admin remove-member failed", error);
     return data;
+  }
+
+  async adminMarkNoShow(input: { bookingId: string; adminId: string }) {
+    const { data: booking, error: fetchErr } = await supabaseAdmin
+      .from("bookings")
+      .select("*, sessions(*)")
+      .eq("id", input.bookingId)
+      .single();
+    if (fetchErr || !booking) throw new HttpError(404, "Booking not found");
+    if (booking.status !== "booked") throw new HttpError(422, `Cannot mark as no_show: booking status is '${booking.status}'`);
+    const session = (booking as Record<string, unknown>).sessions as { start_at: string } | null;
+    if (!session) throw new HttpError(422, "Session not found for this booking");
+    if (new Date(session.start_at) > new Date()) throw new HttpError(422, "Cannot mark no_show before the session has started");
+
+    const { error: updateErr } = await supabaseAdmin
+      .from("bookings")
+      .update({ status: "no_show" })
+      .eq("id", input.bookingId);
+    if (updateErr) throw new HttpError(500, "Failed to update booking status", updateErr);
+
+    await supabaseAdmin.from("audit_logs").insert({
+      actor_type: "admin",
+      actor_id: input.adminId,
+      action: "booking.admin_mark_no_show",
+      meta: { bookingId: input.bookingId },
+    });
+
+    return { ok: true, bookingId: input.bookingId, status: "no_show" };
   }
 
   async adminCancelSession(input: { sessionId: string; refund: "refund" | "charge"; adminId: string }) {
