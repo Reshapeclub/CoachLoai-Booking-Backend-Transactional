@@ -29,6 +29,13 @@ router.post('/bookings/:bookingId/cancel', async (req, res, next) => { try { res
 router.get('/waitlist', async (req, res, next) => { try { res.json({ ok: true, data: await bookingService.getMemberWaitlistEntries(req.user!.id) }); } catch (e) { next(e); } });
 router.post('/waitlist', async (req, res, next) => { try { const body = validate(joinWaitlistSchema, req.body); res.json(await bookingService.joinWaitlist({ memberId: req.user!.id, membershipId: body.membershipId, sessionId: body.sessionId })); } catch (e) { next(e); } });
 router.get('/tokens', async (req, res, next) => { try { res.json({ ok: true, data: await tokenService.getWallet(req.user!.id) }); } catch (e) { next(e); } });
+router.get('/tokens/usage-tracker', async (req, res, next) => {
+  try {
+    const from = typeof req.query.from === 'string' ? req.query.from : new Date().toISOString();
+    const to = typeof req.query.to === 'string' ? req.query.to : new Date().toISOString();
+    res.json({ ok: true, data: await bookingService.getUsageTracker(req.user!.id, from, to) });
+  } catch (e) { next(e); }
+});
 router.get('/tokens/additional-summary', async (req, res, next) => { try { res.json({ ok: true, data: await tokenService.getAdditionalSessionsSummary(req.user!.id) }); } catch (e) { next(e); } });
 router.get('/tokens/purchase/options', async (req, res, next) => { try { res.json({ ok: true, data: await tokenService.listPurchaseOptions() }); } catch (e) { next(e); } });
 router.post('/tokens/purchase/checkout', async (req, res, next) => { try { const body = validate(purchaseTokensCheckoutSchema, req.body); const session = await stripeService.createCheckoutSession({ memberId: req.user!.id, membershipId: body.membershipId, tokenTypeId: body.tokenTypeId, quantity: body.quantity }); res.json({ ok: true, checkoutUrl: session.url }); } catch (e) { next(e); } });

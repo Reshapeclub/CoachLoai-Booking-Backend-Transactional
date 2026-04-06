@@ -70,7 +70,7 @@ export class BookingService {
       .order("start_at", { ascending: true });
     if (to) query = query.lte("start_at", to);
     if (sessionTypeId) query = query.eq("session_type_id", sessionTypeId);
-    
+
     if (isOnline === true) {
       query = query.eq("is_online", true);
     } else {
@@ -271,6 +271,7 @@ export class BookingService {
         cancelled,
         used: usedVal,
         remaining: Math.max(0, allowed - usedVal),
+        unused: Math.max(0, allowed - usedVal),
         allowed,
         schedule,
       };
@@ -280,9 +281,159 @@ export class BookingService {
       view: "upcoming",
       used: upcoming,
       remaining: Math.max(0, allowed - upcoming),
+      unused: Math.max(0, allowed - upcoming),
       allowed,
       schedule,
     };
+  }
+
+  async getUsageTracker(memberId: string, from: string, to: string) {
+    const fromDate = new Date(from);
+    const toDate = new Date(to);
+    const now = new Date();
+    const queryNow = now.toISOString();
+    const getMonday = (d: Date) => {
+      const date = new Date(d);
+      const day = date.getDay();
+      const diff = date.getDate() - (day === 0 ? 6 : day - 1);
+      const monday = new Date(date.setDate(diff));
+      monday.setHours(0, 0, 0, 0);
+      return monday;
+    };
+
+    const firstMonday = getMonday(fromDate);
+    const lastMonday = getMonday(toDate);
+
+    const weeks: Array<{ start: Date; end: Date; label: string }> = [];
+    let curr = new Date(firstMonday);
+    while (curr <= lastMonday) {
+      const wStart = new Date(curr);
+      const wEnd = new Date(curr.getTime() + 7 * 24 * 60 * 60 * 1000 - 1);
+      const label = `${wStart.toLocaleString('default', { month: 'short' })} ${wStart.getDate()} - ${wEnd.toLocaleString('default', { month: 'short' })} ${wEnd.getDate()}`;
+      weeks.push({ start: wStart, end: wEnd, label });
+      curr.setDate(curr.getDate() + 7);
+    }
+    const [bookingsRes, waitlistRes, tokensRes, membershipRes] = await Promise.all([
+      supabaseAdmin
+        .from("bookings")
+        .select("id, status, booked_at, session_id, sessions(id, start_at, end_at, session_type_id, session_types(id, name, color)), booking_token_deductions(token_id, token_week_start, tokens(*))")
+        .eq("member_id", memberId)
+        .gte("sessions.start_at", firstMonday.toISOString())
+        .lte("sessions.start_at", new Date(lastMonday.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString()),
+      supabaseAdmin
+        .from("waiting_list_entries")
+        .select("session_id, sessions(id, start_at, session_type_id, session_types(name))")
+        .eq("member_id", memberId)
+        .gte("sessions.start_at", firstMonday.toISOString()),
+      supabaseAdmin
+        .from("tokens")
+        .select("*")
+        .eq("member_id", memberId)
+        .gt("expiry_at", queryNow),
+      supabaseAdmin.rpc("clm_find_active_membership", { p_member_id: memberId, p_now: queryNow })
+    ]);
+
+    const activeMembershipId = membershipRes.data;
+    let baseQtyPerWeek = 5; // fallback
+    if (activeMembershipId) {
+      const { data: allowances } = await supabaseAdmin
+        .from("membership_session_allowances")
+        .select("weekly_allowance")
+        .eq("membership_id", activeMembershipId);
+      baseQtyPerWeek = (allowances ?? []).reduce((sum, a) => sum + (a.weekly_allowance ?? 0), 0) || 5;
+    }
+
+    const allBookings = (bookingsRes.data ?? []).filter(b => b.sessions != null) as any[];
+    const allWaitlist = (waitlistRes.data ?? []).filter(w => w.sessions != null) as any[];
+    const allTokens = tokensRes.data ?? [];
+
+    return weeks.map(week => {
+      const wStartIso = week.start.toISOString();
+      const nextWStartIso = new Date(week.start.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString();
+      // Bookings in this week
+      const weekBookings = allBookings.filter(b => {
+        const s = Array.isArray(b.sessions) ? b.sessions[0] : b.sessions;
+        return s && s.start_at >= wStartIso && s.start_at < nextWStartIso;
+      });
+      const weekWaitlist = allWaitlist.filter(w => {
+        const s = Array.isArray(w.sessions) ? w.sessions[0] : w.sessions;
+        return s && s.start_at >= wStartIso && s.start_at < nextWStartIso;
+      });
+      const unusedCurrentWeekTokens = [...allTokens].filter(t => t.week_start === wStartIso && t.quantity > 0 && t.source === 'weekly');
+      const circles: Array<{ status: "attended" | "waitlist" | "lost" | "rollover_used" | "future_used" | "available"; date?: string }> = [];
+      // 1. Process bookings in this week
+      for (const b of weekBookings) {
+        const s = Array.isArray(b.sessions) ? b.sessions[0] : b.sessions;
+        const deduction = (b.booking_token_deductions as any)?.[0];
+        const tokenWeekStart = deduction?.token_week_start;
+        const sessionDate = s.start_at.split('T')[0];
+        let status: any = "attended";
+        if (b.status === "no_show" || (b.status === "cancelled" && !deduction?.tokens)) {
+          status = "lost";
+        } else if (b.status === "cancelled") {
+          continue;
+        } else if (b.status === "no_show") {
+          status = "lost";
+        } else if (tokenWeekStart) {
+          if (tokenWeekStart < wStartIso) status = "rollover_used";
+          else if (tokenWeekStart > wStartIso) status = "future_used";
+          else status = "attended";
+        }
+        circles.push({ status, date: sessionDate });
+      }
+
+      for (const w of weekWaitlist) {
+        const s = Array.isArray(w.sessions) ? w.sessions[0] : w.sessions;
+        circles.push({ status: "waitlist", date: s.start_at.split('T')[0] });
+      }
+
+      const baseCircles = circles.filter(c => c.status === "attended" || c.status === "lost" || c.status === "waitlist");
+      const extraCircles = circles.filter(c => c.status === "rollover_used" || c.status === "future_used");
+      const finalCircles: typeof circles = [];
+
+      for (let i = 0; i < baseQtyPerWeek; i++) {
+        if (baseCircles[i]) {
+          finalCircles.push(baseCircles[i]);
+        } else if (unusedCurrentWeekTokens.length > 0) {
+          unusedCurrentWeekTokens.pop();
+          finalCircles.push({ status: "available" });
+        } else {
+          finalCircles.push({ status: "available" });
+        }
+      }
+      if (baseCircles.length > baseQtyPerWeek) {
+        finalCircles.push(...baseCircles.slice(baseQtyPerWeek));
+      }
+
+      finalCircles.push(...extraCircles);
+      const currentWeekOtherTokens = allTokens.filter(t => t.week_start !== wStartIso && t.quantity > 0 && t.source === 'weekly');
+      const adminBonusTokens = allTokens.filter(t => t.source !== 'weekly' && t.quantity > 0);
+
+      for (const t of currentWeekOtherTokens) {
+        for (let i = 0; i < t.quantity; i++) finalCircles.push({ status: "available" });
+      }
+      for (const t of adminBonusTokens) {
+        for (let i = 0; i < t.quantity; i++) finalCircles.push({ status: "available" });
+      }
+
+      const tally = {
+        attended: finalCircles.filter(c => c.status === "attended").length,
+        waitlist: finalCircles.filter(c => c.status === "waitlist").length,
+        lost: finalCircles.filter(c => c.status === "lost").length,
+        available: finalCircles.filter(c => c.status === "available").length,
+        rollover_used: finalCircles.filter(c => c.status === "rollover_used").length,
+        future_used: finalCircles.filter(c => c.status === "future_used").length
+      };
+
+      return {
+        weekStart: wStartIso,
+        label: week.label,
+        counts: tally,
+        remaining: tally.available,
+        unused: tally.available,
+        lost: tally.lost
+      };
+    });
   }
 
   async getAdminBookingById(bookingId: string) {
