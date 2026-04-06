@@ -263,11 +263,14 @@ export class BookingService {
     const allowed = allowedPerWeek * 4;
 
     if (view === "past") {
+      const usedVal = attended + missed;
       return {
         view: "past",
         attended,
         missed,
         cancelled,
+        used: usedVal,
+        remaining: Math.max(0, allowed - usedVal),
         allowed,
         schedule,
       };

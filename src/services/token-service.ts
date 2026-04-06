@@ -134,7 +134,6 @@ export class TokenService {
         if (entry) entry.coachName = c.name;
       });
     }
-    console.log("here")
     return Array.from(coachMap.values());
   }
 
