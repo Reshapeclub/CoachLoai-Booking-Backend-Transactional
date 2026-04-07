@@ -88,9 +88,10 @@ export class BookingService {
 
     const sessionIds = list.map((s) => s.id);
 
-    const [bookedCountsRes, memberBookingsRes, memberWaitlistRes] = await Promise.all([
+    const [bookedCountsRes, memberBookingsRes, memberCancelledBookingsRes, memberWaitlistRes] = await Promise.all([
       supabaseAdmin.from("bookings").select("session_id").in("session_id", sessionIds).eq("status", "booked"),
       supabaseAdmin.from("bookings").select("id, session_id").eq("member_id", memberId).eq("status", "booked").in("session_id", sessionIds),
+      supabaseAdmin.from("bookings").select("session_id").eq("member_id", memberId).eq("status", "cancelled").in("session_id", sessionIds),
       supabaseAdmin.from("waiting_list_entries").select("session_id").eq("member_id", memberId).in("session_id", sessionIds),
     ]);
 
@@ -102,6 +103,7 @@ export class BookingService {
     const memberBookings = (memberBookingsRes.data ?? []) as Array<{ id: string; session_id: string }>;
     const memberBookedSessionIds = new Set(memberBookings.map((r) => r.session_id));
     const bookingIdBySession = new Map(memberBookings.map((r) => [r.session_id, r.id]));
+    const memberCancelledSessionIds = new Set((memberCancelledBookingsRes.data ?? []).map((r) => (r as { session_id: string }).session_id));
     const memberWaitlistSessionIds = new Set((memberWaitlistRes.data ?? []).map((r) => (r as { session_id: string }).session_id));
 
     return list.map((s) => {
@@ -110,6 +112,7 @@ export class BookingService {
       const bookedCount = bookedBySession.get(s.id) ?? 0;
       const isFull = bookedCount >= s.capacity;
       const isBookedByMe = memberBookedSessionIds.has(s.id);
+      const isCancelledByMe = memberCancelledSessionIds.has(s.id);
       const isOnWaitlist = memberWaitlistSessionIds.has(s.id);
       const bookingId = isBookedByMe ? (bookingIdBySession.get(s.id) ?? null) : null;
       let status: "open" | "full" | "booked" = isBookedByMe ? "booked" : isFull ? "full" : "open";
@@ -119,6 +122,7 @@ export class BookingService {
         booked_count: bookedCount,
         status,
         isBookedByMe,
+        isCancelledByMe,
         booking_id: bookingId,
         isOnWaitlist,
       };
