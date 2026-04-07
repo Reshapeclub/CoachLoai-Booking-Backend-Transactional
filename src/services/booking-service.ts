@@ -90,7 +90,7 @@ export class BookingService {
 
     const [bookedCountsRes, memberBookingsRes, memberWaitlistRes] = await Promise.all([
       supabaseAdmin.from("bookings").select("session_id").in("session_id", sessionIds).eq("status", "booked"),
-      supabaseAdmin.from("bookings").select("session_id").eq("member_id", memberId).eq("status", "booked").in("session_id", sessionIds),
+      supabaseAdmin.from("bookings").select("id, session_id").eq("member_id", memberId).eq("status", "booked").in("session_id", sessionIds),
       supabaseAdmin.from("waiting_list_entries").select("session_id").eq("member_id", memberId).in("session_id", sessionIds),
     ]);
 
@@ -99,7 +99,9 @@ export class BookingService {
       const sid = (row as { session_id: string }).session_id;
       bookedBySession.set(sid, (bookedBySession.get(sid) ?? 0) + 1);
     }
-    const memberBookedSessionIds = new Set((memberBookingsRes.data ?? []).map((r) => (r as { session_id: string }).session_id));
+    const memberBookings = (memberBookingsRes.data ?? []) as Array<{ id: string; session_id: string }>;
+    const memberBookedSessionIds = new Set(memberBookings.map((r) => r.session_id));
+    const bookingIdBySession = new Map(memberBookings.map((r) => [r.session_id, r.id]));
     const memberWaitlistSessionIds = new Set((memberWaitlistRes.data ?? []).map((r) => (r as { session_id: string }).session_id));
 
     return list.map((s) => {
@@ -109,6 +111,7 @@ export class BookingService {
       const isFull = bookedCount >= s.capacity;
       const isBookedByMe = memberBookedSessionIds.has(s.id);
       const isOnWaitlist = memberWaitlistSessionIds.has(s.id);
+      const bookingId = isBookedByMe ? (bookingIdBySession.get(s.id) ?? null) : null;
       let status: "open" | "full" | "booked" = isBookedByMe ? "booked" : isFull ? "full" : "open";
       return {
         ...rest,
@@ -116,6 +119,7 @@ export class BookingService {
         booked_count: bookedCount,
         status,
         isBookedByMe,
+        booking_id: bookingId,
         isOnWaitlist,
       };
     });
