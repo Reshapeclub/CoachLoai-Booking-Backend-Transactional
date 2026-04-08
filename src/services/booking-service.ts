@@ -63,12 +63,23 @@ export class BookingService {
     const { data: user, error: userError } = await supabaseAdmin.from("profiles").select("*").eq("id", memberId).single();
     if (userError || !user) throw new HttpError(404, "Member not found");
 
+    let effectiveFrom = from ?? new Date().toISOString();
+    let effectiveTo = to;
+    if (from && to) {
+      const fromDatePart = from.split("T")[0];
+      const toDatePart = to.split("T")[0];
+      if (fromDatePart === toDatePart) {
+        effectiveFrom = `${fromDatePart}T00:00:00.000Z`;
+        effectiveTo = `${toDatePart}T23:59:59.999Z`;
+      }
+    }
+
     let query = supabaseAdmin
       .from("sessions")
       .select("*, session_types(*), coaches(profiles(full_name))")
-      .gte("start_at", from ?? new Date().toISOString())
+      .gte("start_at", effectiveFrom)
       .order("start_at", { ascending: true });
-    if (to) query = query.lte("start_at", to);
+    if (effectiveTo) query = query.lte("start_at", effectiveTo);
     if (sessionTypeId) query = query.eq("session_type_id", sessionTypeId);
 
     if (isOnline === true) {

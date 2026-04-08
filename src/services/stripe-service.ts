@@ -32,8 +32,8 @@ export class StripeService {
 
     const session = await this.stripe.checkout.sessions.create({
       mode: 'payment',
-      success_url: `${env.APP_BASE_URL}/payments/success`,
-      cancel_url: `${env.APP_BASE_URL}/payments/cancel`,
+      success_url: "coachloai://payment/success?session_id={CHECKOUT_SESSION_ID}",
+      cancel_url: "coachloai://payment/cancel",
       line_items: [{
         quantity: input.quantity,
         price_data: {
