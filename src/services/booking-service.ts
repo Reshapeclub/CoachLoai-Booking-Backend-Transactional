@@ -63,16 +63,15 @@ export class BookingService {
     const { data: user, error: userError } = await supabaseAdmin.from("profiles").select("*").eq("id", memberId).single();
     if (userError || !user) throw new HttpError(404, "Member not found");
 
+    const isDateOnly = (v: string) => /^\d{4}-\d{2}-\d{2}$/.test(v);
+    const toStartOfDayUtc = (v: string) => `${v}T00:00:00.000Z`;
+    const toEndOfDayUtc = (v: string) => `${v}T23:59:59.999Z`;
+
     let effectiveFrom = from ?? new Date().toISOString();
     let effectiveTo = to;
-    if (from && to) {
-      const fromDatePart = from.split("T")[0];
-      const toDatePart = to.split("T")[0];
-      if (fromDatePart === toDatePart) {
-        effectiveFrom = `${fromDatePart}T00:00:00.000Z`;
-        effectiveTo = `${toDatePart}T23:59:59.999Z`;
-      }
-    }
+
+    if (from && isDateOnly(from)) effectiveFrom = toStartOfDayUtc(from);
+    if (to && isDateOnly(to)) effectiveTo = toEndOfDayUtc(to);
 
     let query = supabaseAdmin
       .from("sessions")

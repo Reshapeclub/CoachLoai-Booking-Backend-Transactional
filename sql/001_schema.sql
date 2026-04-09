@@ -191,7 +191,7 @@ create table if not exists sessions (
   id uuid primary key default gen_random_uuid(),
   session_type_id uuid not null references session_types(id),
   token_type_id uuid not null,
-  coach_user_id uuid not null references coaches(user_id),
+  coach_user_id uuid not null references coaches(id),
   location_id uuid references locations(id),
   start_at timestamptz not null,
   end_at timestamptz not null,
