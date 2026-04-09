@@ -216,7 +216,7 @@ export class SessionService {
     const { data, error } = await supabaseAdmin
       .from("locations")
       .select("*")
-      .order("name", { ascending: true });
+      .order("name", { ascending: false });
     if (error) throw new HttpError(500, "Failed to fetch locations", error);
     return data ?? [];
   }
