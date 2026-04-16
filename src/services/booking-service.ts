@@ -179,6 +179,7 @@ export class BookingService {
       let status: "open" | "full" | "booked" = isBookedByMe ? "booked" : isFull ? "full" : "open";
       return {
         ...rest,
+        coach_user_id: s.coach_id,
         coach_name: coachName,
         booked_count: bookedCount,
         status,
@@ -200,7 +201,11 @@ export class BookingService {
     const s = data as Record<string, unknown> & { coaches?: { admins?: { name?: string } } };
     const coachName = s?.coaches?.admins?.name ?? null;
     const { coaches, ...rest } = s ?? {};
-    return { ...rest, coach_name: coachName };
+    return {
+      ...rest,
+      coach_user_id: (s as { coach_id?: string }).coach_id ?? null,
+      coach_name: coachName,
+    };
   }
 
   async createBooking(input: { memberId: string; membershipId: string; sessionId: string }) {
