@@ -176,10 +176,42 @@ create table if not exists member_session_tags (
 );
 
 create table if not exists coaches (
-  user_id uuid primary key references admins(id) on delete cascade,
+  id uuid primary key default gen_random_uuid(),
+  user_id int null references admins(id) on delete cascade,
+  location_id uuid not null references locations(id),
   weekly_hour_limit_mins int not null default 2400 check (weekly_hour_limit_mins >= 0),
-  travel_buffer_minutes int not null default 30 check (travel_buffer_minutes >= 0)
+  travel_buffer_minutes int not null default 30 check (travel_buffer_minutes >= 0),
+  is_active boolean not null default true,
+  created_at timestamptz not null default now(),
+  constraint coaches_user_id_key unique (user_id)
 );
+
+do $$
+begin
+  alter table coaches add column if not exists id uuid default gen_random_uuid();
+  alter table coaches add column if not exists user_id int;
+  alter table coaches add column if not exists location_id uuid;
+  alter table coaches add column if not exists is_active boolean default true;
+  alter table coaches add column if not exists created_at timestamptz default now();
+  begin
+    alter table coaches alter column user_id type int using user_id::int;
+  exception when others then null;
+  end;
+  if not exists (select 1 from pg_constraint where conname = 'coaches_pkey') then
+    alter table coaches add constraint coaches_pkey primary key (id);
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'coaches_user_id_fkey') then
+    alter table coaches add constraint coaches_user_id_fkey foreign key (user_id) references admins(id) on delete cascade;
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'coaches_location_id_fkey') then
+    alter table coaches add constraint coaches_location_id_fkey foreign key (location_id) references locations(id);
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'coaches_user_id_key') then
+    alter table coaches add constraint coaches_user_id_key unique (user_id);
+  end if;
+exception when others then null;
+end;
+$$ language plpgsql;
 
 -- create table if not exists coach_allowed_session_types (
 --   id uuid primary key default gen_random_uuid(),
@@ -190,7 +222,7 @@ create table if not exists coaches (
 
 create table if not exists coach_availability (
   id uuid primary key default gen_random_uuid(),
-  coach_user_id uuid not null references coaches(user_id) on delete cascade,
+  coach_id uuid not null references coaches(id) on delete cascade,
   day_of_week int not null check (day_of_week between 1 and 7),
   start_mins int not null check (start_mins between 0 and 1439),
   end_mins int not null check (end_mins between 1 and 1440)
@@ -198,7 +230,7 @@ create table if not exists coach_availability (
 
 create table if not exists coach_holidays (
   id uuid primary key default gen_random_uuid(),
-  coach_user_id uuid not null references coaches(user_id) on delete cascade,
+  coach_id uuid not null references coaches(id) on delete cascade,
   start_at timestamptz not null,
   end_at timestamptz not null,
   check (end_at > start_at)
@@ -208,7 +240,7 @@ create table if not exists sessions (
   id uuid primary key default gen_random_uuid(),
   session_type_id uuid not null references session_types(id),
   token_type_id uuid not null,
-  coach_user_id uuid not null references coaches(id),
+  coach_id uuid not null references coaches(id),
   location_id uuid references locations(id),
   start_at timestamptz not null,
   end_at timestamptz not null,
@@ -224,6 +256,10 @@ do $$
 begin
   alter table sessions add column if not exists is_cancelled boolean not null default false;
   alter table sessions add column if not exists "is_online" boolean not null default false;
+  alter table sessions add column if not exists coach_id uuid;
+  if not exists (select 1 from pg_constraint where conname = 'sessions_coach_id_fkey') then
+    alter table sessions add constraint sessions_coach_id_fkey foreign key (coach_id) references coaches(id);
+  end if;
 exception when others then null;
 end $$;
 

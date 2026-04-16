@@ -6,7 +6,7 @@ export class CoachService {
     const { data, error } = await supabaseAdmin
       .from("coaches")
       .select("*, admins!coaches_user_id_fkey(id, name, email, location_id)")
-      .order("user_id", { ascending: true });
+      .order("created_at", { ascending: true });
     if (error) throw new HttpError(500, "Failed to fetch coaches", error);
     return data ?? [];
   }
@@ -15,7 +15,7 @@ export class CoachService {
     const { data, error } = await supabaseAdmin
       .from("coaches")
       .select("*, admins!coaches_user_id_fkey(id, name, email, location_id)")
-      .eq("user_id", coachUserId)
+      .eq("id", coachUserId)
       .single();
     if (error) throw new HttpError(404, "Coach not found", error);
     return data;
@@ -26,18 +26,20 @@ export class CoachService {
     weeklyHourLimitMins?: number;
     travelBufferMinutes?: number;
   }) {
-    const { data: profile, error: profileError } = await supabaseAdmin
-      .from("profiles")
-      .select("id, role")
+    const { data: admin, error: adminErr } = await supabaseAdmin
+      .from("admins")
+      .select("id, location_id")
       .eq("id", input.userId)
       .single();
-    if (profileError || !profile) throw new HttpError(404, "Profile not found");
-    if (profile.role !== "coach") throw new HttpError(400, "Profile must have role 'coach'");
+    if (adminErr || !admin) throw new HttpError(404, "Admin not found");
+    if (!admin.location_id)
+      throw new HttpError(400, "Admin must have a location_id to create coach");
 
     const { data, error } = await supabaseAdmin
       .from("coaches")
       .insert({
         user_id: input.userId,
+        location_id: admin.location_id,
         weekly_hour_limit_mins: input.weeklyHourLimitMins ?? 2400,
         travel_buffer_minutes: input.travelBufferMinutes ?? 30,
       })
@@ -59,7 +61,7 @@ export class CoachService {
     const { data, error } = await supabaseAdmin
       .from("coaches")
       .update(updates)
-      .eq("user_id", coachUserId)
+      .eq("id", coachUserId)
       .select()
       .single();
     if (error) throw new HttpError(500, "Failed to update coach", error);
@@ -67,7 +69,7 @@ export class CoachService {
   }
 
   async deleteCoach(coachUserId: string) {
-    const { error } = await supabaseAdmin.from("coaches").delete().eq("user_id", coachUserId);
+    const { error } = await supabaseAdmin.from("coaches").delete().eq("id", coachUserId);
     if (error) throw new HttpError(500, "Failed to delete coach", error);
     return { ok: true };
   }
@@ -81,7 +83,7 @@ export class CoachService {
     const { data, error } = await supabaseAdmin
       .from("coach_availability")
       .insert({
-        coach_user_id: input.coachUserId,
+        coach_id: input.coachUserId,
         day_of_week: input.dayOfWeek,
         start_mins: input.startMins,
         end_mins: input.endMins,
@@ -102,7 +104,7 @@ export class CoachService {
     const { data, error } = await supabaseAdmin
       .from("coach_availability")
       .select("*")
-      .eq("coach_user_id", coachUserId)
+      .eq("coach_id", coachUserId)
       .order("day_of_week", { ascending: true });
     if (error) throw new HttpError(500, "Failed to fetch coach availability", error);
     return data ?? [];
@@ -112,7 +114,7 @@ export class CoachService {
     const { data, error } = await supabaseAdmin
       .from("coach_holidays")
       .insert({
-        coach_user_id: input.coachUserId,
+        coach_id: input.coachUserId,
         start_at: input.startAt,
         end_at: input.endAt,
       })
@@ -132,7 +134,7 @@ export class CoachService {
     const { data, error } = await supabaseAdmin
       .from("coach_holidays")
       .select("*")
-      .eq("coach_user_id", coachUserId)
+      .eq("coach_id", coachUserId)
       .order("start_at", { ascending: true });
     if (error) throw new HttpError(500, "Failed to fetch coach holidays", error);
     return data ?? [];
@@ -142,7 +144,7 @@ export class CoachService {
     const { data, error } = await supabaseAdmin
       .from("coach_allowed_session_types")
       .insert({
-        coach_user_id: input.coachUserId,
+        coach_id: input.coachUserId,
         session_type_id: input.sessionTypeId,
       })
       .select()
@@ -155,7 +157,7 @@ export class CoachService {
     const { error } = await supabaseAdmin
       .from("coach_allowed_session_types")
       .delete()
-      .eq("coach_user_id", coachUserId)
+      .eq("coach_id", coachUserId)
       .eq("session_type_id", sessionTypeId);
     if (error) throw new HttpError(500, "Failed to remove allowed session type", error);
     return { ok: true };
@@ -165,7 +167,7 @@ export class CoachService {
     const { data, error } = await supabaseAdmin
       .from("coach_allowed_session_types")
       .select("*, session_types(*)")
-      .eq("coach_user_id", coachUserId);
+      .eq("coach_id", coachUserId);
     if (error) throw new HttpError(500, "Failed to fetch coach allowed session types", error);
     return data ?? [];
   }

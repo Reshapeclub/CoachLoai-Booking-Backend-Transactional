@@ -5,7 +5,7 @@ import { HttpError } from "../lib/http-error.js";
  * Validates coach eligibility and scheduling constraints when assigning a coach to a session.
  */
 export async function validateCoachForSession(opts: {
-  coachUserId: string;
+  coachId: string;
   sessionTypeId: string;
   locationId: string | null;
   startAt: string;
@@ -17,15 +17,14 @@ export async function validateCoachForSession(opts: {
   const end = new Date(opts.endAt);
   if (end <= start) throw new HttpError(400, "endAt must be after startAt");
 
-  // 1. Fetch coach + profile (for location_id, weekly_hour_limit_mins, travel_buffer_minutes)
+  // 1. Fetch coach (for location_id, weekly_hour_limit_mins, travel_buffer_minutes)
   const { data: coach, error: coachErr } = await supabaseAdmin
     .from("coaches")
-    .select("*, profiles!coaches_user_id_fkey(id, location_id)")
-    .eq("user_id", opts.coachUserId)
+    .select("id, location_id, weekly_hour_limit_mins, travel_buffer_minutes")
+    .eq("id", opts.coachId)
     .single();
   if (coachErr || !coach) throw new HttpError(404, "Coach not found");
-  const profile = (coach as { profiles?: { location_id?: string | null } }).profiles;
-  const coachLocationId = profile?.location_id ?? null;
+  const coachLocationId = (coach as { location_id?: string | null }).location_id ?? null;
   const weeklyLimit = (coach as { weekly_hour_limit_mins: number }).weekly_hour_limit_mins;
   const travelBufferMins = (coach as { travel_buffer_minutes: number }).travel_buffer_minutes;
 
@@ -38,7 +37,7 @@ export async function validateCoachForSession(opts: {
   const { data: availRows } = await supabaseAdmin
     .from("coach_availability")
     .select("start_mins, end_mins")
-    .eq("coach_user_id", opts.coachUserId)
+    .eq("coach_id", opts.coachId)
     .eq("day_of_week", dayOfWeek);
   const hasSlots = (availRows ?? []).length > 0;
   const withinAvailability =
@@ -53,7 +52,7 @@ export async function validateCoachForSession(opts: {
   const { data: holidays } = await supabaseAdmin
     .from("coach_holidays")
     .select("start_at, end_at")
-    .eq("coach_user_id", opts.coachUserId);
+    .eq("coach_id", opts.coachId);
   const overlapsHoliday = (holidays ?? []).some((h: { start_at: string; end_at: string }) => {
     const hStart = new Date(h.start_at).getTime();
     const hEnd = new Date(h.end_at).getTime();
@@ -79,7 +78,7 @@ export async function validateCoachForSession(opts: {
   let overlapQuery = supabaseAdmin
     .from("sessions")
     .select("id")
-    .eq("coach_user_id", opts.coachUserId)
+    .eq("coach_id", opts.coachId)
     .lt("start_at", opts.endAt)
     .gt("end_at", opts.startAt);
   if (opts.excludeSessionId) overlapQuery = overlapQuery.neq("id", opts.excludeSessionId);
@@ -91,7 +90,7 @@ export async function validateCoachForSession(opts: {
   const { data: otherSessions } = await supabaseAdmin
     .from("sessions")
     .select("id, start_at, end_at, location_id")
-    .eq("coach_user_id", opts.coachUserId);
+    .eq("coach_id", opts.coachId);
   if (opts.excludeSessionId) {
     const filtered = (otherSessions ?? []).filter((s: { id: string }) => s.id !== opts.excludeSessionId);
     for (const s of filtered) {
@@ -130,7 +129,7 @@ export async function validateCoachForSession(opts: {
     const { data: weekSessions } = await supabaseAdmin
       .from("sessions")
       .select("start_at, end_at")
-      .eq("coach_user_id", opts.coachUserId)
+      .eq("coach_id", opts.coachId)
       .gte("start_at", weekStart.toISOString())
       .lt("start_at", weekEnd.toISOString());
 

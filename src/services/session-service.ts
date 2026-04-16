@@ -187,7 +187,7 @@ export class SessionService {
   async createSession(input: {
     sessionTypeId: string;
     tokenTypeId: string;
-    coachUserId: string;
+    coachId: string;
     locationId?: string | null;
     startAt: string;
     endAt: string;
@@ -196,7 +196,7 @@ export class SessionService {
     isOnline?: boolean;
   }) {
     await validateCoachForSession({
-      coachUserId: input.coachUserId,
+      coachId: input.coachId,
       sessionTypeId: input.sessionTypeId,
       locationId: input.locationId ?? null,
       startAt: input.startAt,
@@ -208,7 +208,7 @@ export class SessionService {
       .insert({
         session_type_id: input.sessionTypeId,
         token_type_id: input.tokenTypeId,
-        coach_user_id: input.coachUserId,
+        coach_id: input.coachId,
         location_id: input.locationId ?? null,
         start_at: input.startAt,
         end_at: input.endAt,
@@ -243,7 +243,7 @@ export class SessionService {
 
   async setCoach(
     sessionId: string,
-    coachUserId: string,
+    coachId: string,
     opts?: { allowOvertime?: boolean }
   ) {
     const { data: session, error: fetchErr } = await supabaseAdmin
@@ -254,7 +254,7 @@ export class SessionService {
     if (fetchErr || !session)
       throw new HttpError(404, "Session not found");
     await validateCoachForSession({
-      coachUserId,
+      coachId,
       sessionTypeId: session.session_type_id,
       locationId: session.location_id,
       startAt: session.start_at,
@@ -264,7 +264,7 @@ export class SessionService {
     });
     const { data, error } = await supabaseAdmin
       .from("sessions")
-      .update({ coach_user_id: coachUserId })
+      .update({ coach_id: coachId })
       .eq("id", sessionId)
       .select()
       .single();
@@ -275,13 +275,13 @@ export class SessionService {
   async setSessionType(sessionId: string, sessionTypeId: string, tokenTypeId: string) {
     const { data: session, error: fetchErr } = await supabaseAdmin
       .from("sessions")
-      .select("coach_user_id, location_id, start_at, end_at")
+      .select("coach_id, location_id, start_at, end_at")
       .eq("id", sessionId)
       .single();
     if (fetchErr || !session)
       throw new HttpError(404, "Session not found");
     await validateCoachForSession({
-      coachUserId: session.coach_user_id,
+      coachId: session.coach_id,
       sessionTypeId,
       locationId: session.location_id,
       startAt: session.start_at,
