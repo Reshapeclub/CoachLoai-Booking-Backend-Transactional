@@ -13,29 +13,35 @@ export class TokenService {
     const expiryPolicy = this.getPurchaseExpiryPolicy();
     const { data, error } = await supabaseAdmin
       .from("session_types")
-      .select("id, name, token_type_id, color, icon, display_order, is_active")
+      .select("id, name, category, token_type_id, color, icon, display_order, is_active")
       .eq("is_active", true)
       .order("display_order", { ascending: true })
       .order("created_at", { ascending: true });
 
     if (error) throw new HttpError(500, "Failed to fetch purchasable session options", error);
 
-    return (data ?? [])
-      .map((item) => {
-        const unitAmountMinorCents = this.unitAmountMinorCentsByName[item.name];
-        if (!unitAmountMinorCents) return null;
-        return {
-          id: item.id,
-          name: item.name,
-          tokenTypeId: item.token_type_id,
-          color: item.color,
-          icon: item.icon ?? (item.name === "Group" ? "👥" : null),
-          unitAmountMinorCents,
-          unitPrice: unitAmountMinorCents / 100,
-          expiryPolicy,
-        };
-      })
-      .filter((item): item is NonNullable<typeof item> => item !== null);
+    // Category-level tokens: show ONE purchasable option per category/tokenTypeId
+    const byCategory = new Map<string, (typeof data)[number]>();
+    for (const row of data ?? []) {
+      const category = (row as { category?: string | null }).category ?? null;
+      if (!category) continue;
+      if (!this.unitAmountMinorCentsByName[category]) continue;
+      if (!byCategory.has(category)) byCategory.set(category, row);
+    }
+
+    return Array.from(byCategory.entries()).map(([category, item]) => {
+      const unitAmountMinorCents = this.unitAmountMinorCentsByName[category];
+      return {
+        id: item.id,
+        name: category,
+        tokenTypeId: item.token_type_id,
+        color: item.color,
+        icon: item.icon ?? (category === "Group" ? "👥" : null),
+        unitAmountMinorCents,
+        unitPrice: unitAmountMinorCents / 100,
+        expiryPolicy,
+      };
+    });
   }
 
   async getWallet(memberId: string) {

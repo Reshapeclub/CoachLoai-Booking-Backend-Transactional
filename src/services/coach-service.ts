@@ -5,7 +5,7 @@ export class CoachService {
   async listCoaches() {
     const { data, error } = await supabaseAdmin
       .from("coaches")
-      .select("*, profiles!coaches_user_id_fkey(id, full_name, email, location_id)")
+      .select("*, admins!coaches_user_id_fkey(id, name, email, location_id)")
       .order("user_id", { ascending: true });
     if (error) throw new HttpError(500, "Failed to fetch coaches", error);
     return data ?? [];
@@ -14,7 +14,7 @@ export class CoachService {
   async getCoach(coachUserId: string) {
     const { data, error } = await supabaseAdmin
       .from("coaches")
-      .select("*, profiles!coaches_user_id_fkey(id, full_name, email, location_id)")
+      .select("*, admins!coaches_user_id_fkey(id, name, email, location_id)")
       .eq("user_id", coachUserId)
       .single();
     if (error) throw new HttpError(404, "Coach not found", error);

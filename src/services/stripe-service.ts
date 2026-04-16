@@ -10,9 +10,11 @@ export class StripeService {
     if (!this.stripe) throw new HttpError(500, 'Stripe is not configured');
     const { data: sessionType, error: sessionTypeError } = await supabaseAdmin
       .from("session_types")
-      .select("name")
+      .select("name, category")
       .eq("token_type_id", input.tokenTypeId)
-      .single();
+      .order("created_at", { ascending: true })
+      .limit(1)
+      .maybeSingle();
 
     if (sessionTypeError || !sessionType?.name) {
       throw new HttpError(404, "Session type not found for tokenTypeId", sessionTypeError);
@@ -25,7 +27,8 @@ export class StripeService {
       "1:1": 9000,
     };
 
-    const unitAmountMinorCents = unitAmountMinorCentsByName[sessionType.name];
+    const pricingKey = sessionType.category || sessionType.name;
+    const unitAmountMinorCents = unitAmountMinorCentsByName[pricingKey];
     if (!unitAmountMinorCents) {
       throw new HttpError(400, `Unsupported session type price: ${sessionType.name}`);
     }

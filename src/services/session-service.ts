@@ -12,34 +12,102 @@ export class SessionService {
     return data ?? [];
   }
 
+  async listSessionTypesGrouped() {
+    const { data, error } = await supabaseAdmin
+      .from("session_types")
+      .select("*")
+      .order("category", { ascending: true })
+      .order("created_at", { ascending: true });
+    if (error) throw new HttpError(500, "Failed to fetch session types", error);
+    const rows = (data ?? []) as Array<Record<string, unknown> & { category?: string; token_type_id?: string }>;
+
+    const groups = new Map<string, { category: string; tokenTypeId: string | null; children: unknown[] }>();
+    for (const row of rows) {
+      const category = String(row.category || "1:1");
+      const tokenTypeId = row.token_type_id ? String(row.token_type_id) : null;
+      const g = groups.get(category) ?? { category, tokenTypeId, children: [] };
+      // prefer first tokenTypeId encountered (created_at asc)
+      if (!g.tokenTypeId && tokenTypeId) g.tokenTypeId = tokenTypeId;
+      g.children.push(row);
+      groups.set(category, g);
+    }
+    return Array.from(groups.values());
+  }
+
+  async listSessionTypesByCategory(category: "1:1" | "Elite" | "Octave" | "Group") {
+    const { data, error } = await supabaseAdmin
+      .from("session_types")
+      .select("*")
+      .eq("category", category)
+      .order("created_at", { ascending: true });
+    if (error) throw new HttpError(500, "Failed to fetch session types by category", error);
+    return data ?? [];
+  }
+
   async listSessions(from?: string, to?: string) {
     let query = supabaseAdmin
       .from("sessions")
-      .select("*, session_types(*), coaches(profiles(full_name, id))")
-      .limit(1)
+      .select("*, session_types(*), coaches(admins(name, id)), locations(name)")
       .order("start_at", { ascending: true });
     if (from) query = query.gte("start_at", from);
     if (to) query = query.lte("start_at", to);
     const { data, error } = await query;
-    console.log(data);
     if (error) throw new HttpError(500, "Failed to fetch sessions", error);
-    const sessions = (data ?? []) as Array<Record<string, unknown> & { coaches?: { profiles?: { full_name?: string } } }>;
+    const sessions = (data ?? []) as Array<
+      Record<string, unknown> & {
+        id: string;
+        coaches?: { admins?: { name?: string } };
+        locations?: { name?: string };
+      }
+    >;
+
+    const sessionIds = sessions.map((s) => s.id).filter(Boolean);
+    const bookedCountBySessionId: Record<string, number> = {};
+    if (sessionIds.length > 0) {
+      const { data: bookings, error: bookingsErr } = await supabaseAdmin
+        .from("bookings")
+        .select("session_id")
+        .in("session_id", sessionIds)
+        .eq("status", "booked");
+      if (bookingsErr) throw new HttpError(500, "Failed to fetch session bookings", bookingsErr);
+      (bookings ?? []).forEach((b) => {
+        const sessionId = String(b.session_id);
+        bookedCountBySessionId[sessionId] = (bookedCountBySessionId[sessionId] ?? 0) + 1;
+      });
+    }
+
     return sessions.map((s) => {
-      const coachName = s.coaches?.profiles?.full_name ?? null;
-      const { coaches, ...rest } = s;
-      return { ...rest, coach_name: coachName };
+      const coachName = s.coaches?.admins?.name ?? null;
+      const locationName = s.locations?.name ?? null;
+      const { coaches, locations, ...rest } = s;
+      return {
+        ...rest,
+        coach_name: coachName,
+        location_name: locationName,
+        booked_count: bookedCountBySessionId[s.id] ?? 0,
+      };
     });
   }
 
-  async createSessionType(input: { name: string; color?: string | null; icon?: string | null; displayOrder?: number; defaultCapacity: number; defaultDurationMins: 30 | 45 | 60 }) {
-    const tokenTypeId = crypto.randomUUID();
+  async createSessionType(input: { name: string; category?: "1:1" | "Elite" | "Octave" | "Group"; color?: string | null; icon?: string | null; displayOrder?: number; defaultCapacity: number; maxPerDay?: number; defaultDurationMins: 30 | 45 | 60 }) {
+    const category = input.category ?? "1:1";
+    const { data: existingCategoryType } = await supabaseAdmin
+      .from("session_types")
+      .select("token_type_id")
+      .eq("category", category)
+      .order("created_at", { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    const tokenTypeId = existingCategoryType?.token_type_id ?? crypto.randomUUID();
     const { data, error } = await supabaseAdmin.from('session_types').insert({
       name: input.name,
+      category,
       color: input.color ?? null,
       icon: input.icon ?? null,
       display_order: input.displayOrder ?? 0,
       token_type_id: tokenTypeId,
       default_capacity: input.defaultCapacity,
+      max_per_day: input.maxPerDay ?? input.defaultCapacity,
       default_duration_mins: input.defaultDurationMins
     }).select().single();
     if (error) throw new HttpError(500, 'Failed to create session type', error);
@@ -50,20 +118,26 @@ export class SessionService {
     sessionTypeId: string,
     input: {
       name?: string;
+      category?: "1:1" | "Elite" | "Octave" | "Group";
       color?: string | null;
       icon?: string | null;
       displayOrder?: number;
       defaultCapacity?: number;
+      maxPerDay?: number;
       defaultDurationMins?: 30 | 45 | 60;
     }
   ) {
     const updates: Record<string, unknown> = {};
     if (input.name !== undefined) updates.name = input.name;
+    if (input.category !== undefined) updates.category = input.category;
     if (input.color !== undefined) updates.color = input.color;
     if (input.icon !== undefined) updates.icon = input.icon;
     if (input.displayOrder !== undefined) updates.display_order = input.displayOrder;
     if (input.defaultCapacity !== undefined) {
       updates.default_capacity = input.defaultCapacity;
+    }
+    if (input.maxPerDay !== undefined) {
+      updates.max_per_day = input.maxPerDay;
     }
     if (input.defaultDurationMins !== undefined) {
       updates.default_duration_mins = input.defaultDurationMins;
@@ -77,6 +151,37 @@ export class SessionService {
       .single();
     if (error) throw new HttpError(500, "Failed to update session type", error);
     return data;
+  }
+
+  async updateSessionTypesByCategory(
+    category: "1:1" | "Elite" | "Octave" | "Group",
+    input: {
+      color?: string | null;
+      icon?: string | null;
+      displayOrder?: number;
+      defaultCapacity?: number;
+      maxPerDay?: number;
+      defaultDurationMins?: 30 | 45 | 60;
+      isActive?: boolean;
+    }
+  ) {
+    const updates: Record<string, unknown> = {};
+    if (input.color !== undefined) updates.color = input.color;
+    if (input.icon !== undefined) updates.icon = input.icon;
+    if (input.displayOrder !== undefined) updates.display_order = input.displayOrder;
+    if (input.defaultCapacity !== undefined) updates.default_capacity = input.defaultCapacity;
+    if (input.maxPerDay !== undefined) updates.max_per_day = input.maxPerDay;
+    if (input.defaultDurationMins !== undefined) updates.default_duration_mins = input.defaultDurationMins;
+    if (input.isActive !== undefined) updates.is_active = input.isActive;
+    if (Object.keys(updates).length === 0) throw new HttpError(400, "No fields to update");
+
+    const { data, error } = await supabaseAdmin
+      .from("session_types")
+      .update(updates)
+      .eq("category", category)
+      .select();
+    if (error) throw new HttpError(500, "Failed to update session types by category", error);
+    return data ?? [];
   }
 
   async createSession(input: {
@@ -206,7 +311,7 @@ export class SessionService {
   async listCoaches() {
     const { data, error } = await supabaseAdmin
       .from("coaches")
-      .select("*, profiles!coaches_user_id_fkey(id, full_name, email, location_id)")
+      .select("*, admins!coaches_user_id_fkey(id, name, email, location_id)")
       .order("user_id", { ascending: true });
     if (error) throw new HttpError(500, "Failed to fetch coaches", error);
     return data ?? [];

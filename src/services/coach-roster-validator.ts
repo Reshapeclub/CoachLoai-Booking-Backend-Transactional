@@ -62,14 +62,14 @@ export async function validateCoachForSession(opts: {
   if (overlapsHoliday) throw new HttpError(400, "Session overlaps with coach holiday");
 
   // 4. Session type permitted for coach
-  const { data: allowed } = await supabaseAdmin
-    .from("coach_allowed_session_types")
-    .select("id")
-    .eq("coach_user_id", opts.coachUserId)
-    .eq("session_type_id", opts.sessionTypeId)
-    .maybeSingle();
-  if (!allowed)
-    throw new HttpError(400, "Session type is not permitted for this coach");
+  // const { data: allowed } = await supabaseAdmin
+  //   .from("coach_allowed_session_types")
+  //   .select("id")
+  //   .eq("coach_user_id", opts.coachUserId)
+  //   .eq("session_type_id", opts.sessionTypeId)
+  //   .maybeSingle();
+  // if (!allowed)
+  //   throw new HttpError(400, "Session type is not permitted for this coach");
 
   // 5. Location match (coach's location or session location; if both set, they must match)
   if (opts.locationId && coachLocationId && opts.locationId !== coachLocationId)

@@ -63,6 +63,42 @@ export class BookingService {
     const { data: user, error: userError } = await supabaseAdmin.from("profiles").select("*").eq("id", memberId).single();
     if (userError || !user) throw new HttpError(404, "Member not found");
 
+    // Membership eligibility gating:
+    // - membership_allowed_session_types: which session types member can book
+    // - membership_session_allowances: which token_type_ids membership provides allowance for
+    const { data: activeMembershipId, error: membershipErr } = await supabaseAdmin.rpc(
+      "clm_find_active_membership",
+      { p_member_id: memberId, p_now: new Date().toISOString() }
+    );
+    if (membershipErr) throw new HttpError(500, "Failed to resolve active membership", membershipErr);
+    if (!activeMembershipId) return [];
+
+    const [{ data: allowedRows, error: allowedErr }, { data: allowanceRows, error: allowanceErr }] =
+      await Promise.all([
+        supabaseAdmin
+          .from("membership_allowed_session_types")
+          .select("session_type_id")
+          .eq("membership_id", activeMembershipId),
+        supabaseAdmin
+          .from("membership_session_allowances")
+          .select("token_type_id, weekly_allowance")
+          .eq("membership_id", activeMembershipId)
+          .gt("weekly_allowance", 0),
+      ]);
+    if (allowedErr) throw new HttpError(500, "Failed to fetch allowed session types", allowedErr);
+    if (allowanceErr) throw new HttpError(500, "Failed to fetch membership allowances", allowanceErr);
+
+    const allowedSessionTypeIds = (allowedRows ?? [])
+      .map((r) => (r as { session_type_id?: string }).session_type_id)
+      .filter((v): v is string => Boolean(v));
+    if (allowedSessionTypeIds.length === 0) return [];
+
+    const allowedTokenTypeIds = new Set(
+      (allowanceRows ?? [])
+        .map((r) => (r as { token_type_id?: string }).token_type_id)
+        .filter((v): v is string => Boolean(v))
+    );
+
     const isDateOnly = (v: string) => /^\d{4}-\d{2}-\d{2}$/.test(v);
     const toStartOfDayUtc = (v: string) => `${v}T00:00:00.000Z`;
     const toEndOfDayUtc = (v: string) => `${v}T23:59:59.999Z`;
@@ -75,11 +111,12 @@ export class BookingService {
 
     let query = supabaseAdmin
       .from("sessions")
-      .select("*, session_types(*), coaches(profiles(full_name))")
+      .select("*, session_types(*), coaches(admins(name))")
       .gte("start_at", effectiveFrom)
       .order("start_at", { ascending: true });
     if (effectiveTo) query = query.lte("start_at", effectiveTo);
     if (sessionTypeId) query = query.eq("session_type_id", sessionTypeId);
+    else query = query.in("session_type_id", allowedSessionTypeIds);
 
     if (isOnline === true) {
       query = query.eq("is_online", true);
@@ -92,11 +129,25 @@ export class BookingService {
     const { data: sessions, error } = await query;
     if (error) throw new HttpError(500, "Failed to fetch available sessions", error);
     const list = (sessions ?? []) as Array<
-      Record<string, unknown> & { id: string; capacity: number; coaches?: { profiles?: { full_name?: string } } }
+      Record<string, unknown> & {
+        id: string;
+        capacity: number;
+        coaches?: { admins?: { name?: string } };
+        session_types?: { token_type_id?: string } | null;
+      }
     >;
     if (list.length === 0) return [];
 
-    const sessionIds = list.map((s) => s.id);
+    // Enforce allowance gating at token level too
+    const eligibleList = allowedTokenTypeIds.size
+      ? list.filter((s) => {
+          const tokenTypeId = s.session_types?.token_type_id;
+          return tokenTypeId ? allowedTokenTypeIds.has(String(tokenTypeId)) : false;
+        })
+      : [];
+    if (eligibleList.length === 0) return [];
+
+    const sessionIds = eligibleList.map((s) => s.id);
 
     const [bookedCountsRes, memberBookingsRes, memberCancelledBookingsRes, memberWaitlistRes] = await Promise.all([
       supabaseAdmin.from("bookings").select("session_id").in("session_id", sessionIds).eq("status", "booked"),
@@ -116,8 +167,8 @@ export class BookingService {
     const memberCancelledSessionIds = new Set((memberCancelledBookingsRes.data ?? []).map((r) => (r as { session_id: string }).session_id));
     const memberWaitlistSessionIds = new Set((memberWaitlistRes.data ?? []).map((r) => (r as { session_id: string }).session_id));
 
-    return list.map((s) => {
-      const coachName = s.coaches?.profiles?.full_name ?? null;
+    return eligibleList.map((s) => {
+      const coachName = s.coaches?.admins?.name ?? null;
       const { coaches, ...rest } = s;
       const bookedCount = bookedBySession.get(s.id) ?? 0;
       const isFull = bookedCount >= s.capacity;
@@ -142,12 +193,12 @@ export class BookingService {
   async getSessionDetail(sessionId: string) {
     const { data, error } = await supabaseAdmin
       .from("sessions")
-      .select("*, session_types(*), coaches(profiles(full_name))")
+      .select("*, session_types(*), coaches(admins(name))")
       .eq("id", sessionId)
       .single();
     if (error) throw new HttpError(404, "Session not found", error);
-    const s = data as Record<string, unknown> & { coaches?: { profiles?: { full_name?: string } } };
-    const coachName = s?.coaches?.profiles?.full_name ?? null;
+    const s = data as Record<string, unknown> & { coaches?: { admins?: { name?: string } } };
+    const coachName = s?.coaches?.admins?.name ?? null;
     const { coaches, ...rest } = s ?? {};
     return { ...rest, coach_name: coachName };
   }

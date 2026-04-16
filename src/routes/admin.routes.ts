@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { z } from "zod";
 import { requireAdminAuth } from "../middleware/auth.js";
 import { requireAdminTableAccess } from "../middleware/roles.js";
 import { validate } from "../utils/validate.js";
@@ -29,6 +30,7 @@ import {
   adminMeetingSlotsQuerySchema,
   createMeetingSlotSchema,
   updateMeetingSlotSchema,
+  updateSessionTypesByCategorySchema,
 } from "../validators/admin.schemas.js";
 import { SessionService } from "../services/session-service.js";
 import { CoachService } from "../services/coach-service.js";
@@ -50,9 +52,39 @@ const meetingService = new MeetingService();
 
 router.use(requireAdminAuth, requireAdminTableAccess());
 // Admin session types routes
-router.get('/session-types', async (req, res, next) => { try { res.json({ ok: true, data: await sessionService.listSessionTypes() }); } catch (e) { next(e); } });
+router.get('/session-types', async (req, res, next) => {
+  try {
+    const grouped =
+      req.query.grouped === "1" ||
+      req.query.grouped === "true" ||
+      req.query.grouped === "yes";
+    const data = grouped
+      ? await sessionService.listSessionTypesGrouped()
+      : await sessionService.listSessionTypes();
+    res.json({ ok: true, data });
+  } catch (e) {
+    next(e);
+  }
+});
+router.get('/session-types/category/:category', async (req, res, next) => {
+  try {
+    const category = validate(z.object({ category: z.enum(["1:1", "Elite", "Octave", "Group"]) }), req.params).category;
+    res.json({ ok: true, data: await sessionService.listSessionTypesByCategory(category) });
+  } catch (e) {
+    next(e);
+  }
+});
 router.post('/session-types', async (req, res, next) => { try { const body = validate(createSessionTypeSchema, req.body); res.json({ ok: true, data: await sessionService.createSessionType(body) }); } catch (e) { next(e); } });
 router.patch('/session-types/:sessionTypeId', async (req, res, next) => { try { const body = validate(updateSessionTypeSchema, req.body); res.json({ ok: true, data: await sessionService.updateSessionType(req.params.sessionTypeId, body) }); } catch (e) { next(e); } });
+router.patch('/session-types/category/:category', async (req, res, next) => {
+  try {
+    const category = validate(z.object({ category: z.enum(["1:1", "Elite", "Octave", "Group"]) }), req.params).category;
+    const body = validate(updateSessionTypesByCategorySchema, req.body);
+    res.json({ ok: true, data: await sessionService.updateSessionTypesByCategory(category, body) });
+  } catch (e) {
+    next(e);
+  }
+});
 // Admin session routes
 router.get('/sessions', async (req, res, next) => { try { const from = typeof req.query.from === 'string' ? req.query.from : undefined; const to = typeof req.query.to === 'string' ? req.query.to : undefined; res.json({ ok: true, data: await sessionService.listSessions(from, to) }); } catch (e) { next(e); } });
 router.get('/sessions/:sessionId/members', async (req, res, next) => { try { res.json({ ok: true, data: await sessionService.getSessionMembers(req.params.sessionId) }); } catch (e) { next(e); } });

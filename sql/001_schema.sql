@@ -126,8 +126,10 @@ create table if not exists membership_pause_weeks (
 create table if not exists session_types (
   id uuid primary key default gen_random_uuid(),
   name text not null unique,
-  token_type_id uuid not null unique,
+  category text not null default '1:1' check (category in ('1:1','Elite','Octave','Group')),
+  token_type_id uuid not null,
   default_capacity int not null check (default_capacity > 0),
+  max_per_day int not null default 1 check (max_per_day > 0),
   default_duration_mins int not null check (default_duration_mins in (30,45,60)),
   color text null,
   icon text null,
@@ -135,6 +137,21 @@ create table if not exists session_types (
   is_active boolean not null default true,
   created_at timestamptz not null default now()
 );
+
+do $$
+begin
+  -- allow token sharing across multiple names in same category
+  alter table session_types drop constraint if exists session_types_token_type_id_key;
+  alter table session_types add column if not exists max_per_day int default 4;
+  alter table session_types add column if not exists category text default '1:1';
+  if not exists (select 1 from pg_constraint where conname = 'session_types_category_check') then
+    alter table session_types add constraint session_types_category_check check (category in ('1:1','Elite','Octave','Group'));
+  end if;
+  alter table session_types add column if not exists color text;
+  alter table session_types add column if not exists icon text;
+exception when others then null;
+end;
+$$ language plpgsql;
 
 create table if not exists membership_session_allowances (
   id uuid primary key default gen_random_uuid(),
@@ -159,17 +176,17 @@ create table if not exists member_session_tags (
 );
 
 create table if not exists coaches (
-  user_id uuid primary key references profiles(id) on delete cascade,
+  user_id uuid primary key references admins(id) on delete cascade,
   weekly_hour_limit_mins int not null default 2400 check (weekly_hour_limit_mins >= 0),
   travel_buffer_minutes int not null default 30 check (travel_buffer_minutes >= 0)
 );
 
-create table if not exists coach_allowed_session_types (
-  id uuid primary key default gen_random_uuid(),
-  coach_user_id uuid not null references coaches(user_id) on delete cascade,
-  session_type_id uuid not null references session_types(id) on delete cascade,
-  constraint coach_allowed_unique unique (coach_user_id, session_type_id)
-);
+-- create table if not exists coach_allowed_session_types (
+--   id uuid primary key default gen_random_uuid(),
+--   coach_user_id uuid not null references coaches(user_id) on delete cascade,
+--   session_type_id uuid not null references session_types(id) on delete cascade,
+--   constraint coach_allowed_unique unique (coach_user_id, session_type_id)
+-- );
 
 create table if not exists coach_availability (
   id uuid primary key default gen_random_uuid(),
@@ -220,12 +237,12 @@ create table if not exists tokens (
   expiry_at timestamptz not null,
   source text not null check (source in ('weekly','admin','purchase')),
   source_meta jsonb not null default '{}'::jsonb,
-  coach_id uuid NULL references coaches(user_id)
+  coach_id uuid NULL references coaches(id)
 )
 
 do $$
 begin
-  alter table tokens add column if not exists coach_id uuid references coaches(user_id);
+  alter table tokens add column if not exists coach_id uuid references coaches(id);
 exception when others then null;
 end $$;
 

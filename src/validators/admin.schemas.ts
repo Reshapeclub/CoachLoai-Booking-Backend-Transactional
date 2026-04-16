@@ -1,26 +1,45 @@
 import { z } from "zod";
+const allowedSessionDurations = z.union([z.literal(30), z.literal(45), z.literal(60)]);
+const sessionTypeCategorySchema = z.enum(["1:1", "Elite", "Octave", "Group"]);
+
 export const createSessionTypeSchema = z.object({
   name: z.string().min(1),
+  category: sessionTypeCategorySchema.optional(),
   defaultCapacity: z.number().int().min(1),
-  defaultDurationMins: z.union([z.literal(30), z.literal(45), z.literal(60)]),
+  maxPerDay: z.number().int().min(1).optional(),
+  defaultDurationMins: allowedSessionDurations,
   color: z.string().nullable().optional(),
   icon: z.string().nullable().optional(),
   displayOrder: z.number().int().min(0).optional()
 });
 export const updateSessionTypeSchema = z.object({
   name: z.string().min(1).optional(),
+  category: sessionTypeCategorySchema.optional(),
   defaultCapacity: z.number().int().min(1).optional(),
-  defaultDurationMins: z.union([z.literal(30), z.literal(45), z.literal(60)]).optional(),
+  maxPerDay: z.number().int().min(1).optional(),
+  defaultDurationMins: allowedSessionDurations.optional(),
   color: z.string().nullable().optional(),
   icon: z.string().nullable().optional(),
   displayOrder: z.number().int().min(0).optional()
 }).refine((v) => Object.keys(v).length > 0, { message: "At least one field must be provided" });
+
+export const updateSessionTypesByCategorySchema = z
+  .object({
+    defaultCapacity: z.number().int().min(1).optional(),
+    maxPerDay: z.number().int().min(1).optional(),
+    defaultDurationMins: allowedSessionDurations.optional(),
+    color: z.string().nullable().optional(),
+    icon: z.string().nullable().optional(),
+    displayOrder: z.number().int().min(0).optional(),
+    isActive: z.boolean().optional(),
+  })
+  .refine((v) => Object.keys(v).length > 0, { message: "At least one field must be provided" });
 export const createSessionSchema = z.object({
   sessionTypeId: z.string().min(1),
   coachId: z.string().min(1),
   locationId: z.string().nullable().optional(),
   start: z.string().datetime(),
-  durationMins: z.union([z.literal(30), z.literal(45), z.literal(60)]).optional(),
+  durationMins: allowedSessionDurations.optional(),
   capacity: z.number().int().min(1).optional(),
   allowOvertime: z.boolean().optional(),
   isOnline: z.boolean().optional(),
