@@ -25,6 +25,7 @@ import {
   addCoachHolidaySchema,
   addCoachSessionTypeSchema,
   adminBookingsListQuerySchema,
+  adminWaitlistEntriesQuerySchema,
   createMeetingTypeSchema,
   updateMeetingTypeSchema,
   adminMeetingSlotsQuerySchema,
@@ -75,7 +76,7 @@ router.get('/session-types/category/:category', async (req, res, next) => {
   }
 });
 router.post('/session-types', async (req, res, next) => { try { const body = validate(createSessionTypeSchema, req.body); res.json({ ok: true, data: await sessionService.createSessionType(body) }); } catch (e) { next(e); } });
-router.patch('/session-types/:sessionTypeId', async (req, res, next) => { try { const body = validate(updateSessionTypeSchema, req.body); res.json({ ok: true, data: await sessionService.updateSessionType(req.params.sessionTypeId, body) }); } catch (e) { next(e); } });
+// More specific path first so "category" is never captured as :sessionTypeId.
 router.patch('/session-types/category/:category', async (req, res, next) => {
   try {
     const category = validate(z.object({ category: z.enum(["1:1", "Elite", "Octave", "Group"]) }), req.params).category;
@@ -85,7 +86,16 @@ router.patch('/session-types/category/:category', async (req, res, next) => {
     next(e);
   }
 });
+router.patch('/session-types/:sessionTypeId', async (req, res, next) => { try { const body = validate(updateSessionTypeSchema, req.body); res.json({ ok: true, data: await sessionService.updateSessionType(req.params.sessionTypeId, body) }); } catch (e) { next(e); } });
 // Admin session routes
+router.get('/waitlist-entries', async (req, res, next) => {
+  try {
+    const q = validate(adminWaitlistEntriesQuerySchema, req.query);
+    res.json({ ok: true, data: await bookingService.listAdminWaitlistEntries({ from: q.from, to: q.to }) });
+  } catch (e) {
+    next(e);
+  }
+});
 router.get('/sessions', async (req, res, next) => { try { const from = typeof req.query.from === 'string' ? req.query.from : undefined; const to = typeof req.query.to === 'string' ? req.query.to : undefined; res.json({ ok: true, data: await sessionService.listSessions(from, to) }); } catch (e) { next(e); } });
 router.get('/sessions/:sessionId/members', async (req, res, next) => { try { res.json({ ok: true, data: await sessionService.getSessionMembers(req.params.sessionId) }); } catch (e) { next(e); } });
 router.get('/sessions/:sessionId/waitlist', async (req, res, next) => { try { res.json({ ok: true, data: await bookingService.getSessionWaitlist(req.params.sessionId) }); } catch (e) { next(e); } });

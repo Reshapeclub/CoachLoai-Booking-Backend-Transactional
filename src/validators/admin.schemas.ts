@@ -8,29 +8,34 @@ export const createSessionTypeSchema = z.object({
   defaultCapacity: z.number().int().min(1),
   maxPerDay: z.number().int().min(1).optional(),
   defaultDurationMins: allowedSessionDurations,
+  audience: z.string().nullable().optional(),
   color: z.string().nullable().optional(),
   icon: z.string().nullable().optional(),
   displayOrder: z.number().int().min(0).optional()
 });
+const intMin1 = z.coerce.number().int().min(1);
+const intMin0 = z.coerce.number().int().min(0);
+
 export const updateSessionTypeSchema = z.object({
   name: z.string().min(1).optional(),
   category: sessionTypeCategorySchema.optional(),
-  defaultCapacity: z.number().int().min(1).optional(),
-  maxPerDay: z.number().int().min(1).optional(),
+  defaultCapacity: intMin1.optional(),
+  maxPerDay: intMin1.optional(),
   defaultDurationMins: allowedSessionDurations.optional(),
+  audience: z.string().nullable().optional(),
   color: z.string().nullable().optional(),
   icon: z.string().nullable().optional(),
-  displayOrder: z.number().int().min(0).optional()
+  displayOrder: intMin0.optional()
 }).refine((v) => Object.keys(v).length > 0, { message: "At least one field must be provided" });
 
 export const updateSessionTypesByCategorySchema = z
   .object({
-    defaultCapacity: z.number().int().min(1).optional(),
-    maxPerDay: z.number().int().min(1).optional(),
+    defaultCapacity: intMin1.optional(),
+    maxPerDay: intMin1.optional(),
     defaultDurationMins: allowedSessionDurations.optional(),
     color: z.string().nullable().optional(),
     icon: z.string().nullable().optional(),
-    displayOrder: z.number().int().min(0).optional(),
+    displayOrder: intMin0.optional(),
     isActive: z.boolean().optional(),
   })
   .refine((v) => Object.keys(v).length > 0, { message: "At least one field must be provided" });
@@ -98,7 +103,7 @@ export const addAllowedSessionTypeSchema = z.object({
 
 // Coach schemas
 export const createCoachSchema = z.object({
-  userId: z.string().uuid(),
+  userId: z.number().int().positive(),
   weeklyHourLimitMins: z.number().int().min(0).max(10080).optional(),
   travelBufferMinutes: z.number().int().min(0).max(480).optional(),
 });
@@ -127,6 +132,11 @@ export const adminBookingsListQuerySchema = z.object({
   sessionId: z.string().uuid().optional(),
   status: z.enum(["booked", "cancelled", "no_show"]).optional(),
   limit: z.coerce.number().int().min(1).max(500).optional(),
+});
+
+export const adminWaitlistEntriesQuerySchema = z.object({
+  from: z.string().datetime().optional(),
+  to: z.string().datetime().optional(),
 });
 
 export const createMeetingTypeSchema = z.object({

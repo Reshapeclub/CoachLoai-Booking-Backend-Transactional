@@ -22,7 +22,7 @@ export class CoachService {
   }
 
   async createCoach(input: {
-    userId: string;
+    userId: number;
     weeklyHourLimitMins?: number;
     travelBufferMinutes?: number;
   }) {

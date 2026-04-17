@@ -22,6 +22,27 @@ export class BookingService {
     return data ?? [];
   }
 
+  /** Waitlist rows for sessions whose start_at falls in [from, to] (admin dashboard). */
+  async listAdminWaitlistEntries(filters: { from?: string; to?: string }) {
+    let sessionQuery = supabaseAdmin.from("sessions").select("id");
+    if (filters.from) sessionQuery = sessionQuery.gte("start_at", filters.from);
+    if (filters.to) sessionQuery = sessionQuery.lte("start_at", filters.to);
+    const { data: sessionRows, error: sessionErr } = await sessionQuery;
+    if (sessionErr) throw new HttpError(500, "Failed to resolve sessions for waitlist", sessionErr);
+    const sessionIds = (sessionRows ?? []).map((r) => String((r as { id: string }).id));
+    if (sessionIds.length === 0) return [];
+
+    const { data, error } = await supabaseAdmin
+      .from("waiting_list_entries")
+      .select(
+        "id, session_id, member_id, joined_at, sessions(start_at, capacity, session_types(category), locations(name), coaches!sessions_coach_id_fkey(admins(name)))), profiles!waiting_list_entries_member_id_fkey(full_name, first_name, last_name)",
+      )
+      .in("session_id", sessionIds)
+      .order("joined_at", { ascending: true });
+    if (error) throw new HttpError(500, "Failed to fetch waitlist entries", error);
+    return data ?? [];
+  }
+
   async getBookingContext(memberId: string) {
     const { data: activeMembershipId } = await supabaseAdmin.rpc("clm_find_active_membership", {
       p_member_id: memberId,
@@ -111,7 +132,7 @@ export class BookingService {
 
     let query = supabaseAdmin
       .from("sessions")
-      .select("*, session_types(*), coaches(admins(name))")
+      .select("*, session_types(*), coaches!sessions_coach_id_fkey(admins(name))")
       .gte("start_at", effectiveFrom)
       .order("start_at", { ascending: true });
     if (effectiveTo) query = query.lte("start_at", effectiveTo);
@@ -194,7 +215,7 @@ export class BookingService {
   async getSessionDetail(sessionId: string) {
     const { data, error } = await supabaseAdmin
       .from("sessions")
-      .select("*, session_types(*), coaches(admins(name))")
+      .select("*, session_types(*), coaches!sessions_coach_id_fkey(admins(name))")
       .eq("id", sessionId)
       .single();
     if (error) throw new HttpError(404, "Session not found", error);

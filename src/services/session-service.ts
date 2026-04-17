@@ -47,7 +47,7 @@ export class SessionService {
   async listSessions(from?: string, to?: string) {
     let query = supabaseAdmin
       .from("sessions")
-      .select("*, session_types(*), coaches(admins(name, id)), locations(name)")
+      .select("*, session_types(*), coaches!sessions_coach_id_fkey(admins(name, id)), locations(name)")
       .order("start_at", { ascending: true });
     if (from) query = query.gte("start_at", from);
     if (to) query = query.lte("start_at", to);
@@ -63,6 +63,7 @@ export class SessionService {
 
     const sessionIds = sessions.map((s) => s.id).filter(Boolean);
     const bookedCountBySessionId: Record<string, number> = {};
+    const waitlistCountBySessionId: Record<string, number> = {};
     if (sessionIds.length > 0) {
       const { data: bookings, error: bookingsErr } = await supabaseAdmin
         .from("bookings")
@@ -73,6 +74,16 @@ export class SessionService {
       (bookings ?? []).forEach((b) => {
         const sessionId = String(b.session_id);
         bookedCountBySessionId[sessionId] = (bookedCountBySessionId[sessionId] ?? 0) + 1;
+      });
+
+      const { data: waitRows, error: waitErr } = await supabaseAdmin
+        .from("waiting_list_entries")
+        .select("session_id")
+        .in("session_id", sessionIds);
+      if (waitErr) throw new HttpError(500, "Failed to fetch session waitlist counts", waitErr);
+      (waitRows ?? []).forEach((w) => {
+        const sessionId = String((w as { session_id: string }).session_id);
+        waitlistCountBySessionId[sessionId] = (waitlistCountBySessionId[sessionId] ?? 0) + 1;
       });
     }
 
@@ -85,12 +96,23 @@ export class SessionService {
         coach_name: coachName,
         location_name: locationName,
         booked_count: bookedCountBySessionId[s.id] ?? 0,
+        waitlist_count: waitlistCountBySessionId[s.id] ?? 0,
       };
     });
   }
 
-  async createSessionType(input: { name: string; category?: "1:1" | "Elite" | "Octave" | "Group"; color?: string | null; icon?: string | null; displayOrder?: number; defaultCapacity: number; maxPerDay?: number; defaultDurationMins: 30 | 45 | 60 }) {
+  async createSessionType(input: { name: string; category?: "1:1" | "Elite" | "Octave" | "Group"; audience?: string | null; color?: string | null; icon?: string | null; displayOrder?: number; defaultCapacity: number; maxPerDay?: number; defaultDurationMins: 30 | 45 | 60 }) {
     const category = input.category ?? "1:1";
+    if (category === "1:1") {
+      const { data: existingOneToOne, error: oneToOneErr } = await supabaseAdmin
+        .from("session_types")
+        .select("id")
+        .eq("category", "1:1")
+        .limit(1)
+        .maybeSingle();
+      if (oneToOneErr) throw new HttpError(500, "Failed to check existing 1:1 session types", oneToOneErr);
+      if (existingOneToOne) throw new HttpError(400, "A 1:1 session type already exists; only one entry is allowed for this category.");
+    }
     const { data: existingCategoryType } = await supabaseAdmin
       .from("session_types")
       .select("token_type_id")
@@ -102,6 +124,7 @@ export class SessionService {
     const { data, error } = await supabaseAdmin.from('session_types').insert({
       name: input.name,
       category,
+      audience: input.audience ?? "mixed",
       color: input.color ?? null,
       icon: input.icon ?? null,
       display_order: input.displayOrder ?? 0,
@@ -119,6 +142,7 @@ export class SessionService {
     input: {
       name?: string;
       category?: "1:1" | "Elite" | "Octave" | "Group";
+      audience?: string | null;
       color?: string | null;
       icon?: string | null;
       displayOrder?: number;
@@ -127,17 +151,35 @@ export class SessionService {
       defaultDurationMins?: 30 | 45 | 60;
     }
   ) {
+    if (input.category === "1:1") {
+      const { data: otherOneToOne, error: oneToOneErr } = await supabaseAdmin
+        .from("session_types")
+        .select("id")
+        .eq("category", "1:1")
+        .neq("id", sessionTypeId)
+        .limit(1)
+        .maybeSingle();
+      if (oneToOneErr) throw new HttpError(500, "Failed to check existing 1:1 session types", oneToOneErr);
+      if (otherOneToOne)
+        throw new HttpError(400, "A 1:1 session type already exists; only one entry is allowed for this category.");
+    }
     const updates: Record<string, unknown> = {};
     if (input.name !== undefined) updates.name = input.name;
     if (input.category !== undefined) updates.category = input.category;
+    if (input.audience !== undefined) updates.audience = input.audience;
     if (input.color !== undefined) updates.color = input.color;
     if (input.icon !== undefined) updates.icon = input.icon;
-    if (input.displayOrder !== undefined) updates.display_order = input.displayOrder;
+    if (input.displayOrder !== undefined) {
+      const n = Math.floor(Number(input.displayOrder));
+      if (Number.isFinite(n) && n >= 0) updates.display_order = n;
+    }
     if (input.defaultCapacity !== undefined) {
-      updates.default_capacity = input.defaultCapacity;
+      const n = Math.floor(Number(input.defaultCapacity));
+      if (Number.isFinite(n) && n >= 1) updates.default_capacity = n;
     }
     if (input.maxPerDay !== undefined) {
-      updates.max_per_day = input.maxPerDay;
+      const n = Math.floor(Number(input.maxPerDay));
+      if (Number.isFinite(n) && n >= 1) updates.max_per_day = n;
     }
     if (input.defaultDurationMins !== undefined) {
       updates.default_duration_mins = input.defaultDurationMins;

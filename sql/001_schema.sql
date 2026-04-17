@@ -131,6 +131,7 @@ create table if not exists session_types (
   default_capacity int not null check (default_capacity > 0),
   max_per_day int not null default 1 check (max_per_day > 0),
   default_duration_mins int not null check (default_duration_mins in (30,45,60)),
+  audience text not null default 'mixed',
   color text null,
   icon text null,
   display_order int not null default 0 check (display_order >= 0),
@@ -147,6 +148,13 @@ begin
   if not exists (select 1 from pg_constraint where conname = 'session_types_category_check') then
     alter table session_types add constraint session_types_category_check check (category in ('1:1','Elite','Octave','Group'));
   end if;
+  alter table session_types add column if not exists audience text default 'mixed';
+  update session_types set audience = 'mixed' where audience is null;
+  begin
+    alter table session_types alter column audience set default 'mixed';
+    alter table session_types alter column audience set not null;
+  exception when others then null;
+  end;
   alter table session_types add column if not exists color text;
   alter table session_types add column if not exists icon text;
 exception when others then null;
