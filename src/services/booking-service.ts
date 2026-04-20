@@ -84,9 +84,7 @@ export class BookingService {
     const { data: user, error: userError } = await supabaseAdmin.from("profiles").select("*").eq("id", memberId).single();
     if (userError || !user) throw new HttpError(404, "Member not found");
 
-    // Membership eligibility gating:
-    // - membership_allowed_session_types: which session types member can book
-    // - membership_session_allowances: which token_type_ids membership provides allowance for
+    // Membership eligibility gating via allowance token types.
     const { data: activeMembershipId, error: membershipErr } = await supabaseAdmin.rpc(
       "clm_find_active_membership",
       { p_member_id: memberId, p_now: new Date().toISOString() }
@@ -94,25 +92,12 @@ export class BookingService {
     if (membershipErr) throw new HttpError(500, "Failed to resolve active membership", membershipErr);
     if (!activeMembershipId) return [];
 
-    const [{ data: allowedRows, error: allowedErr }, { data: allowanceRows, error: allowanceErr }] =
-      await Promise.all([
-        supabaseAdmin
-          .from("membership_allowed_session_types")
-          .select("session_type_id")
-          .eq("membership_id", activeMembershipId),
-        supabaseAdmin
-          .from("membership_session_allowances")
-          .select("token_type_id, weekly_allowance")
-          .eq("membership_id", activeMembershipId)
-          .gt("weekly_allowance", 0),
-      ]);
-    if (allowedErr) throw new HttpError(500, "Failed to fetch allowed session types", allowedErr);
+    const { data: allowanceRows, error: allowanceErr } = await supabaseAdmin
+      .from("membership_session_allowances")
+      .select("token_type_id, weekly_allowance")
+      .eq("membership_id", activeMembershipId)
+      .gt("weekly_allowance", 0);
     if (allowanceErr) throw new HttpError(500, "Failed to fetch membership allowances", allowanceErr);
-
-    const allowedSessionTypeIds = (allowedRows ?? [])
-      .map((r) => (r as { session_type_id?: string }).session_type_id)
-      .filter((v): v is string => Boolean(v));
-    if (allowedSessionTypeIds.length === 0) return [];
 
     const allowedTokenTypeIds = new Set(
       (allowanceRows ?? [])
@@ -137,7 +122,6 @@ export class BookingService {
       .order("start_at", { ascending: true });
     if (effectiveTo) query = query.lte("start_at", effectiveTo);
     if (sessionTypeId) query = query.eq("session_type_id", sessionTypeId);
-    else query = query.in("session_type_id", allowedSessionTypeIds);
 
     if (isOnline === true) {
       query = query.eq("is_online", true);

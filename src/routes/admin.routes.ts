@@ -202,6 +202,127 @@ router.delete('/coaches/:coachUserId/holidays/:holidayId', async (req, res, next
 router.get('/coaches/:coachUserId/session-types', async (req, res, next) => { try { res.json({ ok: true, data: await coachService.getCoachAllowedSessionTypes(req.params.coachUserId) }); } catch (e) { next(e); } });
 router.post('/coaches/:coachUserId/session-types/:sessionTypeId', async (req, res, next) => { try { const { coachUserId, sessionTypeId } = validate(addCoachSessionTypeSchema, { coachUserId: req.params.coachUserId, sessionTypeId: req.params.sessionTypeId }); res.json({ ok: true, data: await coachService.addCoachAllowedSessionType({ coachUserId, sessionTypeId }) }); } catch (e) { next(e); } });
 router.delete('/coaches/:coachUserId/session-types/:sessionTypeId', async (req, res, next) => { try { await coachService.removeCoachAllowedSessionType(req.params.coachUserId, req.params.sessionTypeId); res.json({ ok: true }); } catch (e) { next(e); } });
+// Staff (admins table)
+router.get('/staff', async (req, res, next) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("admins")
+      .select("id, name, email, role, location_id")
+      .order("name", { ascending: true });
+    if (error) throw new HttpError(500, "Failed to fetch staff", error);
+    res.json({ ok: true, data: data ?? [] });
+  } catch (e) { next(e); }
+});
+router.post('/staff', async (req, res, next) => {
+  try {
+    const { name, email, role, location_id } = req.body as { name?: string; email?: string; role?: string; location_id?: string | null };
+    if (!name || !name.trim()) throw new HttpError(400, "name is required");
+    if (!email || !email.trim()) throw new HttpError(400, "email is required");
+    const { data, error } = await supabaseAdmin
+      .from("admins")
+      .insert({ name: name.trim(), email: email.trim(), role: role ?? null, location_id: location_id ?? null })
+      .select("id, name, email, role, location_id")
+      .single();
+    if (error) throw new HttpError(500, "Failed to create staff member", error);
+    res.status(201).json({ ok: true, data });
+  } catch (e) { next(e); }
+});
+router.patch('/staff/:staffId', async (req, res, next) => {
+  try {
+    const { name, email, role, location_id } = req.body as { name?: string; email?: string; role?: string; location_id?: string | null };
+    const updates: Record<string, unknown> = {};
+    if (name !== undefined) updates.name = name;
+    if (email !== undefined) updates.email = email;
+    if (role !== undefined) updates.role = role;
+    if (location_id !== undefined) updates.location_id = location_id;
+    if (Object.keys(updates).length === 0) throw new HttpError(400, "At least one field required");
+    const { data, error } = await supabaseAdmin
+      .from("admins")
+      .update(updates)
+      .eq("id", req.params.staffId)
+      .select("id, name, email, role, location_id")
+      .single();
+    if (error) throw new HttpError(500, "Failed to update staff member", error);
+    res.json({ ok: true, data });
+  } catch (e) { next(e); }
+});
+router.delete('/staff/:staffId', async (req, res, next) => {
+  try {
+    const { error } = await supabaseAdmin.from("admins").delete().eq("id", req.params.staffId);
+    if (error) throw new HttpError(500, "Failed to deactivate staff member", error);
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+// ── Staff Leave (coach_holidays via admins.id → coaches.user_id) ─────────────
+/** Resolve coaches.id (UUID) from admins.id (int). Returns null if not a coach. */
+/** Resolves coaches.id (UUID) from admins.id (int).
+ *  Returns null if the admin does not exist, is not role=coach, or has no coaches record. */
+async function resolveCoachId(staffId: string): Promise<string | null> {
+  // 1. Confirm the admin record exists and has role = 'coach' (case-insensitive)
+  const { data: admin } = await supabaseAdmin
+    .from("admins")
+    .select("id, role")
+    .eq("id", staffId)
+    .maybeSingle();
+  if (!admin) return null;
+  if ((admin.role ?? "").toLowerCase() !== "coach") return null;
+
+  // 2. Look up the coaches record linked to this admin
+  const { data: coach } = await supabaseAdmin
+    .from("coaches")
+    .select("id")
+    .eq("user_id", staffId)
+    .maybeSingle();
+  return coach?.id ?? null;
+}
+
+router.get('/staff/:staffId/leaves', async (req, res, next) => {
+  try {
+    const coachId = await resolveCoachId(req.params.staffId);
+    if (!coachId) return res.json({ ok: true, data: [], isCoach: false });
+    const { data, error } = await supabaseAdmin
+      .from("coach_holidays")
+      .select("*")
+      .eq("coach_id", coachId)
+      .order("start_at", { ascending: false });
+    if (error) throw new HttpError(500, "Failed to fetch leaves", error);
+    res.json({ ok: true, data: data ?? [], isCoach: true });
+  } catch (e) { next(e); }
+});
+
+router.post('/staff/:staffId/leaves', async (req, res, next) => {
+  try {
+    const { start_at, end_at, type = "holiday", notes } = req.body as {
+      start_at?: string; end_at?: string; type?: string; notes?: string;
+    };
+    if (!start_at || !end_at) throw new HttpError(400, "start_at and end_at are required");
+    if (new Date(end_at) <= new Date(start_at)) throw new HttpError(400, "end_at must be after start_at");
+    const validTypes = ["holiday", "sick", "personal", "medical", "training"];
+    if (!validTypes.includes(type)) throw new HttpError(400, `type must be one of: ${validTypes.join(", ")}`);
+    const coachId = await resolveCoachId(req.params.staffId);
+    if (!coachId) throw new HttpError(404, "No coach profile found for this staff member. Only coach-role staff can have leave logged.");
+    const { data, error } = await supabaseAdmin
+      .from("coach_holidays")
+      .insert({ coach_id: coachId, start_at, end_at, type, notes: notes ?? null })
+      .select("*")
+      .single();
+    if (error) throw new HttpError(500, "Failed to create leave", error);
+    res.status(201).json({ ok: true, data });
+  } catch (e) { next(e); }
+});
+
+router.delete('/staff/:staffId/leaves/:leaveId', async (req, res, next) => {
+  try {
+    const { error } = await supabaseAdmin
+      .from("coach_holidays")
+      .delete()
+      .eq("id", req.params.leaveId);
+    if (error) throw new HttpError(500, "Failed to delete leave", error);
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
 router.get('/locations', async (req, res, next) => { try { res.json({ ok: true, data: await sessionService.listLocations() }); } catch (e) { next(e); } });
 router.post('/locations', async (req, res, next) => { try { const body = validate(createLocationSchema, req.body); res.json({ ok: true, data: await sessionService.createLocation(body) }); } catch (e) { next(e); } });
 router.patch('/locations/:locationId', async (req, res, next) => { try { const body = validate(updateLocationSchema, req.body); res.json({ ok: true, data: await sessionService.updateLocation(req.params.locationId, body) }); } catch (e) { next(e); } });
