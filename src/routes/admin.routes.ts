@@ -1,4 +1,5 @@
 import { Router } from "express";
+import type { NextFunction, Request, Response } from "express";
 import { z } from "zod";
 import { requireAdminAuth } from "../middleware/auth.js";
 import { requireAdminTableAccess } from "../middleware/roles.js";
@@ -7,6 +8,7 @@ import {
   createSessionTypeSchema,
   updateSessionTypeSchema,
   createSessionSchema,
+  updateSessionSchema,
   setCapacitySchema,
   setCoachSchema,
   setSessionTypeSchema,
@@ -19,9 +21,11 @@ import {
   addMemberSessionTagSchema,
   addSessionAllowanceSchema,
   addAllowedSessionTypeSchema,
+  patchMemberDashboardMembershipSchema,
   createCoachSchema,
   updateCoachSchema,
   addCoachAvailabilitySchema,
+  replaceCoachAvailabilitySchema,
   addCoachHolidaySchema,
   addCoachSessionTypeSchema,
   adminBookingsListQuerySchema,
@@ -32,6 +36,8 @@ import {
   createMeetingSlotSchema,
   updateMeetingSlotSchema,
   updateSessionTypesByCategorySchema,
+  createLocationSchema,
+  updateLocationSchema,
 } from "../validators/admin.schemas.js";
 import { SessionService } from "../services/session-service.js";
 import { CoachService } from "../services/coach-service.js";
@@ -99,7 +105,8 @@ router.get('/waitlist-entries', async (req, res, next) => {
 router.get('/sessions', async (req, res, next) => { try { const from = typeof req.query.from === 'string' ? req.query.from : undefined; const to = typeof req.query.to === 'string' ? req.query.to : undefined; res.json({ ok: true, data: await sessionService.listSessions(from, to) }); } catch (e) { next(e); } });
 router.get('/sessions/:sessionId/members', async (req, res, next) => { try { res.json({ ok: true, data: await sessionService.getSessionMembers(req.params.sessionId) }); } catch (e) { next(e); } });
 router.get('/sessions/:sessionId/waitlist', async (req, res, next) => { try { res.json({ ok: true, data: await bookingService.getSessionWaitlist(req.params.sessionId) }); } catch (e) { next(e); } });
-router.post('/sessions', async (req, res, next) => { try { const body = validate(createSessionSchema, req.body); const { data: st, error } = await supabaseAdmin.from('session_types').select('*').eq('id', body.sessionTypeId).single(); if (error || !st) throw new HttpError(404, 'Session type not found'); const start = new Date(body.start); const end = new Date(start.getTime() + (body.durationMins ?? st.default_duration_mins) * 60 * 1000); res.json({ ok: true, data: await sessionService.createSession({ sessionTypeId: body.sessionTypeId, tokenTypeId: st.token_type_id, coachId: body.coachId, locationId: body.locationId ?? null, isOnline: body.isOnline ?? false, startAt: start.toISOString(), endAt: end.toISOString(), capacity: body.capacity ?? st.default_capacity, allowOvertime: body.allowOvertime }) }); } catch (e) { next(e); } });
+router.post('/sessions', async (req, res, next) => { try { const body = validate(createSessionSchema, req.body); const { data: st, error } = await supabaseAdmin.from('session_types').select('*').eq('id', body.sessionTypeId).single(); if (error || !st) throw new HttpError(404, 'Session type not found'); const start = new Date(body.start); const end = new Date(start.getTime() + (body.durationMins ?? st.default_duration_mins) * 60 * 1000); res.json({ ok: true, data: await sessionService.createSession({ sessionTypeId: body.sessionTypeId, tokenTypeId: body.tokenTypeId ?? st.token_type_id, coachId: body.coachId, locationId: body.locationId ?? null, isOnline: body.isOnline ?? false, startAt: start.toISOString(), endAt: end.toISOString(), capacity: body.capacity ?? st.default_capacity, allowOvertime: body.allowOvertime }) }); } catch (e) { next(e); } });
+router.patch('/sessions/:sessionId', async (req, res, next) => { try { const body = validate(updateSessionSchema, req.body); res.json({ ok: true, data: await sessionService.updateSession(req.params.sessionId, body) }); } catch (e) { next(e); } });
 router.patch('/sessions/:sessionId/capacity', async (req, res, next) => { try { const body = validate(setCapacitySchema, req.body); res.json({ ok: true, data: await sessionService.setCapacity(req.params.sessionId, body.capacity) }); } catch (e) { next(e); } });
 router.patch('/sessions/:sessionId/coach', async (req, res, next) => { try { const body = validate(setCoachSchema, req.body); res.json({ ok: true, data: await sessionService.setCoach(req.params.sessionId, body.newCoachId, { allowOvertime: body.allowOvertime }) }); } catch (e) { next(e); } });
 router.patch('/sessions/:sessionId/type', async (req, res, next) => { try { const body = validate(setSessionTypeSchema, req.body); const { data: st, error } = await supabaseAdmin.from('session_types').select('*').eq('id', body.newSessionTypeId).single(); if (error || !st) throw new HttpError(404, 'Session type not found'); res.json({ ok: true, data: await sessionService.setSessionType(req.params.sessionId, body.newSessionTypeId, st.token_type_id) }); } catch (e) { next(e); } });
@@ -117,6 +124,58 @@ router.post('/memberships/:membershipId/pause', async (req, res, next) => { try 
 router.post('/memberships/:membershipId/terminate', async (req, res, next) => { try { const body = validate(terminateMembershipSchema, req.body); res.json({ ok: true, data: await membershipService.terminateMembership({ membershipId: req.params.membershipId, terminationDate: body.terminationDate }) }); } catch (e) { next(e); } });
 router.post('/memberships/:membershipId/session-allowances', async (req, res, next) => { try { const body = validate(addSessionAllowanceSchema, req.body); res.json({ ok: true, data: await membershipService.addSessionAllowance({ membershipId: req.params.membershipId, tokenTypeId: body.tokenTypeId, weeklyAllowance: body.weeklyAllowance }) }); } catch (e) { next(e); } });
 router.post('/memberships/:membershipId/session-types/:sessionTypeId', async (req, res, next) => { try { const { membershipId, sessionTypeId } = validate(addAllowedSessionTypeSchema, { membershipId: req.params.membershipId, sessionTypeId: req.params.sessionTypeId }); res.json({ ok: true, data: await membershipService.addAllowedSessionType({ membershipId, sessionTypeId }) }); } catch (e) { next(e); } });
+// Admin dashboard MemberProfile — memberships tab (must be before /members/:memberId/tokens)
+router.get('/members/:memberId/membership/history', async (req, res, next) => {
+  try {
+    const { memberId } = validate(z.object({ memberId: z.string().uuid() }), req.params);
+    const rows = await membershipService.getAdminMemberMembershipHistory(memberId);
+    res.json({ ok: true, data: rows });
+  } catch (e) {
+    next(e);
+  }
+});
+router.get('/members/:memberId/membership', async (req, res, next) => {
+  try {
+    const { memberId } = validate(z.object({ memberId: z.string().uuid() }), req.params);
+    const mode = typeof req.query.mode === "string" ? req.query.mode : undefined;
+    const bookings = await bookingService.listAdminBookings({ memberId, limit: 200 });
+    const data = await membershipService.getAdminMemberMembershipAggregate(memberId, { mode }, bookings as Array<Record<string, unknown>>);
+    res.json({ ok: true, data });
+  } catch (e) {
+    next(e);
+  }
+});
+router.patch('/members/:memberId/membership', async (req, res, next) => {
+  try {
+    const { memberId } = validate(z.object({ memberId: z.string().uuid() }), req.params);
+    const body = validate(patchMemberDashboardMembershipSchema, req.body);
+    const tier = body.current_package ?? body.currentPackage ?? "pace";
+    const mode = body.mode ?? "inperson";
+    const result = await membershipService.patchAdminMemberMembership(memberId, {
+      mode,
+      currentPackage: tier,
+    });
+    res.json({ ok: true, data: result });
+  } catch (e) {
+    next(e);
+  }
+});
+const putMemberTrainingCurrentHandler = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { memberId } = validate(z.object({ memberId: z.string().uuid() }), req.params);
+    const body =
+      req.body && typeof req.body === "object" && !Array.isArray(req.body)
+        ? (req.body as Record<string, unknown>)
+        : {};
+    const data = await membershipService.putAdminMemberTrainingCurrent(memberId, body);
+    res.json({ ok: true, data });
+  } catch (e) {
+    next(e);
+  }
+};
+router.put('/members/:memberId/membership/training/current', putMemberTrainingCurrentHandler);
+router.patch('/members/:memberId/membership/training/current', putMemberTrainingCurrentHandler);
+router.post('/members/:memberId/membership/training/current', putMemberTrainingCurrentHandler);
 router.post('/tokens/issue', async (req, res, next) => { try { const body = validate(issueTokensSchema, req.body); res.json({ ok: true, data: await tokenService.issueAdminTokens({ memberId: body.memberId, tokenTypeId: body.tokenTypeId, quantity: body.quantity, expiryAt: body.expiry, coachId: body.coachId }) }); } catch (e) { next(e); } });
 // Admin token generation routes for testing will be removed later
 router.get('/tokens/generate-weekly', async (req, res, next) => { try { const result = await runWeeklyTokenGeneration(); res.json({ ok: true, data: result }); } catch (e) { next(e); } });
@@ -132,6 +191,9 @@ router.post('/coaches', async (req, res, next) => { try { const body = validate(
 router.patch('/coaches/:coachUserId', async (req, res, next) => { try { const body = validate(updateCoachSchema, req.body); res.json({ ok: true, data: await coachService.updateCoach(req.params.coachUserId, body) }); } catch (e) { next(e); } });
 router.delete('/coaches/:coachUserId', async (req, res, next) => { try { res.json(await coachService.deleteCoach(req.params.coachUserId)); } catch (e) { next(e); } });
 router.get('/coaches/:coachUserId/availability', async (req, res, next) => { try { res.json({ ok: true, data: await coachService.getCoachAvailability(req.params.coachUserId) }); } catch (e) { next(e); } });
+// Replace full weekly pattern; must be registered before POST /availability (add single window).
+router.put('/coaches/:coachUserId/availability', async (req, res, next) => { try { const body = validate(replaceCoachAvailabilitySchema, req.body); res.json({ ok: true, data: await coachService.replaceCoachAvailability(req.params.coachUserId, body.windows) }); } catch (e) { next(e); } });
+router.post('/coaches/:coachUserId/availability/replace', async (req, res, next) => { try { const body = validate(replaceCoachAvailabilitySchema, req.body); res.json({ ok: true, data: await coachService.replaceCoachAvailability(req.params.coachUserId, body.windows) }); } catch (e) { next(e); } });
 router.post('/coaches/:coachUserId/availability', async (req, res, next) => { try { const body = validate(addCoachAvailabilitySchema, req.body); res.json({ ok: true, data: await coachService.addCoachAvailability({ coachUserId: req.params.coachUserId, dayOfWeek: body.dayOfWeek, startMins: body.startMins, endMins: body.endMins }) }); } catch (e) { next(e); } });
 router.delete('/coaches/:coachUserId/availability/:availabilityId', async (req, res, next) => { try { res.json(await coachService.removeCoachAvailability(req.params.availabilityId)); } catch (e) { next(e); } });
 router.get('/coaches/:coachUserId/holidays', async (req, res, next) => { try { res.json({ ok: true, data: await coachService.getCoachHolidays(req.params.coachUserId) }); } catch (e) { next(e); } });
@@ -141,6 +203,9 @@ router.get('/coaches/:coachUserId/session-types', async (req, res, next) => { tr
 router.post('/coaches/:coachUserId/session-types/:sessionTypeId', async (req, res, next) => { try { const { coachUserId, sessionTypeId } = validate(addCoachSessionTypeSchema, { coachUserId: req.params.coachUserId, sessionTypeId: req.params.sessionTypeId }); res.json({ ok: true, data: await coachService.addCoachAllowedSessionType({ coachUserId, sessionTypeId }) }); } catch (e) { next(e); } });
 router.delete('/coaches/:coachUserId/session-types/:sessionTypeId', async (req, res, next) => { try { await coachService.removeCoachAllowedSessionType(req.params.coachUserId, req.params.sessionTypeId); res.json({ ok: true }); } catch (e) { next(e); } });
 router.get('/locations', async (req, res, next) => { try { res.json({ ok: true, data: await sessionService.listLocations() }); } catch (e) { next(e); } });
+router.post('/locations', async (req, res, next) => { try { const body = validate(createLocationSchema, req.body); res.json({ ok: true, data: await sessionService.createLocation(body) }); } catch (e) { next(e); } });
+router.patch('/locations/:locationId', async (req, res, next) => { try { const body = validate(updateLocationSchema, req.body); res.json({ ok: true, data: await sessionService.updateLocation(req.params.locationId, body) }); } catch (e) { next(e); } });
+router.delete('/locations/:locationId', async (req, res, next) => { try { await sessionService.deleteLocation(req.params.locationId); res.json({ ok: true }); } catch (e) { next(e); } });
 // Admin meeting routes
 router.get('/meeting-types', async (req, res, next) => { try { res.json({ ok: true, data: await meetingService.listMeetingTypesAdmin() }); } catch (e) { next(e); } });
 router.post('/meeting-types', async (req, res, next) => { try { const body = validate(createMeetingTypeSchema, req.body); res.json({ ok: true, data: await meetingService.createMeetingType(body) }); } catch (e) { next(e); } });

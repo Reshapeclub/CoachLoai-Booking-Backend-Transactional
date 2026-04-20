@@ -13,7 +13,7 @@ export class TokenService {
     const expiryPolicy = this.getPurchaseExpiryPolicy();
     const { data, error } = await supabaseAdmin
       .from("session_types")
-      .select("id, name, category, token_type_id, color, icon, display_order, is_active")
+      .select("id, name, category, token_type_id, color, icon, display_order, is_active, category_icon")
       .eq("is_active", true)
       .order("display_order", { ascending: true })
       .order("created_at", { ascending: true });
@@ -36,7 +36,7 @@ export class TokenService {
         name: category,
         tokenTypeId: item.token_type_id,
         color: item.color,
-        icon: item.icon ?? (category === "Group" ? "👥" : null),
+        icon: item.category_icon ?? (category === "Group" ? "👥" : null),
         unitAmountMinorCents,
         unitPrice: unitAmountMinorCents / 100,
         expiryPolicy,
@@ -131,14 +131,22 @@ export class TokenService {
 
     const coachIds = Array.from(coachMap.keys());
     if (coachIds.length) {
-      const { data: coaches } = await supabaseAdmin
-        .from('coaches')
-        .select('id, name')
-        .in('id', coachIds);
-      coaches?.forEach(c => {
+      const { data: coaches, error: coachesError } = await supabaseAdmin
+        .from("coaches")
+        .select("id, admins!coaches_user_id_fkey(name)")
+        .in("id", coachIds);
+      if (coachesError) {
+        throw new HttpError(500, "Failed to fetch coach names for token summary", coachesError);
+      }
+      type CoachRow = {
+        id: string;
+        admins?: { name?: string | null } | null;
+      };
+      for (const c of (coaches ?? []) as CoachRow[]) {
         const entry = coachMap.get(c.id);
-        if (entry) entry.coachName = c.name;
-      });
+        const name = c.admins?.name != null ? String(c.admins.name).trim() : "";
+        if (entry && name) entry.coachName = name;
+      }
     }
     return Array.from(coachMap.values());
   }

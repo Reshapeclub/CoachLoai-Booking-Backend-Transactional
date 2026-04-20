@@ -101,7 +101,7 @@ export class SessionService {
     });
   }
 
-  async createSessionType(input: { name: string; category?: "1:1" | "Elite" | "Octave" | "Group"; audience?: string | null; color?: string | null; icon?: string | null; displayOrder?: number; defaultCapacity: number; maxPerDay?: number; defaultDurationMins: 30 | 45 | 60 }) {
+  async createSessionType(input: { name: string; category?: "1:1" | "Elite" | "Octave" | "Group"; categoryIcon?: string | null; audience?: string | null; color?: string | null; icon?: string | null; displayOrder?: number; defaultCapacity: number; maxPerDay?: number; defaultDurationMins: 30 | 45 | 60 }) {
     const category = input.category ?? "1:1";
     if (category === "1:1") {
       const { data: existingOneToOne, error: oneToOneErr } = await supabaseAdmin
@@ -124,6 +124,7 @@ export class SessionService {
     const { data, error } = await supabaseAdmin.from('session_types').insert({
       name: input.name,
       category,
+      category_icon: input.categoryIcon ?? null,
       audience: input.audience ?? "mixed",
       color: input.color ?? null,
       icon: input.icon ?? null,
@@ -142,6 +143,7 @@ export class SessionService {
     input: {
       name?: string;
       category?: "1:1" | "Elite" | "Octave" | "Group";
+      categoryIcon?: string | null;
       audience?: string | null;
       color?: string | null;
       icon?: string | null;
@@ -166,6 +168,7 @@ export class SessionService {
     const updates: Record<string, unknown> = {};
     if (input.name !== undefined) updates.name = input.name;
     if (input.category !== undefined) updates.category = input.category;
+    if (input.categoryIcon !== undefined) updates.category_icon = input.categoryIcon;
     if (input.audience !== undefined) updates.audience = input.audience;
     if (input.color !== undefined) updates.color = input.color;
     if (input.icon !== undefined) updates.icon = input.icon;
@@ -173,10 +176,10 @@ export class SessionService {
       const n = Math.floor(Number(input.displayOrder));
       if (Number.isFinite(n) && n >= 0) updates.display_order = n;
     }
-    if (input.defaultCapacity !== undefined) {
-      const n = Math.floor(Number(input.defaultCapacity));
-      if (Number.isFinite(n) && n >= 1) updates.default_capacity = n;
-    }
+    // if (input.defaultCapacity !== undefined) {
+    //   const n = Math.floor(Number(input.defaultCapacity));
+    //   if (Number.isFinite(n) && n >= 1) updates.default_capacity = n;
+    // }
     if (input.maxPerDay !== undefined) {
       const n = Math.floor(Number(input.maxPerDay));
       if (Number.isFinite(n) && n >= 1) updates.max_per_day = n;
@@ -198,6 +201,7 @@ export class SessionService {
   async updateSessionTypesByCategory(
     category: "1:1" | "Elite" | "Octave" | "Group",
     input: {
+      categoryIcon?: string | null;
       color?: string | null;
       icon?: string | null;
       displayOrder?: number;
@@ -208,15 +212,62 @@ export class SessionService {
     }
   ) {
     const updates: Record<string, unknown> = {};
+    if (input.categoryIcon !== undefined) updates.category_icon = input.categoryIcon;
     if (input.color !== undefined) updates.color = input.color;
-    if (input.icon !== undefined) updates.icon = input.icon;
+    // if (input.icon !== undefined) updates.icon = input.icon;
     if (input.displayOrder !== undefined) updates.display_order = input.displayOrder;
     if (input.defaultCapacity !== undefined) updates.default_capacity = input.defaultCapacity;
     if (input.maxPerDay !== undefined) updates.max_per_day = input.maxPerDay;
     if (input.defaultDurationMins !== undefined) updates.default_duration_mins = input.defaultDurationMins;
     if (input.isActive !== undefined) updates.is_active = input.isActive;
     if (Object.keys(updates).length === 0) throw new HttpError(400, "No fields to update");
-
+    const { data: existingForCategory, error: existErr } = await supabaseAdmin
+      .from("session_types")
+      .select("id")
+      .eq("category", category)
+      .limit(1)
+      .maybeSingle();
+    if (existErr) throw new HttpError(500, "Failed to check session types for category", existErr);
+    if (!existingForCategory) {
+      const defaultNames: Record<"1:1" | "Elite" | "Octave" | "Group", string> = {
+        "1:1": "1:1 Private (default)",
+        Elite: "Elite (default)",
+        Octave: "Octave (default)",
+        Group: "Group (default)",
+      };
+      const defaultCapacity = Math.max(1, Math.floor(Number(updates.default_capacity ?? 1)));
+      const maxPerDay = Math.max(
+        1,
+        Math.floor(Number(updates.max_per_day ?? defaultCapacity))
+      );
+      const dur = updates.default_duration_mins;
+      const defaultDurationMins =
+        dur === 30 || dur === 45 || dur === 60
+          ? dur
+          : (45 as 30 | 45 | 60);
+      const displayOrder =
+        updates.display_order !== undefined
+          ? Math.max(0, Math.floor(Number(updates.display_order)))
+          : 0;
+      const isActive = typeof updates.is_active === "boolean" ? updates.is_active : true;
+      const { error: insertErr } = await supabaseAdmin.from("session_types").insert({
+        name: defaultNames[category],
+        category,
+        category_icon: updates.category_icon ?? null,
+        color: updates.color ?? null,
+        display_order: displayOrder,
+        token_type_id: crypto.randomUUID(),
+        default_capacity: defaultCapacity,
+        max_per_day: maxPerDay,
+        default_duration_mins: defaultDurationMins,
+        is_active: isActive,
+        audience: "mixed",
+      });
+      if (insertErr) {
+        if ((insertErr as { code?: string }).code !== "23505")
+          throw new HttpError(500, "Failed to create default session type for category", insertErr);
+      }
+    }
     const { data, error } = await supabaseAdmin
       .from("session_types")
       .update(updates)
@@ -260,6 +311,87 @@ export class SessionService {
       .select()
       .single();
     if (error) throw new HttpError(500, "Failed to create session", error);
+    return data;
+  }
+
+  async updateSession(
+    sessionId: string,
+    input: {
+      sessionTypeId?: string;
+      tokenTypeId?: string;
+      coachId?: string;
+      locationId?: string | null;
+      start?: string;
+      durationMins?: 30 | 45 | 60;
+      capacity?: number;
+      allowOvertime?: boolean;
+      isOnline?: boolean;
+    }
+  ) {
+    const { data: current, error: currentErr } = await supabaseAdmin
+      .from("sessions")
+      .select("id, session_type_id, token_type_id, coach_id, location_id, start_at, end_at, capacity, is_online")
+      .eq("id", sessionId)
+      .single();
+    if (currentErr || !current) throw new HttpError(404, "Session not found");
+
+    const finalSessionTypeId = input.sessionTypeId ?? current.session_type_id;
+    const finalCoachId = input.coachId ?? current.coach_id;
+    const finalLocationId = input.locationId !== undefined ? input.locationId : current.location_id;
+    const finalStart = input.start ? new Date(input.start) : new Date(current.start_at);
+
+    const { data: st, error: stErr } = await supabaseAdmin
+      .from("session_types")
+      .select("id, token_type_id, default_duration_mins, default_capacity")
+      .eq("id", finalSessionTypeId)
+      .single();
+    if (stErr || !st) throw new HttpError(404, "Session type not found");
+
+    const finalDuration = input.durationMins ?? Number(st.default_duration_mins ?? 45);
+    const finalEnd = new Date(finalStart.getTime() + finalDuration * 60 * 1000);
+    const finalCapacity = input.capacity ?? Number(current.capacity ?? st.default_capacity ?? 1);
+
+    const { count, error: countErr } = await supabaseAdmin
+      .from("bookings")
+      .select("*", { count: "exact", head: true })
+      .eq("session_id", sessionId)
+      .eq("status", "booked");
+    if (countErr) throw new HttpError(500, "Failed to check booked count", countErr);
+    const bookedCount = count ?? 0;
+    if (finalCapacity < bookedCount)
+      throw new HttpError(400, `Capacity cannot be less than current booked count (${bookedCount})`);
+
+    await validateCoachForSession({
+      coachId: finalCoachId,
+      sessionTypeId: finalSessionTypeId,
+      locationId: finalLocationId,
+      startAt: finalStart.toISOString(),
+      endAt: finalEnd.toISOString(),
+      excludeSessionId: sessionId,
+      allowOvertime: input.allowOvertime,
+    });
+
+    const finalTokenTypeId = String(input.tokenTypeId ?? st.token_type_id ?? current.token_type_id ?? "").trim();
+    if (!finalTokenTypeId) throw new HttpError(400, "Session type is missing token_type_id");
+
+    const updates: Record<string, unknown> = {
+      coach_id: finalCoachId,
+      session_type_id: finalSessionTypeId,
+      token_type_id: finalTokenTypeId,
+      location_id: finalLocationId,
+      start_at: finalStart.toISOString(),
+      end_at: finalEnd.toISOString(),
+      capacity: finalCapacity,
+    };
+    if (input.isOnline !== undefined) updates.is_online = input.isOnline;
+
+    const { data, error } = await supabaseAdmin
+      .from("sessions")
+      .update(updates)
+      .eq("id", sessionId)
+      .select()
+      .single();
+    if (error) throw new HttpError(500, "Failed to update session", error);
     return data;
   }
 
@@ -366,5 +498,68 @@ export class SessionService {
       .order("name", { ascending: false });
     if (error) throw new HttpError(500, "Failed to fetch locations", error);
     return data ?? [];
+  }
+
+  async createLocation(input: {
+    name: string;
+    slug: string;
+    address?: string | null;
+    capacity?: number | null;
+    manager?: string | null;
+    openingHours?: string | null;
+  }) {
+    const row: Record<string, unknown> = { name: input.name.trim(), slug: input.slug.trim() };
+    if (input.address !== undefined) row.address = input.address;
+    if (input.capacity !== undefined) row.capacity = input.capacity;
+    if (input.manager !== undefined) row.manager = input.manager;
+    if (input.openingHours !== undefined) row.opening_hours = input.openingHours;
+    const { data, error } = await supabaseAdmin.from("locations").insert(row).select().single();
+    if (error) {
+      if ((error as { code?: string }).code === "23505")
+        throw new HttpError(409, "A location with this name or slug already exists", error);
+      throw new HttpError(500, "Failed to create location", error);
+    }
+    return data;
+  }
+
+  async updateLocation(
+    locationId: string,
+    input: {
+      name?: string;
+      slug?: string;
+      address?: string | null;
+      capacity?: number | null;
+      manager?: string | null;
+      openingHours?: string | null;
+    }
+  ) {
+    const upd: Record<string, unknown> = {};
+    if (input.name !== undefined) upd.name = input.name.trim();
+    if (input.slug !== undefined) upd.slug = input.slug.trim();
+    if (input.address !== undefined) upd.address = input.address;
+    if (input.capacity !== undefined) upd.capacity = input.capacity;
+    if (input.manager !== undefined) upd.manager = input.manager;
+    if (input.openingHours !== undefined) upd.opening_hours = input.openingHours;
+    if (Object.keys(upd).length === 0) throw new HttpError(400, "No fields to update");
+    const { data, error } = await supabaseAdmin.from("locations").update(upd).eq("id", locationId).select().single();
+    if (error) {
+      if ((error as { code?: string }).code === "23505")
+        throw new HttpError(409, "A location with this name or slug already exists", error);
+      if ((error as { code?: string }).code === "PGRST116")
+        throw new HttpError(404, "Location not found", error);
+      throw new HttpError(500, "Failed to update location", error);
+    }
+    if (!data) throw new HttpError(404, "Location not found");
+    return data;
+  }
+
+  async deleteLocation(locationId: string) {
+    const { error } = await supabaseAdmin.from("locations").delete().eq("id", locationId);
+    if (error) {
+      if ((error as { code?: string }).code === "23503")
+        throw new HttpError(409, "Cannot delete: location is still in use (sessions, coaches, or other records).", error);
+      throw new HttpError(500, "Failed to delete location", error);
+    }
+    return { ok: true } as const;
   }
 }

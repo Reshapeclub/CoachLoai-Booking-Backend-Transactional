@@ -5,6 +5,7 @@ const sessionTypeCategorySchema = z.enum(["1:1", "Elite", "Octave", "Group"]);
 export const createSessionTypeSchema = z.object({
   name: z.string().min(1),
   category: sessionTypeCategorySchema.optional(),
+  categoryIcon: z.string().nullable().optional(),
   defaultCapacity: z.number().int().min(1),
   maxPerDay: z.number().int().min(1).optional(),
   defaultDurationMins: allowedSessionDurations,
@@ -19,6 +20,7 @@ const intMin0 = z.coerce.number().int().min(0);
 export const updateSessionTypeSchema = z.object({
   name: z.string().min(1).optional(),
   category: sessionTypeCategorySchema.optional(),
+  categoryIcon: z.string().nullable().optional(),
   defaultCapacity: intMin1.optional(),
   maxPerDay: intMin1.optional(),
   defaultDurationMins: allowedSessionDurations.optional(),
@@ -30,6 +32,7 @@ export const updateSessionTypeSchema = z.object({
 
 export const updateSessionTypesByCategorySchema = z
   .object({
+    categoryIcon: z.string().nullable().optional(),
     defaultCapacity: intMin1.optional(),
     maxPerDay: intMin1.optional(),
     defaultDurationMins: allowedSessionDurations.optional(),
@@ -41,6 +44,7 @@ export const updateSessionTypesByCategorySchema = z
   .refine((v) => Object.keys(v).length > 0, { message: "At least one field must be provided" });
 export const createSessionSchema = z.object({
   sessionTypeId: z.string().min(1),
+  tokenTypeId: z.string().uuid().optional(),
   coachId: z.string().min(1),
   locationId: z.string().nullable().optional(),
   start: z.string().datetime(),
@@ -49,6 +53,19 @@ export const createSessionSchema = z.object({
   allowOvertime: z.boolean().optional(),
   isOnline: z.boolean().optional(),
 });
+export const updateSessionSchema = z
+  .object({
+    sessionTypeId: z.string().min(1).optional(),
+    tokenTypeId: z.string().uuid().optional(),
+    coachId: z.string().min(1).optional(),
+    locationId: z.string().nullable().optional(),
+    start: z.string().datetime().optional(),
+    durationMins: allowedSessionDurations.optional(),
+    capacity: z.number().int().min(1).optional(),
+    allowOvertime: z.boolean().optional(),
+    isOnline: z.boolean().optional(),
+  })
+  .refine((v) => Object.keys(v).length > 0, { message: 'At least one field must be provided' });
 export const setCapacitySchema = z.object({ capacity: z.number().int().min(1) });
 export const setCoachSchema = z.object({
   newCoachId: z.string().min(1),
@@ -63,6 +80,17 @@ export const createMembershipSchema = z.object({
   startDate: z.string().datetime(),
   endDate: z.string().datetime(),
 });
+/** Admin dashboard MemberProfile — PATCH /admin/members/:memberId/membership */
+export const patchMemberDashboardMembershipSchema = z
+  .object({
+    mode: z.enum(["inperson", "remote"]).optional(),
+    current_package: z.enum(["structure", "pace", "performance"]).optional(),
+    currentPackage: z.enum(["structure", "pace", "performance"]).optional(),
+  })
+  .refine(
+    (v) => v.mode !== undefined || v.current_package !== undefined || v.currentPackage !== undefined,
+    { message: "At least one of mode, current_package, or currentPackage is required" },
+  );
 export const updateMembershipSchema = z
   .object({
     mode: z.enum(["inperson", "remote"]).optional(),
@@ -116,6 +144,21 @@ export const addCoachAvailabilitySchema = z.object({
   startMins: z.number().int().min(0).max(1439),
   endMins: z.number().int().min(1).max(1440),
 }).refine((v) => v.endMins > v.startMins, { message: "endMins must be after startMins" });
+
+/** Replace all `coach_availability` rows for a coach (used by admin rota). */
+export const replaceCoachAvailabilitySchema = z.object({
+  windows: z
+    .array(
+      z
+        .object({
+          dayOfWeek: z.number().int().min(1).max(7),
+          startMins: z.number().int().min(0).max(1439),
+          endMins: z.number().int().min(1).max(1440),
+        })
+        .refine((w) => w.endMins > w.startMins, { message: "endMins must be after startMins" })
+    )
+    .max(21),
+});
 export const addCoachHolidaySchema = z.object({
   startAt: z.string().datetime(),
   endAt: z.string().datetime(),
@@ -124,6 +167,26 @@ export const addCoachSessionTypeSchema = z.object({
   coachUserId: z.string().uuid(),
   sessionTypeId: z.string().uuid(),
 });
+
+export const createLocationSchema = z.object({
+  name: z.string().min(1),
+  slug: z.string().min(1).max(200),
+  address: z.string().nullable().optional(),
+  capacity: z.number().int().min(0).nullable().optional(),
+  manager: z.string().nullable().optional(),
+  openingHours: z.string().nullable().optional(),
+});
+
+export const updateLocationSchema = z
+  .object({
+    name: z.string().min(1).optional(),
+    slug: z.string().min(1).max(200).optional(),
+    address: z.string().nullable().optional(),
+    capacity: z.number().int().min(0).nullable().optional(),
+    manager: z.string().nullable().optional(),
+    openingHours: z.string().nullable().optional(),
+  })
+  .refine((v) => Object.keys(v).length > 0, { message: "At least one field must be provided" });
 
 export const adminBookingsListQuerySchema = z.object({
   from: z.string().datetime().optional(),

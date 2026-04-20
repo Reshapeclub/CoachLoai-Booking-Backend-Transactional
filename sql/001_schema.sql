@@ -16,6 +16,14 @@ create table if not exists locations (
   slug text not null unique,
   created_at timestamptz not null default now()
 );
+do $$
+begin
+  alter table locations add column if not exists address text;
+  alter table locations add column if not exists capacity int;
+  alter table locations add column if not exists manager text;
+  alter table locations add column if not exists opening_hours text;
+exception when others then null;
+end $$;
 
 create table if not exists profiles (
   id uuid primary key default gen_random_uuid(),
@@ -127,6 +135,7 @@ create table if not exists session_types (
   id uuid primary key default gen_random_uuid(),
   name text not null unique,
   category text not null default '1:1' check (category in ('1:1','Elite','Octave','Group')),
+  category_icon text null,
   token_type_id uuid not null,
   default_capacity int not null check (default_capacity > 0),
   max_per_day int not null default 1 check (max_per_day > 0),
@@ -156,6 +165,7 @@ begin
   exception when others then null;
   end;
   alter table session_types add column if not exists color text;
+  alter table session_types add column if not exists category_icon text;
   alter table session_types add column if not exists icon text;
 exception when others then null;
 end;
@@ -169,19 +179,19 @@ create table if not exists membership_session_allowances (
   constraint membership_allowance_unique unique (membership_id, token_type_id)
 );
 
-create table if not exists membership_allowed_session_types (
-  id uuid primary key default gen_random_uuid(),
-  membership_id uuid not null references member_memberships(id) on delete cascade,
-  session_type_id uuid not null references session_types(id) on delete cascade,
-  constraint membership_allowed_session_types_membership_session_unique unique (membership_id, session_type_id)
-);
+-- create table if not exists membership_allowed_session_types (
+--   id uuid primary key default gen_random_uuid(),
+--   membership_id uuid not null references member_memberships(id) on delete cascade,
+--   session_type_id uuid not null references session_types(id) on delete cascade,
+--   constraint membership_allowed_session_types_membership_session_unique unique (membership_id, session_type_id)
+-- );
 
-create table if not exists member_session_tags (
-  id uuid primary key default gen_random_uuid(),
-  member_id uuid not null references profiles(id) on delete cascade,
-  session_type_id uuid not null references session_types(id) on delete cascade,
-  constraint member_tag_unique unique (member_id, session_type_id)
-);
+-- create table if not exists member_session_tags (
+--   id uuid primary key default gen_random_uuid(),
+--   member_id uuid not null references profiles(id) on delete cascade,
+--   session_type_id uuid not null references session_types(id) on delete cascade,
+--   constraint member_tag_unique unique (member_id, session_type_id)
+-- );
 
 create table if not exists coaches (
   id uuid primary key default gen_random_uuid(),

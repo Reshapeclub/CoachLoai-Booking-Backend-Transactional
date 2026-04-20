@@ -129,8 +129,8 @@ begin
   if exists (select 1 from membership_pause_weeks mpw where mpw.membership_id = v_membership.id and mpw.week_start = v_session_week) then raise exception 'Cannot book in paused week'; end if;
   if v_session.start_at > v_horizon then raise exception 'Session beyond booking horizon'; end if;
   if v_member.location_id is distinct from v_session.location_id then raise exception 'Location mismatch'; end if;
-  if not exists (select 1 from membership_allowed_session_types mast where mast.membership_id = v_membership.id and mast.session_type_id = v_session.session_type_id) then raise exception 'Session type not allowed by membership'; end if;
-  if not exists (select 1 from member_session_tags mst where mst.member_id = p_member_id and mst.session_type_id = v_session.session_type_id) then raise exception 'Session type not allowed by user tags'; end if;
+  if not exists (select 1 from membership_session_allowances msa where msa.membership_id = v_membership.id and msa.token_type_id = v_session.token_type_id) then raise exception 'Session not covered by membership allowance'; end if;
+  --if not exists (select 1 from member_session_tags mst where mst.member_id = p_member_id and mst.session_type_id = v_session.session_type_id) then raise exception 'Session type not allowed by user tags'; end if;
 
   select count(*) into v_duplicate_count
   from bookings b join sessions s on s.id=b.session_id

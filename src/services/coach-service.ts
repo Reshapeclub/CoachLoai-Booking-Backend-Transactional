@@ -110,6 +110,33 @@ export class CoachService {
     return data ?? [];
   }
 
+  /**
+   * Replaces all availability windows for a coach (admin rota / weekly pattern).
+   * A day with no windows in `windows` is effectively OFF (old rows for that day are removed by the delete,
+   * then not re-inserted). `windows: []` clears the whole week.
+   */
+  async replaceCoachAvailability(
+    coachId: string,
+    windows: { dayOfWeek: number; startMins: number; endMins: number }[]
+  ) {
+    const { error: delErr } = await supabaseAdmin.from("coach_availability").delete().eq("coach_id", coachId);
+    if (delErr) throw new HttpError(500, "Failed to clear coach availability", delErr);
+    if (windows.length === 0) return [];
+    const { data, error } = await supabaseAdmin
+      .from("coach_availability")
+      .insert(
+        windows.map((w) => ({
+          coach_id: coachId,
+          day_of_week: w.dayOfWeek,
+          start_mins: w.startMins,
+          end_mins: w.endMins,
+        }))
+      )
+      .select();
+    if (error) throw new HttpError(500, "Failed to set coach availability", error);
+    return data ?? [];
+  }
+
   async addCoachHoliday(input: { coachUserId: string; startAt: string; endAt: string }) {
     const { data, error } = await supabaseAdmin
       .from("coach_holidays")
