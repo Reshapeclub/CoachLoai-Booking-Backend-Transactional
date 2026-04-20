@@ -606,6 +606,7 @@ export class BookingService {
   }
 
   async adminCancelSession(input: { sessionId: string; refund: "refund" | "charge"; adminId: string }) {
+   console.log("adminCancelSession", input);
     const { data, error } = await supabaseAdmin.rpc("clm_admin_cancel_session", {
       p_admin_id: input.adminId,
       p_session_id: input.sessionId,

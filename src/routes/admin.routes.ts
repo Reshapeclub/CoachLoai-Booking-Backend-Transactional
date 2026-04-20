@@ -110,7 +110,25 @@ router.patch('/sessions/:sessionId', async (req, res, next) => { try { const bod
 router.patch('/sessions/:sessionId/capacity', async (req, res, next) => { try { const body = validate(setCapacitySchema, req.body); res.json({ ok: true, data: await sessionService.setCapacity(req.params.sessionId, body.capacity) }); } catch (e) { next(e); } });
 router.patch('/sessions/:sessionId/coach', async (req, res, next) => { try { const body = validate(setCoachSchema, req.body); res.json({ ok: true, data: await sessionService.setCoach(req.params.sessionId, body.newCoachId, { allowOvertime: body.allowOvertime }) }); } catch (e) { next(e); } });
 router.patch('/sessions/:sessionId/type', async (req, res, next) => { try { const body = validate(setSessionTypeSchema, req.body); const { data: st, error } = await supabaseAdmin.from('session_types').select('*').eq('id', body.newSessionTypeId).single(); if (error || !st) throw new HttpError(404, 'Session type not found'); res.json({ ok: true, data: await sessionService.setSessionType(req.params.sessionId, body.newSessionTypeId, st.token_type_id) }); } catch (e) { next(e); } });
-router.post('/sessions/:sessionId/cancel', async (req, res, next) => { try { const body = validate(refundModeSchema, req.body); res.json(await bookingService.adminCancelSession({ sessionId: req.params.sessionId, refund: body.refund, adminId: req.user!.id })); } catch (e) { next(e); } });
+router.post('/sessions/:sessionId/cancel', async (req, res, next) => {
+  try {
+    const body = validate(refundModeSchema, req.body);
+    const { data: session, error: sessionErr } = await supabaseAdmin
+      .from("sessions")
+      .select("coach_id")
+      .eq("id", req.params.sessionId)
+      .single();
+    if (sessionErr || !session) throw new HttpError(404, "Session not found");
+    if (!session.coach_id) throw new HttpError(422, "Session has no assigned coach");
+    res.json(
+      await bookingService.adminCancelSession({
+        sessionId: req.params.sessionId,
+        refund: body.refund,
+        adminId: session.coach_id,
+      }),
+    );
+  } catch (e) { next(e); }
+});
 // Admin fetch bookings routes
 router.get('/bookings', async (req, res, next) => { try { const q = validate(adminBookingsListQuerySchema, req.query); res.json({ ok: true, data: await bookingService.listAdminBookings({ from: q.from, to: q.to, memberId: q.memberId, sessionId: q.sessionId, status: q.status, limit: q.limit }) }); } catch (e) { next(e); } });
 router.get('/bookings/:bookingId', async (req, res, next) => { try { res.json({ ok: true, data: await bookingService.getAdminBookingById(req.params.bookingId) }); } catch (e) { next(e); } });
