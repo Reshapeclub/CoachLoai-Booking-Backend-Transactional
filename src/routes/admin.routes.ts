@@ -222,6 +222,49 @@ router.get('/coaches/:coachUserId/session-types', async (req, res, next) => { tr
 router.post('/coaches/:coachUserId/session-types/:sessionTypeId', async (req, res, next) => { try { const { coachUserId, sessionTypeId } = validate(addCoachSessionTypeSchema, { coachUserId: req.params.coachUserId, sessionTypeId: req.params.sessionTypeId }); res.json({ ok: true, data: await coachService.addCoachAllowedSessionType({ coachUserId, sessionTypeId }) }); } catch (e) { next(e); } });
 router.delete('/coaches/:coachUserId/session-types/:sessionTypeId', async (req, res, next) => { try { await coachService.removeCoachAllowedSessionType(req.params.coachUserId, req.params.sessionTypeId); res.json({ ok: true }); } catch (e) { next(e); } });
 // Staff (admins table)
+function isCoachLikeRole(role: unknown): boolean {
+  if (typeof role !== "string") return false;
+  const normalized = role.trim().toLowerCase().replace(/\s+/g, "");
+  return normalized === "coach" || normalized === "headcoach";
+}
+
+async function ensureCoachProfileForAdmin(input: {
+  adminId: number | string;
+  role: unknown;
+  locationId?: string | null;
+}) {
+  if (!isCoachLikeRole(input.role)) return;
+  const adminIdStr = String(input.adminId);
+  const { data: existing, error: existingErr } = await supabaseAdmin
+    .from("coaches")
+    .select("id, location_id")
+    .eq("user_id", adminIdStr)
+    .maybeSingle();
+  if (existingErr) throw new HttpError(500, "Failed to verify coach profile", existingErr);
+
+  if (existing) {
+    if (input.locationId && existing.location_id !== input.locationId) {
+      const { error: updErr } = await supabaseAdmin
+        .from("coaches")
+        .update({ location_id: input.locationId })
+        .eq("id", existing.id);
+      if (updErr) throw new HttpError(500, "Failed to sync coach location", updErr);
+    }
+    return;
+  }
+
+  if (!input.locationId) {
+    throw new HttpError(400, "Coach users must have a location before creating coach profile");
+  }
+  const { error: createErr } = await supabaseAdmin.from("coaches").insert({
+    user_id: adminIdStr,
+    location_id: input.locationId,
+    weekly_hour_limit_mins: 2400,
+    travel_buffer_minutes: 30,
+  });
+  if (createErr) throw new HttpError(500, "Failed to auto-create coach profile", createErr);
+}
+
 router.get('/staff', async (req, res, next) => {
   try {
     const { data, error } = await supabaseAdmin
@@ -243,6 +286,11 @@ router.post('/staff', async (req, res, next) => {
       .select("id, name, email, role, location_id")
       .single();
     if (error) throw new HttpError(500, "Failed to create staff member", error);
+    await ensureCoachProfileForAdmin({
+      adminId: data.id,
+      role: data.role,
+      locationId: data.location_id ?? null,
+    });
     res.status(201).json({ ok: true, data });
   } catch (e) { next(e); }
 });
@@ -262,6 +310,11 @@ router.patch('/staff/:staffId', async (req, res, next) => {
       .select("id, name, email, role, location_id")
       .single();
     if (error) throw new HttpError(500, "Failed to update staff member", error);
+    await ensureCoachProfileForAdmin({
+      adminId: data.id,
+      role: data.role,
+      locationId: data.location_id ?? null,
+    });
     res.json({ ok: true, data });
   } catch (e) { next(e); }
 });
@@ -285,7 +338,7 @@ async function resolveCoachId(staffId: string): Promise<string | null> {
     .eq("id", staffId)
     .maybeSingle();
   if (!admin) return null;
-  if ((admin.role ?? "").toLowerCase() !== "coach") return null;
+  if (!isCoachLikeRole(admin.role)) return null;
 
   // 2. Look up the coaches record linked to this admin
   const { data: coach } = await supabaseAdmin
