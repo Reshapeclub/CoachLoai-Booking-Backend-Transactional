@@ -79,11 +79,13 @@ export class CoachService {
     dayOfWeek: number;
     startMins: number;
     endMins: number;
+    weekStartDate?: string;
   }) {
     const { data, error } = await supabaseAdmin
       .from("coach_availability")
       .insert({
         coach_id: input.coachUserId,
+        week_start_date: input.weekStartDate ?? null,
         day_of_week: input.dayOfWeek,
         start_mins: input.startMins,
         end_mins: input.endMins,
@@ -100,14 +102,28 @@ export class CoachService {
     return { ok: true };
   }
 
-  async getCoachAvailability(coachUserId: string) {
-    const { data, error } = await supabaseAdmin
+  async getCoachAvailability(coachUserId: string, weekStartDate?: string) {
+    if (weekStartDate) {
+      const { data: weekRows, error: weekErr } = await supabaseAdmin
+        .from("coach_availability")
+        .select("*")
+        .eq("coach_id", coachUserId)
+        .eq("week_start_date", weekStartDate)
+        .order("day_of_week", { ascending: true })
+        .order("start_mins", { ascending: true });
+      if (weekErr) throw new HttpError(500, "Failed to fetch coach weekly availability", weekErr);
+      if ((weekRows ?? []).length > 0) return weekRows ?? [];
+    }
+
+    const { data: defaultRows, error: defaultErr } = await supabaseAdmin
       .from("coach_availability")
       .select("*")
       .eq("coach_id", coachUserId)
-      .order("day_of_week", { ascending: true });
-    if (error) throw new HttpError(500, "Failed to fetch coach availability", error);
-    return data ?? [];
+      .is("week_start_date", null)
+      .order("day_of_week", { ascending: true })
+      .order("start_mins", { ascending: true });
+    if (defaultErr) throw new HttpError(500, "Failed to fetch coach default availability", defaultErr);
+    return defaultRows ?? [];
   }
 
   /**
@@ -117,9 +133,13 @@ export class CoachService {
    */
   async replaceCoachAvailability(
     coachId: string,
-    windows: { dayOfWeek: number; startMins: number; endMins: number }[]
+    windows: { dayOfWeek: number; startMins: number; endMins: number }[],
+    weekStartDate?: string
   ) {
-    const { error: delErr } = await supabaseAdmin.from("coach_availability").delete().eq("coach_id", coachId);
+    let deleteQuery = supabaseAdmin.from("coach_availability").delete().eq("coach_id", coachId);
+    if (weekStartDate) deleteQuery = deleteQuery.eq("week_start_date", weekStartDate);
+    else deleteQuery = deleteQuery.is("week_start_date", null);
+    const { error: delErr } = await deleteQuery;
     if (delErr) throw new HttpError(500, "Failed to clear coach availability", delErr);
     if (windows.length === 0) return [];
     const { data, error } = await supabaseAdmin
@@ -127,6 +147,7 @@ export class CoachService {
       .insert(
         windows.map((w) => ({
           coach_id: coachId,
+          week_start_date: weekStartDate ?? null,
           day_of_week: w.dayOfWeek,
           start_mins: w.startMins,
           end_mins: w.endMins,

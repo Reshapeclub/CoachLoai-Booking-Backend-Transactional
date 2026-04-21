@@ -143,10 +143,12 @@ export const addCoachAvailabilitySchema = z.object({
   dayOfWeek: z.number().int().min(1).max(7),
   startMins: z.number().int().min(0).max(1439),
   endMins: z.number().int().min(1).max(1440),
+  weekStartDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
 }).refine((v) => v.endMins > v.startMins, { message: "endMins must be after startMins" });
 
 /** Replace all `coach_availability` rows for a coach (used by admin rota). */
 export const replaceCoachAvailabilitySchema = z.object({
+  weekStartDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   windows: z
     .array(
       z
@@ -158,6 +160,10 @@ export const replaceCoachAvailabilitySchema = z.object({
         .refine((w) => w.endMins > w.startMins, { message: "endMins must be after startMins" })
     )
     .max(21),
+});
+
+export const coachAvailabilityQuerySchema = z.object({
+  weekStartDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
 });
 export const addCoachHolidaySchema = z.object({
   startAt: z.string().datetime(),

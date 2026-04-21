@@ -26,6 +26,7 @@ import {
   updateCoachSchema,
   addCoachAvailabilitySchema,
   replaceCoachAvailabilitySchema,
+  coachAvailabilityQuerySchema,
   addCoachHolidaySchema,
   addCoachSessionTypeSchema,
   adminBookingsListQuerySchema,
@@ -208,11 +209,11 @@ router.get('/coaches/:coachUserId', async (req, res, next) => { try { res.json({
 router.post('/coaches', async (req, res, next) => { try { const body = validate(createCoachSchema, req.body); res.json({ ok: true, data: await coachService.createCoach({ userId: body.userId, weeklyHourLimitMins: body.weeklyHourLimitMins, travelBufferMinutes: body.travelBufferMinutes }) }); } catch (e) { next(e); } });
 router.patch('/coaches/:coachUserId', async (req, res, next) => { try { const body = validate(updateCoachSchema, req.body); res.json({ ok: true, data: await coachService.updateCoach(req.params.coachUserId, body) }); } catch (e) { next(e); } });
 router.delete('/coaches/:coachUserId', async (req, res, next) => { try { res.json(await coachService.deleteCoach(req.params.coachUserId)); } catch (e) { next(e); } });
-router.get('/coaches/:coachUserId/availability', async (req, res, next) => { try { res.json({ ok: true, data: await coachService.getCoachAvailability(req.params.coachUserId) }); } catch (e) { next(e); } });
+router.get('/coaches/:coachUserId/availability', async (req, res, next) => { try { const q = validate(coachAvailabilityQuerySchema, req.query); res.json({ ok: true, data: await coachService.getCoachAvailability(req.params.coachUserId, q.weekStartDate) }); } catch (e) { next(e); } });
 // Replace full weekly pattern; must be registered before POST /availability (add single window).
-router.put('/coaches/:coachUserId/availability', async (req, res, next) => { try { const body = validate(replaceCoachAvailabilitySchema, req.body); res.json({ ok: true, data: await coachService.replaceCoachAvailability(req.params.coachUserId, body.windows) }); } catch (e) { next(e); } });
-router.post('/coaches/:coachUserId/availability/replace', async (req, res, next) => { try { const body = validate(replaceCoachAvailabilitySchema, req.body); res.json({ ok: true, data: await coachService.replaceCoachAvailability(req.params.coachUserId, body.windows) }); } catch (e) { next(e); } });
-router.post('/coaches/:coachUserId/availability', async (req, res, next) => { try { const body = validate(addCoachAvailabilitySchema, req.body); res.json({ ok: true, data: await coachService.addCoachAvailability({ coachUserId: req.params.coachUserId, dayOfWeek: body.dayOfWeek, startMins: body.startMins, endMins: body.endMins }) }); } catch (e) { next(e); } });
+router.put('/coaches/:coachUserId/availability', async (req, res, next) => { try { const body = validate(replaceCoachAvailabilitySchema, req.body); res.json({ ok: true, data: await coachService.replaceCoachAvailability(req.params.coachUserId, body.windows, body.weekStartDate) }); } catch (e) { next(e); } });
+router.post('/coaches/:coachUserId/availability/replace', async (req, res, next) => { try { const body = validate(replaceCoachAvailabilitySchema, req.body); res.json({ ok: true, data: await coachService.replaceCoachAvailability(req.params.coachUserId, body.windows, body.weekStartDate) }); } catch (e) { next(e); } });
+router.post('/coaches/:coachUserId/availability', async (req, res, next) => { try { const body = validate(addCoachAvailabilitySchema, req.body); res.json({ ok: true, data: await coachService.addCoachAvailability({ coachUserId: req.params.coachUserId, dayOfWeek: body.dayOfWeek, startMins: body.startMins, endMins: body.endMins, weekStartDate: body.weekStartDate }) }); } catch (e) { next(e); } });
 router.delete('/coaches/:coachUserId/availability/:availabilityId', async (req, res, next) => { try { res.json(await coachService.removeCoachAvailability(req.params.availabilityId)); } catch (e) { next(e); } });
 router.get('/coaches/:coachUserId/holidays', async (req, res, next) => { try { res.json({ ok: true, data: await coachService.getCoachHolidays(req.params.coachUserId) }); } catch (e) { next(e); } });
 router.post('/coaches/:coachUserId/holidays', async (req, res, next) => { try { const body = validate(addCoachHolidaySchema, req.body); res.json({ ok: true, data: await coachService.addCoachHoliday({ coachUserId: req.params.coachUserId, startAt: body.startAt, endAt: body.endAt }) }); } catch (e) { next(e); } });
@@ -337,6 +338,244 @@ router.delete('/staff/:staffId/leaves/:leaveId', async (req, res, next) => {
       .delete()
       .eq("id", req.params.leaveId);
     if (error) throw new HttpError(500, "Failed to delete leave", error);
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+// ── Staff Stats ────────────────────────────────────────────────────────────────
+router.get('/staff/:staffId/stats', async (req, res, next) => {
+  try {
+    const staffIdInt = parseInt(req.params.staffId, 10);
+
+    // NOTES count — works for all staff regardless of coach status
+    const { count: notesCount } = await supabaseAdmin
+      .from("staff_notes")
+      .select("*", { count: "exact", head: true })
+      .eq("staff_id", staffIdInt);
+    const notes = notesCount ?? 0;
+
+    const coachId = await resolveCoachId(req.params.staffId);
+    if (!coachId) {
+      return res.json({ ok: true, isCoach: false, data: { sess: null, util: null, noshow: null, notes } });
+    }
+
+    const now = new Date();
+
+    // ── Week start: Monday 00:00 local ──
+    const dow = now.getDay(); // 0=Sun
+    const monday = new Date(now);
+    monday.setDate(now.getDate() - (dow === 0 ? 6 : dow - 1));
+    monday.setHours(0, 0, 0, 0);
+
+    // ── Past 4 weeks for historical stats ──
+    const fourWeeksAgo = new Date(now);
+    fourWeeksAgo.setDate(now.getDate() - 28);
+
+    // SESS — non-cancelled sessions starting this week
+    const { data: weekSessions, error: e1 } = await supabaseAdmin
+      .from("sessions")
+      .select("id")
+      .eq("coach_id", coachId)
+      .eq("is_cancelled", false)
+      .gte("start_at", monday.toISOString())
+      .lte("start_at", now.toISOString());
+    if (e1) throw new HttpError(500, "Failed to fetch week sessions", e1);
+    const sess = (weekSessions ?? []).length;
+
+    // Past sessions (completed, not cancelled) for UTIL + NO-SHOW
+    const { data: pastSessions, error: e2 } = await supabaseAdmin
+      .from("sessions")
+      .select("id, capacity")
+      .eq("coach_id", coachId)
+      .eq("is_cancelled", false)
+      .gte("start_at", fourWeeksAgo.toISOString())
+      .lt("start_at", now.toISOString());
+    if (e2) throw new HttpError(500, "Failed to fetch past sessions", e2);
+
+    if (!pastSessions || pastSessions.length === 0) {
+      return res.json({ ok: true, isCoach: true, data: { sess, util: null, noshow: null, notes } });
+    }
+
+    const sessionIds = pastSessions.map((s: { id: string }) => s.id);
+
+    // Bookings for past sessions
+    const { data: bookings, error: e3 } = await supabaseAdmin
+      .from("bookings")
+      .select("session_id, status")
+      .in("session_id", sessionIds);
+    if (e3) throw new HttpError(500, "Failed to fetch bookings", e3);
+
+    const bk = (bookings ?? []) as { session_id: string; status: string }[];
+    const nonCancelled = bk.filter(b => b.status !== "cancelled");
+    const noShows      = bk.filter(b => b.status === "no_show");
+
+    // UTIL — avg (booked / capacity) across past sessions, as %
+    let utilSum = 0;
+    for (const s of pastSessions as { id: string; capacity: number }[]) {
+      const booked = bk.filter(b => b.session_id === s.id && b.status !== "cancelled").length;
+      utilSum += s.capacity > 0 ? booked / s.capacity : 0;
+    }
+    const util = Math.round((utilSum / pastSessions.length) * 100);
+
+    // NO-SHOW — (no_show / non-cancelled) as %
+    const noshow = nonCancelled.length > 0
+      ? Math.round((noShows.length / nonCancelled.length) * 100)
+      : 0;
+
+    res.json({ ok: true, isCoach: true, data: { sess, util, noshow, notes } });
+  } catch (e) { next(e); }
+});
+
+// ── Staff Notes ────────────────────────────────────────────────────────────────
+router.get('/staff/:staffId/notes', async (req, res, next) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("staff_notes")
+      .select("*")
+      .eq("staff_id", parseInt(req.params.staffId, 10))
+      .order("created_at", { ascending: false });
+    if (error) throw new HttpError(500, "Failed to fetch notes", error);
+    res.json({ ok: true, data: data ?? [] });
+  } catch (e) { next(e); }
+});
+
+router.post('/staff/:staffId/notes', async (req, res, next) => {
+  try {
+    const { content, category = "General" } = req.body as { content?: string; category?: string };
+    if (!content?.trim()) throw new HttpError(400, "content is required");
+    const validCategories = ["General", "Performance", "Feedback", "Meeting"];
+    if (!validCategories.includes(category)) throw new HttpError(400, `category must be one of: ${validCategories.join(", ")}`);
+    const { data, error } = await supabaseAdmin
+      .from("staff_notes")
+      .insert({ staff_id: parseInt(req.params.staffId, 10), content: content.trim(), category })
+      .select("*")
+      .single();
+    if (error) throw new HttpError(500, "Failed to create note", error);
+    res.status(201).json({ ok: true, data });
+  } catch (e) { next(e); }
+});
+
+router.delete('/staff/:staffId/notes/:noteId', async (req, res, next) => {
+  try {
+    const { error } = await supabaseAdmin
+      .from("staff_notes")
+      .delete()
+      .eq("id", req.params.noteId)
+      .eq("staff_id", parseInt(req.params.staffId, 10));
+    if (error) throw new HttpError(500, "Failed to delete note", error);
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+// ── Staff Tasks ────────────────────────────────────────────────────────────────
+// Schema: staff_tasks(id uuid, created_by_admin_id bigint, assigned_to_admin_id bigint,
+//   title text, description text, status 'open'|'done', priority 'low'|'medium'|'high',
+//   due_at timestamptz, completed_at timestamptz, source 'manual'|'legacy_note', created_at, updated_at)
+
+/** All tasks across all staff, with assignee name resolved */
+router.get('/tasks', async (req, res, next) => {
+  try {
+    const [tasksRes, staffRes] = await Promise.all([
+      supabaseAdmin
+        .from("staff_tasks")
+        .select("*")
+        .eq("source", "manual")
+        .order("created_at", { ascending: false }),
+      supabaseAdmin.from("admins").select("id, name"),
+    ]);
+    if (tasksRes.error) throw new HttpError(500, "Failed to fetch tasks", tasksRes.error);
+    const nameMap: Record<number, string> = {};
+    (staffRes.data ?? []).forEach((s: { id: number; name: string | null }) => {
+      nameMap[s.id] = s.name ?? "Unknown";
+    });
+    const data = (tasksRes.data ?? []).map((t: Record<string, unknown>) => ({
+      ...t,
+      staff_name: nameMap[t.assigned_to_admin_id as number] ?? "Unknown",
+    }));
+    res.json({ ok: true, data });
+  } catch (e) { next(e); }
+});
+
+/** Tasks assigned to a specific staff member */
+router.get('/staff/:staffId/tasks', async (req, res, next) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("staff_tasks")
+      .select("*")
+      .eq("assigned_to_admin_id", parseInt(req.params.staffId, 10))
+      .order("created_at", { ascending: false });
+    if (error) throw new HttpError(500, "Failed to fetch tasks", error);
+    res.json({ ok: true, data: data ?? [] });
+  } catch (e) { next(e); }
+});
+
+/** Create a task assigned to a staff member */
+router.post('/staff/:staffId/tasks', async (req, res, next) => {
+  try {
+    const { title, description, due_at, priority = "medium" } = req.body as {
+      title?: string; description?: string; due_at?: string | null; priority?: string;
+    };
+    if (!title?.trim()) throw new HttpError(400, "title is required");
+    const validPriorities = ["low", "medium", "high"];
+    if (!validPriorities.includes(priority)) throw new HttpError(400, `priority must be one of: ${validPriorities.join(", ")}`);
+    const creatorId = parseInt(req.user!.id, 10);
+    if (isNaN(creatorId)) throw new HttpError(401, "Invalid admin identity");
+    const { data, error } = await supabaseAdmin
+      .from("staff_tasks")
+      .insert({
+        assigned_to_admin_id: parseInt(req.params.staffId, 10),
+        created_by_admin_id:  creatorId,
+        title:                title.trim(),
+        description:          description?.trim() ?? null,
+        due_at:               due_at ?? null,
+        priority,
+        status:               "open",
+        source:               "manual",
+      })
+      .select("*")
+      .single();
+    if (error) throw new HttpError(500, "Failed to create task", error);
+    res.status(201).json({ ok: true, data });
+  } catch (e) { next(e); }
+});
+
+/** Update a task (status, priority, title, description, due_at) */
+router.patch('/staff/:staffId/tasks/:taskId', async (req, res, next) => {
+  try {
+    const { status, title, description, due_at, priority } = req.body as {
+      status?: string; title?: string; description?: string; due_at?: string | null; priority?: string;
+    };
+    const validStatuses   = ["open", "done"];
+    const validPriorities = ["low", "medium", "high"];
+    if (status   && !validStatuses.includes(status))     throw new HttpError(400, `status must be one of: ${validStatuses.join(", ")}`);
+    if (priority && !validPriorities.includes(priority)) throw new HttpError(400, `priority must be one of: ${validPriorities.join(", ")}`);
+    const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
+    if (status      !== undefined) { updates.status = status; if (status === "done") updates.completed_at = new Date().toISOString(); }
+    if (title       !== undefined) updates.title       = title?.trim();
+    if (description !== undefined) updates.description = description?.trim() ?? null;
+    if (due_at      !== undefined) updates.due_at      = due_at ?? null;
+    if (priority    !== undefined) updates.priority    = priority;
+    const { data, error } = await supabaseAdmin
+      .from("staff_tasks")
+      .update(updates)
+      .eq("id", req.params.taskId)
+      .eq("assigned_to_admin_id", parseInt(req.params.staffId, 10))
+      .select("*")
+      .single();
+    if (error) throw new HttpError(500, "Failed to update task", error);
+    res.json({ ok: true, data });
+  } catch (e) { next(e); }
+});
+
+/** Delete a task */
+router.delete('/staff/:staffId/tasks/:taskId', async (req, res, next) => {
+  try {
+    const { error } = await supabaseAdmin
+      .from("staff_tasks")
+      .delete()
+      .eq("id", req.params.taskId)
+      .eq("assigned_to_admin_id", parseInt(req.params.staffId, 10));
+    if (error) throw new HttpError(500, "Failed to delete task", error);
     res.json({ ok: true });
   } catch (e) { next(e); }
 });

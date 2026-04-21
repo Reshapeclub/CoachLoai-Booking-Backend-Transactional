@@ -28,24 +28,43 @@ export async function validateCoachForSession(opts: {
   const weeklyLimit = (coach as { weekly_hour_limit_mins: number }).weekly_hour_limit_mins;
   const travelBufferMins = (coach as { travel_buffer_minutes: number }).travel_buffer_minutes;
 
-  // 2. Within availability windows (day_of_week 1=Mon..7=Sun, start_mins/end_mins)
-  const dow = start.getUTCDay(); // 0=Sun, 1=Mon, ..., 6=Sat
-  const dayOfWeek = dow === 0 ? 7 : dow; // 1=Mon .. 7=Sun
-  const startMins = start.getUTCHours() * 60 + start.getUTCMinutes();
-  const endMins = end.getUTCHours() * 60 + end.getUTCMinutes();
+  // 2. Within availability windows (day_of_week 1=Mon..7=Sun, start_mins/end_mins).
+  // Availability is configured in UK local business time (Europe/London), not UTC.
+  const startLocal = toLondonParts(start);
+  const endLocal = toLondonParts(end);
+  const dayOfWeek = startLocal.dayOfWeek;
+  const startMins = startLocal.minutesFromMidnight;
+  const endMins = endLocal.minutesFromMidnight;
+  const sessionWeekStart = getWeekStartDateOnly(opts.startAt);
 
-  const { data: availRows } = await supabaseAdmin
+  const { data: weekRows, error: weekErr } = await supabaseAdmin
     .from("coach_availability")
     .select("start_mins, end_mins")
     .eq("coach_id", opts.coachId)
-    .eq("day_of_week", dayOfWeek);
+    .eq("day_of_week", dayOfWeek)
+    .eq("week_start_date", sessionWeekStart);
+  if (weekErr) throw new HttpError(500, "Failed to fetch coach weekly availability", weekErr);
+  console.log("weekRows", weekRows);
+  let availRows = weekRows ?? [];
+  if (availRows.length === 0) {
+    const { data: defaultRows, error: defaultErr } = await supabaseAdmin
+      .from("coach_availability")
+      .select("start_mins, end_mins")
+      .eq("coach_id", opts.coachId)
+      .eq("day_of_week", dayOfWeek)
+      .is("week_start_date", null);
+    if (defaultErr) throw new HttpError(500, "Failed to fetch coach default availability", defaultErr);
+    availRows = defaultRows ?? [];
+  }
   const hasSlots = (availRows ?? []).length > 0;
   const withinAvailability =
     hasSlots &&
     (availRows ?? []).some(
       (r: { start_mins: number; end_mins: number }) => startMins >= r.start_mins && endMins <= r.end_mins
     );
-  if (hasSlots && !withinAvailability)
+  if (!hasSlots)
+    throw new HttpError(400, "Coach has no availability windows for this day");
+  if (!withinAvailability)
     throw new HttpError(400, "Session time is outside coach availability windows");
 
   // 3. Not during approved holiday
@@ -153,6 +172,36 @@ function getWeekStart(iso: string): Date {
   monday.setUTCDate(monday.getUTCDate() - diff);
   monday.setUTCHours(0, 0, 0, 0);
   return monday;
+}
+
+function getWeekStartDateOnly(iso: string): string {
+  return getWeekStart(iso).toISOString().slice(0, 10);
+}
+
+function toLondonParts(d: Date): { dayOfWeek: number; minutesFromMidnight: number } {
+  const weekday = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/London",
+    weekday: "short",
+  }).format(d);
+  const time = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/London",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(d);
+
+  const dayMap: Record<string, number> = {
+    Mon: 1,
+    Tue: 2,
+    Wed: 3,
+    Thu: 4,
+    Fri: 5,
+    Sat: 6,
+    Sun: 7,
+  };
+  const dayOfWeek = dayMap[weekday] ?? 1;
+  const [hh, mm] = time.split(":").map((x) => Number(x));
+  return { dayOfWeek, minutesFromMidnight: (hh || 0) * 60 + (mm || 0) };
 }
 
 function checkTravelBuffer(

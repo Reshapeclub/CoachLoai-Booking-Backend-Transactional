@@ -241,10 +241,27 @@ $$ language plpgsql;
 create table if not exists coach_availability (
   id uuid primary key default gen_random_uuid(),
   coach_id uuid not null references coaches(id) on delete cascade,
+  week_start_date date null,
   day_of_week int not null check (day_of_week between 1 and 7),
   start_mins int not null check (start_mins between 0 and 1439),
-  end_mins int not null check (end_mins between 1 and 1440)
+  end_mins int not null check (end_mins between 1 and 1440),
+  check (end_mins > start_mins)
 );
+create index if not exists idx_coach_availability_coach_week on coach_availability(coach_id, week_start_date, day_of_week);
+
+do $$
+begin
+  alter table coach_availability
+    add column if not exists week_start_date date null;
+
+  alter table coach_availability
+    drop constraint if exists coach_availability_end_after_start_check;
+
+  alter table coach_availability
+    add constraint coach_availability_end_after_start_check
+    check (end_mins > start_mins);
+exception when others then null;
+end $$;
 
 create table if not exists coach_holidays (
   id uuid primary key default gen_random_uuid(),
@@ -406,3 +423,13 @@ create table if not exists notifications (
   sent_at timestamptz,
   created_at timestamptz not null default now()
 );
+
+create table if not exists staff_notes (
+  id         uuid        primary key default gen_random_uuid(),
+  staff_id   integer     not null,
+  content    text        not null,
+  category   text        not null default 'General',
+  created_at timestamptz not null default now()
+);
+
+create index if not exists idx_staff_notes_staff_id on staff_notes(staff_id);
