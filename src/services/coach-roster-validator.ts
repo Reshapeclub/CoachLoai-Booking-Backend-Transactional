@@ -1,3 +1,4 @@
+import { DateTime } from "luxon";
 import { supabaseAdmin } from "../db/supabase.js";
 import { HttpError } from "../lib/http-error.js";
 
@@ -164,20 +165,36 @@ export async function validateCoachForSession(opts: {
 }
 
 /** Monday 00:00 UTC for the week containing the given ISO datetime */
+// function getWeekStart(iso: string): Date {
+//   const d = new Date(iso);
+//   const dow = d.getUTCDay();
+//   const diff = dow === 0 ? 6 : dow - 1; // days back to Monday
+//   const monday = new Date(d);
+//   monday.setUTCDate(monday.getUTCDate() - diff);
+//   monday.setUTCHours(0, 0, 0, 0);
+//   return monday;
+// }
+
+// function getWeekStartDateOnly(iso: string): string {
+//   return getWeekStart(iso).toISOString().slice(0, 10);
+// }
 function getWeekStart(iso: string): Date {
-  const d = new Date(iso);
-  const dow = d.getUTCDay();
-  const diff = dow === 0 ? 6 : dow - 1; // days back to Monday
-  const monday = new Date(d);
-  monday.setUTCDate(monday.getUTCDate() - diff);
-  monday.setUTCHours(0, 0, 0, 0);
-  return monday;
+  return DateTime
+    .fromISO(iso, { zone: "utc" })     // input is UTC
+    .setZone("Europe/London")          // convert to London
+    .startOf("week")                   // Monday 00:00 (ISO)
+    .toJSDate();
 }
 
 function getWeekStartDateOnly(iso: string): string {
-  return getWeekStart(iso).toISOString().slice(0, 10);
+  const weekStart = DateTime
+    .fromISO(iso, { zone: "utc" })
+    .setZone("Europe/London")
+    .startOf("week")
+    .toISODate(); // YYYY-MM-DD
+  if (!weekStart) throw new Error(`Invalid ISO date: ${iso}`);
+  return weekStart;
 }
-
 function toLondonParts(d: Date): { dayOfWeek: number; minutesFromMidnight: number } {
   const weekday = new Intl.DateTimeFormat("en-GB", {
     timeZone: "Europe/London",
