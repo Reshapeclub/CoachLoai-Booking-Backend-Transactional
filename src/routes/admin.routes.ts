@@ -22,6 +22,7 @@ import {
   addMemberSessionTagSchema,
   addSessionAllowanceSchema,
   addAllowedSessionTypeSchema,
+  putMemberDashboardMembershipAccessSchema,
   patchMemberDashboardMembershipSchema,
   createCoachSchema,
   updateCoachSchema,
@@ -107,8 +108,8 @@ router.get('/waitlist-entries', async (req, res, next) => {
 router.get('/sessions', async (req, res, next) => { try { const from = typeof req.query.from === 'string' ? req.query.from : undefined; const to = typeof req.query.to === 'string' ? req.query.to : undefined; res.json({ ok: true, data: await sessionService.listSessions(from, to) }); } catch (e) { next(e); } });
 router.get('/sessions/:sessionId/members', async (req, res, next) => { try { res.json({ ok: true, data: await sessionService.getSessionMembers(req.params.sessionId) }); } catch (e) { next(e); } });
 router.get('/sessions/:sessionId/waitlist', async (req, res, next) => { try { res.json({ ok: true, data: await bookingService.getSessionWaitlist(req.params.sessionId) }); } catch (e) { next(e); } });
-router.post('/sessions', async (req, res, next) => { try { const body = validate(createSessionSchema, req.body); const { data: st, error } = await supabaseAdmin.from('session_types').select('*').eq('id', body.sessionTypeId).single(); if (error || !st) throw new HttpError(404, 'Session type not found'); const start = new Date(body.start); const end = new Date(start.getTime() + (body.durationMins ?? st.default_duration_mins) * 60 * 1000); res.json({ ok: true, data: await sessionService.createSession({ sessionTypeId: body.sessionTypeId, tokenTypeId: body.tokenTypeId ?? st.token_type_id, coachId: body.coachId, locationId: body.locationId ?? null, isOnline: body.isOnline ?? false, startAt: start.toISOString(), endAt: end.toISOString(), capacity: body.capacity ?? st.default_capacity, allowOvertime: body.allowOvertime }) }); } catch (e) { next(e); } });
-router.patch('/sessions/:sessionId', async (req, res, next) => { try { const body = validate(updateSessionSchema, req.body); res.json({ ok: true, data: await sessionService.updateSession(req.params.sessionId, body) }); } catch (e) { next(e); } });
+router.post('/sessions', async (req, res, next) => { try { const body = validate(createSessionSchema, req.body); const { data: st, error } = await supabaseAdmin.from('session_types').select('*').eq('id', body.sessionTypeId).single(); if (error || !st) throw new HttpError(404, 'Session type not found'); const start = new Date(body.start); const end = new Date(start.getTime() + (body.durationMins ?? st.default_duration_mins) * 60 * 1000); const chargeType = body.chargeType ?? body.trainingLevel; res.json({ ok: true, data: await sessionService.createSession({ sessionTypeId: body.sessionTypeId, tokenTypeId: body.tokenTypeId ?? st.token_type_id, coachId: body.coachId, locationId: body.locationId ?? null, isOnline: body.isOnline ?? false, startAt: start.toISOString(), endAt: end.toISOString(), capacity: body.capacity ?? st.default_capacity, allowOvertime: body.allowOvertime, chargeType }) }); } catch (e) { next(e); } });
+router.patch('/sessions/:sessionId', async (req, res, next) => { try { const body = validate(updateSessionSchema, req.body); const chargeType = body.chargeType ?? body.trainingLevel; res.json({ ok: true, data: await sessionService.updateSession(req.params.sessionId, { ...body, chargeType }) }); } catch (e) { next(e); } });
 router.patch('/sessions/:sessionId/capacity', async (req, res, next) => { try { const body = validate(setCapacitySchema, req.body); res.json({ ok: true, data: await sessionService.setCapacity(req.params.sessionId, body.capacity) }); } catch (e) { next(e); } });
 router.patch('/sessions/:sessionId/coach', async (req, res, next) => { try { const body = validate(setCoachSchema, req.body); res.json({ ok: true, data: await sessionService.setCoach(req.params.sessionId, body.newCoachId, { allowOvertime: body.allowOvertime }) }); } catch (e) { next(e); } });
 router.patch('/sessions/:sessionId/type', async (req, res, next) => { try { const body = validate(setSessionTypeSchema, req.body); const { data: st, error } = await supabaseAdmin.from('session_types').select('*').eq('id', body.newSessionTypeId).single(); if (error || !st) throw new HttpError(404, 'Session type not found'); res.json({ ok: true, data: await sessionService.setSessionType(req.params.sessionId, body.newSessionTypeId, st.token_type_id) }); } catch (e) { next(e); } });
@@ -160,7 +161,8 @@ router.get('/members/:memberId/membership', async (req, res, next) => {
   try {
     const { memberId } = validate(z.object({ memberId: z.string().uuid() }), req.params);
     const mode = typeof req.query.mode === "string" ? req.query.mode : undefined;
-    const bookings = await bookingService.listAdminBookings({ memberId, limit: 200 });
+    // Use full member booking history so Training tab session history is complete.
+    const bookings = await bookingService.getBookings(memberId);
     const data = await membershipService.getAdminMemberMembershipAggregate(memberId, { mode }, bookings as Array<Record<string, unknown>>);
     res.json({ ok: true, data });
   } catch (e) {
@@ -176,6 +178,20 @@ router.patch('/members/:memberId/membership', async (req, res, next) => {
     const result = await membershipService.patchAdminMemberMembership(memberId, {
       mode,
       currentPackage: tier,
+    });
+    res.json({ ok: true, data: result });
+  } catch (e) {
+    next(e);
+  }
+});
+router.put('/members/:memberId/membership/access', async (req, res, next) => {
+  try {
+    const { memberId } = validate(z.object({ memberId: z.string().uuid() }), req.params);
+    const body = validate(putMemberDashboardMembershipAccessSchema, req.body);
+    const result = await membershipService.putAdminMemberMembershipAccess(memberId, {
+      member_locations: body.member_locations,
+      training_level: body.training_level,
+      session_access: body.session_access,
     });
     res.json({ ok: true, data: result });
   } catch (e) {

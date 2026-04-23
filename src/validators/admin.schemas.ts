@@ -1,6 +1,7 @@
 import { z } from "zod";
 const allowedSessionDurations = z.union([z.literal(30), z.literal(45), z.literal(60)]);
 const sessionTypeCategorySchema = z.enum(["1:1", "Elite", "Octave", "Group"]);
+const sessionChargeTypeSchema = z.enum(["charged", "noncharged"]);
 
 export const createSessionTypeSchema = z.object({
   name: z.string().min(1),
@@ -52,6 +53,8 @@ export const createSessionSchema = z.object({
   capacity: z.number().int().min(1).optional(),
   allowOvertime: z.boolean().optional(),
   isOnline: z.boolean().optional(),
+  chargeType: sessionChargeTypeSchema.optional(),
+  trainingLevel: sessionChargeTypeSchema.optional(),
 });
 export const updateSessionSchema = z
   .object({
@@ -64,6 +67,8 @@ export const updateSessionSchema = z
     capacity: z.number().int().min(1).optional(),
     allowOvertime: z.boolean().optional(),
     isOnline: z.boolean().optional(),
+    chargeType: sessionChargeTypeSchema.optional(),
+    trainingLevel: sessionChargeTypeSchema.optional(),
   })
   .refine((v) => Object.keys(v).length > 0, { message: 'At least one field must be provided' });
 export const setCapacitySchema = z.object({ capacity: z.number().int().min(1) });
@@ -91,6 +96,11 @@ export const patchMemberDashboardMembershipSchema = z
     (v) => v.mode !== undefined || v.current_package !== undefined || v.currentPackage !== undefined,
     { message: "At least one of mode, current_package, or currentPackage is required" },
   );
+export const putMemberDashboardMembershipAccessSchema = z.object({
+  member_locations: z.array(z.string().min(1)).default([]),
+  training_level: z.array(z.string().min(1)).default([]),
+  session_access: z.array(z.string().min(1)).default([]),
+});
 export const updateMembershipSchema = z
   .object({
     mode: z.enum(["inperson", "remote"]).optional(),

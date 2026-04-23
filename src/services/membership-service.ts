@@ -99,6 +99,107 @@ function parseCalendarDateToEndIso(dateStr: string): string {
 }
 
 export class MembershipService {
+  #normalizeCodeList(value: unknown): string[] {
+    if (!Array.isArray(value)) return [];
+    return Array.from(
+      new Set(
+        value
+          .map((item) => String(item ?? "").trim().toLowerCase())
+          .filter((item) => item.length > 0),
+      ),
+    );
+  }
+
+  async putAdminMemberMembershipAccess(
+    memberId: string,
+    body: {
+      member_locations?: string[];
+      training_level?: string[];
+      session_access?: string[];
+    },
+  ) {
+    const { data: profile, error: profileErr } = await supabaseAdmin
+      .from("profiles")
+      .select("id")
+      .eq("id", memberId)
+      .maybeSingle();
+    if (profileErr) throw new HttpError(500, "Failed to verify member", profileErr);
+    if (!profile) throw new HttpError(404, "Member not found");
+
+    const memberLocations = this.#normalizeCodeList(body.member_locations);
+    const trainingLevels = this.#normalizeCodeList(body.training_level);
+    const sessionAccess = this.#normalizeCodeList(body.session_access);
+
+    const { error: clearLocErr } = await supabaseAdmin
+      .from("member_location_access")
+      .delete()
+      .eq("member_id", memberId);
+    if (clearLocErr) {
+      throw new HttpError(500, "Failed to clear member location access", clearLocErr);
+    }
+    if (memberLocations.length) {
+      const { error: insertLocErr } = await supabaseAdmin
+        .from("member_location_access")
+        .insert(
+          memberLocations.map((locationCode) => ({
+            member_id: memberId,
+            location_code: locationCode,
+          })),
+        );
+      if (insertLocErr) {
+        throw new HttpError(500, "Failed to save member location access", insertLocErr);
+      }
+    }
+
+    const { error: clearTrainingErr } = await supabaseAdmin
+      .from("member_training_levels")
+      .delete()
+      .eq("member_id", memberId);
+    if (clearTrainingErr) {
+      throw new HttpError(500, "Failed to clear member training levels", clearTrainingErr);
+    }
+    if (trainingLevels.length) {
+      const { error: insertTrainingErr } = await supabaseAdmin
+        .from("member_training_levels")
+        .insert(
+          trainingLevels.map((levelCode) => ({
+            member_id: memberId,
+            level_code: levelCode,
+          })),
+        );
+      if (insertTrainingErr) {
+        throw new HttpError(500, "Failed to save member training levels", insertTrainingErr);
+      }
+    }
+
+    const { error: clearSessionAccessErr } = await supabaseAdmin
+      .from("member_session_access")
+      .delete()
+      .eq("member_id", memberId);
+    if (clearSessionAccessErr) {
+      throw new HttpError(500, "Failed to clear member session access", clearSessionAccessErr);
+    }
+    if (sessionAccess.length) {
+      const { error: insertSessionAccessErr } = await supabaseAdmin
+        .from("member_session_access")
+        .insert(
+          sessionAccess.map((accessCode) => ({
+            member_id: memberId,
+            session_code: accessCode,
+          })),
+        );
+      if (insertSessionAccessErr) {
+        throw new HttpError(500, "Failed to save member session access", insertSessionAccessErr);
+      }
+    }
+
+    return {
+      member_locations: memberLocations,
+      training_level: trainingLevels,
+      session_access: sessionAccess,
+    };
+  }
+
   async createMembership(input: {
     memberId: string;
     mode: MembershipMode;
@@ -530,6 +631,36 @@ export class MembershipService {
       else historySessions.push(row);
     }
 
+    const { data: locationAccessRows, error: locationAccessErr } = await supabaseAdmin
+      .from("member_location_access")
+      .select("location_code")
+      .eq("member_id", memberId);
+    if (locationAccessErr) {
+      throw new HttpError(500, "Failed to load member location access", locationAccessErr);
+    }
+    const { data: trainingLevelRows, error: trainingLevelErr } = await supabaseAdmin
+      .from("member_training_levels")
+      .select("level_code")
+      .eq("member_id", memberId);
+    if (trainingLevelErr) {
+      throw new HttpError(500, "Failed to load member training levels", trainingLevelErr);
+    }
+    const { data: sessionAccessRows, error: sessionAccessErr } = await supabaseAdmin
+      .from("member_session_access")
+      .select("session_code")
+      .eq("member_id", memberId);
+    if (sessionAccessErr) {
+      throw new HttpError(500, "Failed to load member session access", sessionAccessErr);
+    }
+    const memberLocations = (locationAccessRows ?? [])
+      .map((row) => String((row as { location_code?: string }).location_code ?? "").trim())
+      .filter(Boolean);
+    const trainingLevel = (trainingLevelRows ?? [])
+      .map((row) => String((row as { level_code?: string }).level_code ?? "").trim())
+      .filter(Boolean);
+    const sessionAccess = (sessionAccessRows ?? [])
+      .map((row) => String((row as { session_code?: string }).session_code ?? "").trim())
+      .filter(Boolean);
     const syntheticHistory = this.#buildDashboardHistoryEvents(rows);
 
     return {
@@ -552,12 +683,12 @@ export class MembershipService {
       },
       gifts: [] as unknown[],
       access: {
-        memberLocations: [] as string[],
-        member_locations: [] as string[],
-        trainingLevel: [] as string[],
-        training_level: [] as string[],
-        sessionAccess: [] as string[],
-        session_access: [] as string[],
+        memberLocations,
+        member_locations: memberLocations,
+        trainingLevel,
+        training_level: trainingLevel,
+        sessionAccess,
+        session_access: sessionAccess,
       },
       sessions: {
         booked,

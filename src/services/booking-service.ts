@@ -115,6 +115,14 @@ export class BookingService {
     if (from && isDateOnly(from)) effectiveFrom = toStartOfDayUtc(from);
     if (to && isDateOnly(to)) effectiveTo = toEndOfDayUtc(to);
 
+    const normalizedSex = String((user as { sex?: string | null }).sex ?? "")
+      .trim()
+      .toLowerCase();
+    const allowedAudiences = new Set<string>(["mixed"]);
+    if (normalizedSex === "male" || normalizedSex === "female") {
+      allowedAudiences.add(normalizedSex);
+    }
+
     let query = supabaseAdmin
       .from("sessions")
       .select("*, session_types(*), coaches!sessions_coach_id_fkey(admins(name))")
@@ -138,16 +146,20 @@ export class BookingService {
         id: string;
         capacity: number;
         coaches?: { admins?: { name?: string } };
-        session_types?: { token_type_id?: string } | null;
+        session_types?: { token_type_id?: string; audience?: string | null } | null;
       }
     >;
     if (list.length === 0) return [];
 
-    // Enforce allowance gating at token level too
+    // Enforce allowance gating at token level and audience level.
     const eligibleList = allowedTokenTypeIds.size
       ? list.filter((s) => {
           const tokenTypeId = s.session_types?.token_type_id;
-          return tokenTypeId ? allowedTokenTypeIds.has(String(tokenTypeId)) : false;
+          const audience = String(s.session_types?.audience ?? "mixed")
+            .trim()
+            .toLowerCase();
+          const audienceAllowed = allowedAudiences.has(audience || "mixed");
+          return tokenTypeId ? allowedTokenTypeIds.has(String(tokenTypeId)) && audienceAllowed : false;
         })
       : [];
     if (eligibleList.length === 0) return [];

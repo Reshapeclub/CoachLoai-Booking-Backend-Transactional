@@ -280,6 +280,7 @@ create table if not exists sessions (
   start_at timestamptz not null,
   end_at timestamptz not null,
   capacity int not null check (capacity > 0),
+  charge_type text check (charge_type in ('charged','noncharged')),
   created_at timestamptz not null default now(),
   is_cancelled boolean not null default false,
   "is_online" boolean not null default false,
@@ -292,8 +293,14 @@ begin
   alter table sessions add column if not exists is_cancelled boolean not null default false;
   alter table sessions add column if not exists "is_online" boolean not null default false;
   alter table sessions add column if not exists coach_id uuid;
+  alter table sessions add column if not exists charge_type text;
   if not exists (select 1 from pg_constraint where conname = 'sessions_coach_id_fkey') then
     alter table sessions add constraint sessions_coach_id_fkey foreign key (coach_id) references coaches(id);
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'sessions_charge_type_check') then
+    alter table sessions
+      add constraint sessions_charge_type_check
+      check (charge_type in ('charged','noncharged'));
   end if;
 exception when others then null;
 end $$;
