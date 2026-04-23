@@ -194,6 +194,103 @@ export class MembershipService {
     return data;
   }
 
+  async cancelMembershipPause(input: {
+    membershipId: string;
+    pauseId?: string;
+    reverseExtensions?: boolean;
+  }) {
+    const reverseExtensions = input.reverseExtensions !== false;
+    const { data: membership, error: membershipErr } = await supabaseAdmin
+      .from("member_memberships")
+      .select("id, end_date")
+      .eq("id", input.membershipId)
+      .maybeSingle();
+    if (membershipErr) throw new HttpError(500, "Failed to load membership", membershipErr);
+    if (!membership) throw new HttpError(404, "Membership not found");
+
+    let pauseRowIds: string[] = [];
+    if (input.pauseId) {
+      const { data: pauseRow, error: pauseErr } = await supabaseAdmin
+        .from("membership_pause_weeks")
+        .select("id")
+        .eq("membership_id", input.membershipId)
+        .eq("id", input.pauseId)
+        .maybeSingle();
+      if (pauseErr) throw new HttpError(500, "Failed to load membership pause", pauseErr);
+      if (pauseRow?.id) pauseRowIds = [String(pauseRow.id)];
+    } else {
+      const { data: latestPauseRows, error: latestPauseErr } = await supabaseAdmin
+        .from("membership_pause_weeks")
+        .select("id")
+        .eq("membership_id", input.membershipId)
+        .order("week_start", { ascending: false })
+        .limit(1);
+      if (latestPauseErr) {
+        throw new HttpError(500, "Failed to resolve latest membership pause", latestPauseErr);
+      }
+      pauseRowIds = (latestPauseRows ?? []).map((row) => String((row as { id: string }).id));
+    }
+
+    if (!pauseRowIds.length) {
+      return {
+        ok: true,
+        removedWeeks: 0,
+        reversedDays: 0,
+      };
+    }
+
+    const { error: deleteErr } = await supabaseAdmin
+      .from("membership_pause_weeks")
+      .delete()
+      .in("id", pauseRowIds);
+    if (deleteErr) throw new HttpError(500, "Failed to cancel membership pause", deleteErr);
+
+    const removedWeeks = pauseRowIds.length;
+    const reversedDays = reverseExtensions ? removedWeeks * 7 : 0;
+    const currentEndDate = String((membership as { end_date?: string | null }).end_date ?? "");
+    const currentEndMs = currentEndDate ? new Date(currentEndDate).getTime() : NaN;
+    const nextEndDate =
+      reverseExtensions && Number.isFinite(currentEndMs)
+        ? new Date(currentEndMs - reversedDays * 86400000).toISOString()
+        : currentEndDate || null;
+
+    const { data: remainingPauseRows, error: remainingErr } = await supabaseAdmin
+      .from("membership_pause_weeks")
+      .select("id")
+      .eq("membership_id", input.membershipId)
+      .limit(1);
+    if (remainingErr) throw new HttpError(500, "Failed to check remaining pauses", remainingErr);
+    const hasRemainingPause = (remainingPauseRows ?? []).length > 0;
+
+    const membershipPatch: {
+      updated_at: string;
+      is_paused: boolean;
+      end_date?: string | null;
+    } = {
+      updated_at: new Date().toISOString(),
+      is_paused: hasRemainingPause,
+    };
+    if (reverseExtensions && nextEndDate) {
+      membershipPatch.end_date = nextEndDate;
+    }
+
+    const { error: membershipUpdateErr } = await supabaseAdmin
+      .from("member_memberships")
+      .update(membershipPatch)
+      .eq("id", input.membershipId);
+    if (membershipUpdateErr) {
+      throw new HttpError(500, "Failed to update membership after pause cancel", membershipUpdateErr);
+    }
+
+    return {
+      ok: true,
+      removedWeeks,
+      reversedDays,
+      isPaused: hasRemainingPause,
+      endDate: nextEndDate || currentEndDate || null,
+    };
+  }
+
   async terminateMembership(input: { membershipId: string; terminationDate: string }) {
     const { data, error } = await supabaseAdmin
       .from("member_memberships")
@@ -240,7 +337,7 @@ export class MembershipService {
   }
 
   /**
-   * Payload shape expected by adminDashboard MemberProfile memberships hydrate
+   * 
    * (GET /admin/members/:memberId/membership).
    */
   async getAdminMemberMembershipAggregate(
@@ -265,10 +362,34 @@ export class MembershipService {
     const rows = (membershipRows ?? []) as MembershipRow[];
     const membership =
       rows.find((r) => r.mode === mode) ?? rows.find((r) => r.status === "active") ?? rows[0] ?? null;
+    let transactionalMembershipId = "";
+    if (membership) {
+      const membershipRecord = membership as MembershipRow & {
+        membership_id?: string | null;
+      };
+      transactionalMembershipId = String(membershipRecord.membership_id ?? "").trim();
+      if (!transactionalMembershipId) {
+        const { data: activeMembershipId, error: activeMembershipErr } =
+          await supabaseAdmin.rpc("clm_find_active_membership", {
+            p_member_id: memberId,
+            p_now: new Date().toISOString(),
+          });
+        if (activeMembershipErr) {
+          throw new HttpError(
+            500,
+            "Failed to resolve transactional membership id",
+            activeMembershipErr,
+          );
+        }
+        transactionalMembershipId = String(activeMembershipId ?? "").trim();
+      }
+    }
 
     const membershipPayload = membership
       ? {
           id: membership.id,
+          transactionalMembershipId,
+          transactional_membership_id: transactionalMembershipId,
           memberId: membership.member_id,
           mode: membership.mode,
           currentPackage: membership.current_package,

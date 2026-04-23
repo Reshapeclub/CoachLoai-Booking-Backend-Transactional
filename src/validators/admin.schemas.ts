@@ -106,6 +106,12 @@ export const pauseMembershipSchema = z.object({
   startWeek: z.string().datetime(),
   endWeekInclusive: z.string().datetime(),
 });
+export const cancelPauseMembershipSchema = z.object({
+  pause_id: z.string().uuid().optional(),
+  pauseId: z.string().uuid().optional(),
+  reverse_extensions: z.boolean().optional(),
+  reverseExtensions: z.boolean().optional(),
+});
 export const terminateMembershipSchema = z.object({
   terminationDate: z.string().datetime(),
 });

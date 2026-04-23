@@ -446,10 +446,15 @@ begin
       (v_booking.member_id, 'email', 'booking_cancelled', jsonb_build_object('bookingId', v_booking.booking_id, 'refundApplied', false, 'reason', 'membership_paused'));
   end loop;
 
-  foreach v_sid in array (select distinct unnest(v_session_ids))
-  loop
-    v_waitlist := clm_process_waitlist_after_opening(v_sid, p_now);
-  end loop;
+  if coalesce(array_length(v_session_ids, 1), 0) > 0 then
+    foreach v_sid in array coalesce(
+      (select array_agg(distinct sid) from unnest(v_session_ids) as sid),
+      '{}'::uuid[]
+    )
+    loop
+      v_waitlist := clm_process_waitlist_after_opening(v_sid, p_now);
+    end loop;
+  end if;
 
   v_new_end_date := v_membership.end_date + (v_inserted_weeks * interval '7 days');
   update member_memberships set end_date = v_new_end_date, is_paused = true, updated_at = p_now where id = p_membership_id;
