@@ -489,7 +489,7 @@ export class SessionService {
   async listCoaches() {
     const { data, error } = await supabaseAdmin
       .from("coaches")
-      .select("*, admins!coaches_user_id_fkey(id, name, email, location_id)")
+      .select("*, admins!coaches_user_id_fkey(id, name, email, role, location_id)")
       .order("user_id", { ascending: true });
     if (error) throw new HttpError(500, "Failed to fetch coaches", error);
     return data ?? [];
