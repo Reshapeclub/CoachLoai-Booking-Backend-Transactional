@@ -287,7 +287,7 @@ export class SessionService {
     capacity: number;
     allowOvertime?: boolean;
     isOnline?: boolean;
-    chargeType?: "charged" | "noncharged";
+    trainingLevel?: string | null;
   }) {
     await validateCoachForSession({
       coachId: input.coachId,
@@ -308,7 +308,7 @@ export class SessionService {
         end_at: input.endAt,
         capacity: input.capacity,
         is_online: input.isOnline ?? false,
-        charge_type: input.chargeType ?? null,
+        training_level: input.trainingLevel ?? null,
       })
       .select()
       .single();
@@ -328,7 +328,7 @@ export class SessionService {
       capacity?: number;
       allowOvertime?: boolean;
       isOnline?: boolean;
-      chargeType?: "charged" | "noncharged";
+      trainingLevel?: string | null;
     }
   ) {
     const { data: current, error: currentErr } = await supabaseAdmin
@@ -387,7 +387,7 @@ export class SessionService {
       capacity: finalCapacity,
     };
     if (input.isOnline !== undefined) updates.is_online = input.isOnline;
-    if (input.chargeType !== undefined) updates.charge_type = input.chargeType;
+    if (input.trainingLevel !== undefined) updates.training_level = input.trainingLevel;
 
     const { data, error } = await supabaseAdmin
       .from("sessions")

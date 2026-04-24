@@ -108,8 +108,8 @@ router.get('/waitlist-entries', async (req, res, next) => {
 router.get('/sessions', async (req, res, next) => { try { const from = typeof req.query.from === 'string' ? req.query.from : undefined; const to = typeof req.query.to === 'string' ? req.query.to : undefined; res.json({ ok: true, data: await sessionService.listSessions(from, to) }); } catch (e) { next(e); } });
 router.get('/sessions/:sessionId/members', async (req, res, next) => { try { res.json({ ok: true, data: await sessionService.getSessionMembers(req.params.sessionId) }); } catch (e) { next(e); } });
 router.get('/sessions/:sessionId/waitlist', async (req, res, next) => { try { res.json({ ok: true, data: await bookingService.getSessionWaitlist(req.params.sessionId) }); } catch (e) { next(e); } });
-router.post('/sessions', async (req, res, next) => { try { const body = validate(createSessionSchema, req.body); const { data: st, error } = await supabaseAdmin.from('session_types').select('*').eq('id', body.sessionTypeId).single(); if (error || !st) throw new HttpError(404, 'Session type not found'); const start = new Date(body.start); const end = new Date(start.getTime() + (body.durationMins ?? st.default_duration_mins) * 60 * 1000); const chargeType = body.chargeType ?? body.trainingLevel; res.json({ ok: true, data: await sessionService.createSession({ sessionTypeId: body.sessionTypeId, tokenTypeId: body.tokenTypeId ?? st.token_type_id, coachId: body.coachId, locationId: body.locationId ?? null, isOnline: body.isOnline ?? false, startAt: start.toISOString(), endAt: end.toISOString(), capacity: body.capacity ?? st.default_capacity, allowOvertime: body.allowOvertime, chargeType }) }); } catch (e) { next(e); } });
-router.patch('/sessions/:sessionId', async (req, res, next) => { try { const body = validate(updateSessionSchema, req.body); const chargeType = body.chargeType ?? body.trainingLevel; res.json({ ok: true, data: await sessionService.updateSession(req.params.sessionId, { ...body, chargeType }) }); } catch (e) { next(e); } });
+router.post('/sessions', async (req, res, next) => { try { const body = validate(createSessionSchema, req.body); const { data: st, error } = await supabaseAdmin.from('session_types').select('*').eq('id', body.sessionTypeId).single(); if (error || !st) throw new HttpError(404, 'Session type not found'); const start = new Date(body.start); const end = new Date(start.getTime() + (body.durationMins ?? st.default_duration_mins) * 60 * 1000); const trainingLevel = body.trainingLevel; res.json({ ok: true, data: await sessionService.createSession({ sessionTypeId: body.sessionTypeId, tokenTypeId: body.tokenTypeId ?? st.token_type_id, coachId: body.coachId, locationId: body.locationId ?? null, isOnline: body.isOnline ?? false, startAt: start.toISOString(), endAt: end.toISOString(), capacity: body.capacity ?? st.default_capacity, allowOvertime: body.allowOvertime, trainingLevel }) }); } catch (e) { next(e); } });
+router.patch('/sessions/:sessionId', async (req, res, next) => { try { const body = validate(updateSessionSchema, req.body); const trainingLevel = body.trainingLevel; res.json({ ok: true, data: await sessionService.updateSession(req.params.sessionId, { ...body, trainingLevel }) }); } catch (e) { next(e); } });
 router.patch('/sessions/:sessionId/capacity', async (req, res, next) => { try { const body = validate(setCapacitySchema, req.body); res.json({ ok: true, data: await sessionService.setCapacity(req.params.sessionId, body.capacity) }); } catch (e) { next(e); } });
 router.patch('/sessions/:sessionId/coach', async (req, res, next) => { try { const body = validate(setCoachSchema, req.body); res.json({ ok: true, data: await sessionService.setCoach(req.params.sessionId, body.newCoachId, { allowOvertime: body.allowOvertime }) }); } catch (e) { next(e); } });
 router.patch('/sessions/:sessionId/type', async (req, res, next) => { try { const body = validate(setSessionTypeSchema, req.body); const { data: st, error } = await supabaseAdmin.from('session_types').select('*').eq('id', body.newSessionTypeId).single(); if (error || !st) throw new HttpError(404, 'Session type not found'); res.json({ ok: true, data: await sessionService.setSessionType(req.params.sessionId, body.newSessionTypeId, st.token_type_id) }); } catch (e) { next(e); } });
@@ -414,6 +414,35 @@ router.delete('/staff/:staffId/leaves/:leaveId', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ── Staff Schedule (current week sessions) ────────────────────────────────────
+router.get('/staff/:staffId/schedule', async (req, res, next) => {
+  try {
+    const coachId = await resolveCoachId(req.params.staffId);
+    if (!coachId) return res.json({ ok: true, isCoach: false, data: [] });
+
+    // Current week: Monday 00:00 UTC → next Monday 00:00 UTC
+    const now = new Date();
+    const dow = now.getDay(); // 0 = Sun
+    const monday = new Date(now);
+    monday.setDate(now.getDate() - (dow === 0 ? 6 : dow - 1));
+    monday.setHours(0, 0, 0, 0);
+    const nextMonday = new Date(monday);
+    nextMonday.setDate(monday.getDate() + 7);
+
+    const { data, error } = await supabaseAdmin
+      .from("sessions")
+      .select("id, start_at, end_at, capacity, is_cancelled, session_types(name, color), locations(name)")
+      .eq("coach_id", coachId)
+      .eq("is_cancelled", false)
+      .gte("start_at", monday.toISOString())
+      .lt("start_at", nextMonday.toISOString())
+      .order("start_at", { ascending: true });
+
+    if (error) throw new HttpError(500, "Failed to fetch schedule", error);
+    res.json({ ok: true, isCoach: true, data: data ?? [] });
+  } catch (e) { next(e); }
+});
+
 // ── Staff Stats ────────────────────────────────────────────────────────────────
 router.get('/staff/:staffId/stats', async (req, res, next) => {
   try {
@@ -479,7 +508,7 @@ router.get('/staff/:staffId/stats', async (req, res, next) => {
 
     const bk = (bookings ?? []) as { session_id: string; status: string }[];
     const nonCancelled = bk.filter(b => b.status !== "cancelled");
-    const noShows      = bk.filter(b => b.status === "no_show");
+    const noShows = bk.filter(b => b.status === "no_show");
 
     // UTIL — avg (booked / capacity) across past sessions, as %
     let utilSum = 0;
@@ -596,13 +625,13 @@ router.post('/staff/:staffId/tasks', async (req, res, next) => {
       .from("staff_tasks")
       .insert({
         assigned_to_admin_id: parseInt(req.params.staffId, 10),
-        created_by_admin_id:  creatorId,
-        title:                title.trim(),
-        description:          description?.trim() ?? null,
-        due_at:               due_at ?? null,
+        created_by_admin_id: creatorId,
+        title: title.trim(),
+        description: description?.trim() ?? null,
+        due_at: due_at ?? null,
         priority,
-        status:               "open",
-        source:               "manual",
+        status: "open",
+        source: "manual",
       })
       .select("*")
       .single();
@@ -617,16 +646,16 @@ router.patch('/staff/:staffId/tasks/:taskId', async (req, res, next) => {
     const { status, title, description, due_at, priority } = req.body as {
       status?: string; title?: string; description?: string; due_at?: string | null; priority?: string;
     };
-    const validStatuses   = ["open", "done"];
+    const validStatuses = ["open", "done"];
     const validPriorities = ["low", "medium", "high"];
-    if (status   && !validStatuses.includes(status))     throw new HttpError(400, `status must be one of: ${validStatuses.join(", ")}`);
+    if (status && !validStatuses.includes(status)) throw new HttpError(400, `status must be one of: ${validStatuses.join(", ")}`);
     if (priority && !validPriorities.includes(priority)) throw new HttpError(400, `priority must be one of: ${validPriorities.join(", ")}`);
     const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
-    if (status      !== undefined) { updates.status = status; if (status === "done") updates.completed_at = new Date().toISOString(); }
-    if (title       !== undefined) updates.title       = title?.trim();
+    if (status !== undefined) { updates.status = status; if (status === "done") updates.completed_at = new Date().toISOString(); }
+    if (title !== undefined) updates.title = title?.trim();
     if (description !== undefined) updates.description = description?.trim() ?? null;
-    if (due_at      !== undefined) updates.due_at      = due_at ?? null;
-    if (priority    !== undefined) updates.priority    = priority;
+    if (due_at !== undefined) updates.due_at = due_at ?? null;
+    if (priority !== undefined) updates.priority = priority;
     const { data, error } = await supabaseAdmin
       .from("staff_tasks")
       .update(updates)
@@ -660,6 +689,7 @@ router.delete('/locations/:locationId', async (req, res, next) => { try { await 
 router.get('/meeting-types', async (req, res, next) => { try { res.json({ ok: true, data: await meetingService.listMeetingTypesAdmin() }); } catch (e) { next(e); } });
 router.post('/meeting-types', async (req, res, next) => { try { const body = validate(createMeetingTypeSchema, req.body); res.json({ ok: true, data: await meetingService.createMeetingType(body) }); } catch (e) { next(e); } });
 router.patch('/meeting-types/:meetingTypeId', async (req, res, next) => { try { const body = validate(updateMeetingTypeSchema, req.body); res.json({ ok: true, data: await meetingService.updateMeetingType(req.params.meetingTypeId, body) }); } catch (e) { next(e); } });
+router.delete('/meeting-types/:meetingTypeId', async (req, res, next) => { try { res.json({ ok: true, data: await meetingService.deleteMeetingType(req.params.meetingTypeId) }); } catch (e) { next(e); } });
 router.get('/meeting-slots', async (req, res, next) => { try { const q = validate(adminMeetingSlotsQuerySchema, req.query); res.json({ ok: true, data: await meetingService.listMeetingSlotsAdmin({ meetingTypeId: q.meetingTypeId, locationId: q.locationId, from: q.from, to: q.to }) }); } catch (e) { next(e); } });
 router.post('/meeting-slots', async (req, res, next) => { try { const body = validate(createMeetingSlotSchema, req.body); res.json({ ok: true, data: await meetingService.createMeetingSlot(body) }); } catch (e) { next(e); } });
 router.patch('/meeting-slots/:meetingSlotId', async (req, res, next) => { try { const body = validate(updateMeetingSlotSchema, req.body); res.json({ ok: true, data: await meetingService.updateMeetingSlot(req.params.meetingSlotId, body) }); } catch (e) { next(e); } });

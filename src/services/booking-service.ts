@@ -154,13 +154,13 @@ export class BookingService {
     // Enforce allowance gating at token level and audience level.
     const eligibleList = allowedTokenTypeIds.size
       ? list.filter((s) => {
-          const tokenTypeId = s.session_types?.token_type_id;
-          const audience = String(s.session_types?.audience ?? "mixed")
-            .trim()
-            .toLowerCase();
-          const audienceAllowed = allowedAudiences.has(audience || "mixed");
-          return tokenTypeId ? allowedTokenTypeIds.has(String(tokenTypeId)) && audienceAllowed : false;
-        })
+        const tokenTypeId = s.session_types?.token_type_id;
+        const audience = String(s.session_types?.audience ?? "mixed")
+          .trim()
+          .toLowerCase();
+        const audienceAllowed = allowedAudiences.has(audience || "mixed");
+        return tokenTypeId ? allowedTokenTypeIds.has(String(tokenTypeId)) && audienceAllowed : false;
+      })
       : [];
     if (eligibleList.length === 0) return [];
 
@@ -268,16 +268,24 @@ export class BookingService {
 
   async getSessionUsage(memberId: string, view: "past" | "upcoming") {
     const now = new Date();
-    const fourWeeksMs = 4 * 7 * 24 * 60 * 60 * 1000;
+    let rangeStart: Date;
+    let rangeEnd: Date;
 
-    // Determine the date range (4 weeks)
-    const rangeStart = view === "past" ? new Date(now.getTime() - fourWeeksMs) : now;
-    const rangeEnd = view === "past" ? now : new Date(now.getTime() + fourWeeksMs);
+    if (view === "past") {
+      rangeStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+      rangeEnd = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59, 999);
+    } else {
+      rangeStart = new Date(now.getFullYear(), now.getMonth(), 1);
+      rangeEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
+    }
 
     // Fetch bookings within the date range (join sessions for start_at)
     const { data: bookings, error: bookingsErr } = await supabaseAdmin
       .from("bookings")
-      .select("id, status, booked_at, session_id, sessions(id, start_at, end_at, session_type_id, session_types(id, name, color))")
+      .select(`
+        id, status, booked_at, session_id, 
+        sessions!inner(id, start_at, end_at, session_type_id, session_types(id, name, color))
+      `)
       .eq("member_id", memberId)
       .gte("sessions.start_at", rangeStart.toISOString())
       .lte("sessions.start_at", rangeEnd.toISOString());
@@ -370,9 +378,13 @@ export class BookingService {
 
     return {
       view: "upcoming",
-      used: upcoming,
-      remaining: Math.max(0, allowed - upcoming),
-      unused: Math.max(0, allowed - upcoming),
+      attended,
+      upcoming,
+      missed,
+      cancelled,
+      used: attended + upcoming + missed,
+      remaining: Math.max(0, allowed - (attended + upcoming + missed)),
+      unused: Math.max(0, allowed - (attended + upcoming + missed)),
       allowed,
       schedule,
     };
@@ -618,7 +630,7 @@ export class BookingService {
   }
 
   async adminCancelSession(input: { sessionId: string; refund: "refund" | "charge"; adminId: string }) {
-   console.log("adminCancelSession", input);
+    console.log("adminCancelSession", input);
     const { data, error } = await supabaseAdmin.rpc("clm_admin_cancel_session", {
       p_admin_id: input.adminId,
       p_session_id: input.sessionId,

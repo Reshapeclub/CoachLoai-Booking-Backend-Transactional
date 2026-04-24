@@ -280,7 +280,7 @@ create table if not exists sessions (
   start_at timestamptz not null,
   end_at timestamptz not null,
   capacity int not null check (capacity > 0),
-  charge_type text check (charge_type in ('charged','noncharged')),
+  training_level text,
   created_at timestamptz not null default now(),
   is_cancelled boolean not null default false,
   "is_online" boolean not null default false,
@@ -293,14 +293,9 @@ begin
   alter table sessions add column if not exists is_cancelled boolean not null default false;
   alter table sessions add column if not exists "is_online" boolean not null default false;
   alter table sessions add column if not exists coach_id uuid;
-  alter table sessions add column if not exists charge_type text;
+  alter table sessions add column if not exists training_level text;
   if not exists (select 1 from pg_constraint where conname = 'sessions_coach_id_fkey') then
     alter table sessions add constraint sessions_coach_id_fkey foreign key (coach_id) references coaches(id);
-  end if;
-  if not exists (select 1 from pg_constraint where conname = 'sessions_charge_type_check') then
-    alter table sessions
-      add constraint sessions_charge_type_check
-      check (charge_type in ('charged','noncharged'));
   end if;
 exception when others then null;
 end $$;
@@ -384,6 +379,7 @@ create table if not exists meeting_slots (
   id uuid primary key default gen_random_uuid(),
   meeting_type_id uuid not null references meeting_types(id) on delete cascade,
   location_id uuid not null references locations(id) on delete cascade,
+  coach_id uuid references coaches(id),
   slot_start timestamptz not null,
   slot_end timestamptz not null,
   capacity int not null default 1 check (capacity > 0),
@@ -395,6 +391,17 @@ create table if not exists meeting_slots (
 
 create index if not exists idx_meeting_slots_lookup
   on meeting_slots (meeting_type_id, location_id, slot_start);
+
+do $$
+begin
+  alter table meeting_slots add column if not exists coach_id uuid;
+  if not exists (select 1 from pg_constraint where conname = 'meeting_slots_coach_id_fkey') then
+    alter table meeting_slots
+      add constraint meeting_slots_coach_id_fkey
+      foreign key (coach_id) references coaches(id);
+  end if;
+exception when others then null;
+end $$;
 
 create index if not exists idx_track_meetings_slot_lookup
   on track_meetings (meeting_type_id, location_id, meeting_start, status);

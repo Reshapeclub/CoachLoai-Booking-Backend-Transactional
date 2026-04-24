@@ -53,8 +53,7 @@ export const createSessionSchema = z.object({
   capacity: z.number().int().min(1).optional(),
   allowOvertime: z.boolean().optional(),
   isOnline: z.boolean().optional(),
-  chargeType: sessionChargeTypeSchema.optional(),
-  trainingLevel: sessionChargeTypeSchema.optional(),
+  trainingLevel: z.string().nullable().optional(),
 });
 export const updateSessionSchema = z
   .object({
@@ -67,8 +66,7 @@ export const updateSessionSchema = z
     capacity: z.number().int().min(1).optional(),
     allowOvertime: z.boolean().optional(),
     isOnline: z.boolean().optional(),
-    chargeType: sessionChargeTypeSchema.optional(),
-    trainingLevel: sessionChargeTypeSchema.optional(),
+    trainingLevel: z.string().nullable().optional(),
   })
   .refine((v) => Object.keys(v).length > 0, { message: 'At least one field must be provided' });
 export const setCapacitySchema = z.object({ capacity: z.number().int().min(1) });
@@ -259,6 +257,7 @@ export const createMeetingSlotSchema = z
   .object({
     meetingTypeId: z.string().uuid(),
     locationId: z.string().uuid(),
+    coachId: z.string().uuid().nullable().optional(),
     slotStart: z.string().datetime(),
     slotEnd: z.string().datetime(),
     capacity: z.number().int().min(1).optional(),
@@ -270,6 +269,7 @@ export const updateMeetingSlotSchema = z
   .object({
     meetingTypeId: z.string().uuid().optional(),
     locationId: z.string().uuid().optional(),
+    coachId: z.string().uuid().nullable().optional(),
     slotStart: z.string().datetime().optional(),
     slotEnd: z.string().datetime().optional(),
     capacity: z.number().int().min(1).optional(),

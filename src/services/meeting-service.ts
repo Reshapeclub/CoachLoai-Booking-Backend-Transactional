@@ -72,6 +72,17 @@ export class MeetingService {
     return data;
   }
 
+  async deleteMeetingType(meetingTypeId: string) {
+    const { error } = await supabaseAdmin.from("meeting_types").delete().eq("id", meetingTypeId);
+    if (error) {
+      if ((error as { code?: string }).code === "23503") {
+        throw new HttpError(409, "Cannot delete meeting type while slots or meetings still reference it", error);
+      }
+      throw new HttpError(500, "Failed to delete meeting type", error);
+    }
+    return { ok: true };
+  }
+
   async listMeetingTypes() {
     const { data, error } = await supabaseAdmin
       .from("meeting_types")
@@ -168,7 +179,7 @@ export class MeetingService {
   }) {
     let query = supabaseAdmin
       .from("meeting_slots")
-      .select("*, meeting_types(*), locations(*)")
+      .select("*, meeting_types(*), locations(*), coaches!meeting_slots_coach_id_fkey(id, admins(name, id))")
       .order("slot_start", { ascending: true });
 
     if (filters.meetingTypeId) query = query.eq("meeting_type_id", filters.meetingTypeId);
@@ -207,6 +218,7 @@ export class MeetingService {
   async createMeetingSlot(input: {
     meetingTypeId: string;
     locationId: string;
+    coachId?: string | null;
     slotStart: string;
     slotEnd: string;
     capacity?: number;
@@ -217,6 +229,7 @@ export class MeetingService {
       .insert({
         meeting_type_id: input.meetingTypeId,
         location_id: input.locationId,
+        coach_id: input.coachId ?? null,
         slot_start: input.slotStart,
         slot_end: input.slotEnd,
         capacity: input.capacity ?? 1,
@@ -233,6 +246,7 @@ export class MeetingService {
     input: {
       meetingTypeId?: string;
       locationId?: string;
+      coachId?: string | null;
       slotStart?: string;
       slotEnd?: string;
       capacity?: number;
@@ -242,6 +256,7 @@ export class MeetingService {
     const updates: Record<string, unknown> = {};
     if (input.meetingTypeId !== undefined) updates.meeting_type_id = input.meetingTypeId;
     if (input.locationId !== undefined) updates.location_id = input.locationId;
+    if (input.coachId !== undefined) updates.coach_id = input.coachId;
     if (input.slotStart !== undefined) updates.slot_start = input.slotStart;
     if (input.slotEnd !== undefined) updates.slot_end = input.slotEnd;
     if (input.capacity !== undefined) updates.capacity = input.capacity;
