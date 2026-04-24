@@ -663,6 +663,16 @@ router.patch('/meeting-types/:meetingTypeId', async (req, res, next) => { try { 
 router.get('/meeting-slots', async (req, res, next) => { try { const q = validate(adminMeetingSlotsQuerySchema, req.query); res.json({ ok: true, data: await meetingService.listMeetingSlotsAdmin({ meetingTypeId: q.meetingTypeId, locationId: q.locationId, from: q.from, to: q.to }) }); } catch (e) { next(e); } });
 router.post('/meeting-slots', async (req, res, next) => { try { const body = validate(createMeetingSlotSchema, req.body); res.json({ ok: true, data: await meetingService.createMeetingSlot(body) }); } catch (e) { next(e); } });
 router.patch('/meeting-slots/:meetingSlotId', async (req, res, next) => { try { const body = validate(updateMeetingSlotSchema, req.body); res.json({ ok: true, data: await meetingService.updateMeetingSlot(req.params.meetingSlotId, body) }); } catch (e) { next(e); } });
+router.get('/meeting-slots/bookings', async (req, res, next) => {
+  try {
+    const q = validate(z.object({
+      meetingTypeId: z.string().uuid(),
+      locationId: z.string().uuid(),
+      meetingStart: z.string().datetime()
+    }), req.query);
+    res.json({ ok: true, data: await meetingService.listMeetingsForSlot(q) });
+  } catch (e) { next(e); }
+});
 router.delete('/meeting-slots/:meetingSlotId', async (req, res, next) => { try { res.json(await meetingService.deleteMeetingSlot(req.params.meetingSlotId)); } catch (e) { next(e); } });
 
 export default router;

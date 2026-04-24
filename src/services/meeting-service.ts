@@ -176,9 +176,32 @@ export class MeetingService {
     if (filters.from) query = query.gte("slot_start", filters.from);
     if (filters.to) query = query.lte("slot_start", filters.to);
 
-    const { data, error } = await query;
-    if (error) throw new HttpError(500, "Failed to fetch meeting slots", error);
-    return data ?? [];
+    const { data: slots, error: slotsError } = await query;
+    if (slotsError) throw new HttpError(500, "Failed to fetch meeting slots", slotsError);
+
+    if (!slots || slots.length === 0) return [];
+
+    // Fetch all bookings for these slots to calculate counts
+    const { data: bookings, error: bookingsError } = await supabaseAdmin
+      .from("track_meetings")
+      .select("meeting_type_id, location_id, meeting_start")
+      .gte("meeting_start", filters.from || slots[0].slot_start)
+      .lte("meeting_start", filters.to || slots[slots.length - 1].slot_start)
+      .eq("status", "booked");
+
+    if (bookingsError) throw new HttpError(500, "Failed to fetch bookings for counts", bookingsError);
+
+    // Merge counts into slots
+    const slotsWithCounts = slots.map(s => {
+      const bookedCount = bookings.filter(b => 
+        b.meeting_type_id === s.meeting_type_id &&
+        b.location_id === s.location_id &&
+        new Date(b.meeting_start).getTime() === new Date(s.slot_start).getTime()
+      ).length;
+      return { ...s, booked_count: bookedCount };
+    });
+
+    return slotsWithCounts;
   }
 
   async createMeetingSlot(input: {
@@ -240,6 +263,22 @@ export class MeetingService {
     return { ok: true };
   }
 
+  async listMeetingsForSlot(filters: {
+    meetingTypeId: string;
+    locationId: string;
+    meetingStart: string;
+  }) {
+    const { data, error } = await supabaseAdmin
+      .from("track_meetings")
+      .select("*, profiles(*)")
+      .eq("meeting_type_id", filters.meetingTypeId)
+      .eq("location_id", filters.locationId)
+      .eq("meeting_start", filters.meetingStart)
+      .eq("status", "booked");
+    if (error) throw new HttpError(500, "Failed to fetch slot meetings", error);
+    return data ?? [];
+  }
+
   async getEligibility(memberId: string) {
     const { data, error } = await supabaseAdmin
       .from("track_meetings")
@@ -282,6 +321,7 @@ export class MeetingService {
     if (typeError) throw new HttpError(500, "Failed to fetch meeting type", typeError);
     if (!meetingType) throw new HttpError(404, "Meeting type not found");
 
+
     const meetingStartDate = new Date(input.meetingStart);
     if (Number.isNaN(meetingStartDate.getTime())) throw new HttpError(400, "Invalid meetingStart");
     const meetingEndDate = new Date(
@@ -297,7 +337,7 @@ export class MeetingService {
       .eq("is_active", true)
       .maybeSingle();
     if (slotError) throw new HttpError(500, "Failed to validate meeting slot", slotError);
-    if (!slot) throw new HttpError(422, "Selected slot is not available");
+    if (!slot) throw new HttpError(422, "Selected slot is not available or already booked");
 
     const { count, error: countError } = await supabaseAdmin
       .from("track_meetings")
