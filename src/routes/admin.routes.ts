@@ -320,6 +320,9 @@ router.post('/staff', async (req, res, next) => {
     if (!email || !email.trim()) throw new HttpError(400, "email is required");
     // primary location: first of location_ids, or legacy location_id
     const allLocIds = location_ids ?? (location_id ? [location_id] : []);
+    if (isCoachLikeRole(role) && allLocIds.length === 0) {
+      throw new HttpError(400, "Coach users must have a location before creating coach profile");
+    }
     const primaryLocId = allLocIds[0] ?? null;
     const { data, error } = await supabaseAdmin
       .from("admins")
@@ -346,6 +349,21 @@ router.patch('/staff/:staffId', async (req, res, next) => {
     if (phone !== undefined) updates.phone = phone;
     // Resolve primary location from location_ids or legacy location_id
     const allLocIds = location_ids ?? (location_id !== undefined ? (location_id ? [location_id] : []) : undefined);
+    if (allLocIds !== undefined && allLocIds.length === 0) {
+      if (role === undefined) {
+        const { data: existingRoleRow, error: existingRoleErr } = await supabaseAdmin
+          .from("admins")
+          .select("role")
+          .eq("id", req.params.staffId)
+          .maybeSingle();
+        if (existingRoleErr) throw new HttpError(500, "Failed to verify staff role", existingRoleErr);
+        if (isCoachLikeRole(existingRoleRow?.role)) {
+          throw new HttpError(400, "Coach users must have a location before creating coach profile");
+        }
+      } else if (isCoachLikeRole(role)) {
+        throw new HttpError(400, "Coach users must have a location before creating coach profile");
+      }
+    }
     if (allLocIds !== undefined) updates.location_id = allLocIds[0] ?? null;
     else if (location_id !== undefined) updates.location_id = location_id;
     if (Object.keys(updates).length === 0) throw new HttpError(400, "At least one field required");
