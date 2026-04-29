@@ -50,10 +50,10 @@ export async function requireAdminAuth(req: Request, _res: Response, next: NextF
 
   try {
     const token = getBearerToken(req);
-    console.log("token", token);
+    //console.log("token", token);
     const secret = new TextEncoder().encode(env.JWT_SECRET);
     const { payload } = await jwtVerify(token, secret, { algorithms: ["HS256"] });
-    console.log("payload", payload);
+    //console.log("payload", payload);
     const rawId = (payload as { id?: unknown; sub?: unknown }).id ?? (payload as { sub?: unknown }).sub;
     const id =
       typeof rawId === "string"
@@ -67,14 +67,14 @@ export async function requireAdminAuth(req: Request, _res: Response, next: NextF
       typeof (payload as { email?: unknown }).email === "string"
         ? ((payload as { email?: unknown }).email as string)
         : undefined;
-    console.log("email", email);
+    //console.log("email", email);
     const role =
       typeof (payload as { role?: unknown }).role === "string"
         ? ((payload as { role?: string }).role?.toLowerCase() === "admin" ? "admin" : undefined)
         : undefined;
-    console.log("role", role);
+    //console.log("role", role);
     const user: RequestUser = { id, ...(email ? { email } : {}), ...(role ? { role } : {}) };
-    console.log("user", user);
+    //console.log("user", user);
     req.user = user;
     return next();
   } catch (err) {

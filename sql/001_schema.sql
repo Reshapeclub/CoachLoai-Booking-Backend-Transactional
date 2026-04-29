@@ -196,7 +196,7 @@ create table if not exists membership_session_allowances (
 create table if not exists coaches (
   id uuid primary key default gen_random_uuid(),
   user_id int null references admins(id) on delete cascade,
-  location_id uuid not null references locations(id),
+  location_id uuid null references locations(id),
   weekly_hour_limit_mins int not null default 2400 check (weekly_hour_limit_mins >= 0),
   travel_buffer_minutes int not null default 30 check (travel_buffer_minutes >= 0),
   is_active boolean not null default true,
@@ -227,6 +227,10 @@ begin
   if not exists (select 1 from pg_constraint where conname = 'coaches_user_id_key') then
     alter table coaches add constraint coaches_user_id_key unique (user_id);
   end if;
+  begin
+    alter table coaches alter column location_id drop not null;
+  exception when others then null;
+  end;
 exception when others then null;
 end;
 $$ language plpgsql;

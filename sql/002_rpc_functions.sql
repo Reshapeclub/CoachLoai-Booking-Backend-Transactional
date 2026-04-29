@@ -129,7 +129,24 @@ begin
   if v_membership.termination_date is not null and v_session.start_at >= v_membership.termination_date then raise exception 'Cannot book beyond termination date'; end if;
   if exists (select 1 from membership_pause_weeks mpw where mpw.membership_id = v_membership.id and mpw.week_start = v_session_week) then raise exception 'Cannot book in paused week'; end if;
   if v_session.start_at > v_horizon then raise exception 'Session beyond booking horizon'; end if;
-  if v_member.location_id is distinct from v_session.location_id then raise exception 'Location mismatch'; end if;
+  if not coalesce(v_session.is_online, false) and v_session.location_id is not null then
+    if not exists (
+      select 1
+      from member_location_access mla
+      where mla.member_id = p_member_id
+        and (
+          lower(regexp_replace(coalesce(mla.location_code, ''), '[^a-z0-9]+', '', 'g'))
+          =
+          lower(regexp_replace(coalesce((select l.slug from locations l where l.id = v_session.location_id), ''), '[^a-z0-9]+', '', 'g'))
+          or
+          lower(regexp_replace(coalesce(mla.location_code, ''), '[^a-z0-9]+', '', 'g'))
+          =
+          lower(regexp_replace(coalesce((select l.name from locations l where l.id = v_session.location_id), ''), '[^a-z0-9]+', '', 'g'))
+        )
+    ) and v_member.location_id is distinct from v_session.location_id then
+      raise exception 'Location mismatch';
+    end if;
+  end if;
   if not exists (select 1 from membership_session_allowances msa where msa.membership_id = v_membership.id and msa.token_type_id = v_session.token_type_id) then raise exception 'Session not covered by membership allowance'; end if;
   --if not exists (select 1 from member_session_tags mst where mst.member_id = p_member_id and mst.session_type_id = v_session.session_type_id) then raise exception 'Session type not allowed by user tags'; end if;
 
@@ -260,7 +277,24 @@ begin
   if not found then raise exception 'Session not found'; end if;
   select * into v_member from profiles where id = p_member_id;
   if not found then raise exception 'Member not found'; end if;
-  if v_member.location_id is distinct from v_session.location_id then raise exception 'Location mismatch'; end if;
+  if not coalesce(v_session.is_online, false) and v_session.location_id is not null then
+    if not exists (
+      select 1
+      from member_location_access mla
+      where mla.member_id = p_member_id
+        and (
+          lower(regexp_replace(coalesce(mla.location_code, ''), '[^a-z0-9]+', '', 'g'))
+          =
+          lower(regexp_replace(coalesce((select l.slug from locations l where l.id = v_session.location_id), ''), '[^a-z0-9]+', '', 'g'))
+          or
+          lower(regexp_replace(coalesce(mla.location_code, ''), '[^a-z0-9]+', '', 'g'))
+          =
+          lower(regexp_replace(coalesce((select l.name from locations l where l.id = v_session.location_id), ''), '[^a-z0-9]+', '', 'g'))
+        )
+    ) and v_member.location_id is distinct from v_session.location_id then
+      raise exception 'Location mismatch';
+    end if;
+  end if;
   if v_session.start_at > (p_now + interval '28 days') then raise exception 'Session beyond booking horizon'; end if;
   if (select count(*) from bookings where session_id=p_session_id and status='booked') < v_session.capacity then raise exception 'Session has available space'; end if;
 

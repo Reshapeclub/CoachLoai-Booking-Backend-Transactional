@@ -18,14 +18,14 @@ export async function validateCoachForSession(opts: {
   const end = new Date(opts.endAt);
   if (end <= start) throw new HttpError(400, "endAt must be after startAt");
 
-  // 1. Fetch coach (for location_id, weekly_hour_limit_mins, travel_buffer_minutes)
+  // 1. Fetch coach and limits.
   const { data: coach, error: coachErr } = await supabaseAdmin
     .from("coaches")
-    .select("id, location_id, weekly_hour_limit_mins, travel_buffer_minutes")
+    .select("id, user_id, weekly_hour_limit_mins, travel_buffer_minutes")
     .eq("id", opts.coachId)
     .single();
   if (coachErr || !coach) throw new HttpError(404, "Coach not found");
-  const coachLocationId = (coach as { location_id?: string | null }).location_id ?? null;
+  const coachUserId = (coach as { user_id: string | number }).user_id;
   const weeklyLimit = (coach as { weekly_hour_limit_mins: number }).weekly_hour_limit_mins;
   const travelBufferMins = (coach as { travel_buffer_minutes: number }).travel_buffer_minutes;
 
@@ -90,9 +90,17 @@ export async function validateCoachForSession(opts: {
   // if (!allowed)
   //   throw new HttpError(400, "Session type is not permitted for this coach");
 
-  // 5. Location match (coach's location or session location; if both set, they must match)
-  if (opts.locationId && coachLocationId && opts.locationId !== coachLocationId)
-    throw new HttpError(400, "Session location does not match coach location");
+  // 5. Location access match: coach must have access to session location.
+  if (opts.locationId) {
+    const { data: access, error: accessErr } = await supabaseAdmin
+      .from("admin_location_access")
+      .select("location_id")
+      .eq("admin_id", coachUserId)
+      .eq("location_id", opts.locationId)
+      .maybeSingle();
+    if (accessErr) throw new HttpError(500, "Failed to verify coach location access", accessErr);
+    if (!access) throw new HttpError(400, "Session location is not assigned to this coach");
+  }
 
   // 6. No overlapping sessions for same coach
   let overlapQuery = supabaseAdmin

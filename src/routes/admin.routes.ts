@@ -250,34 +250,19 @@ function isCoachLikeRole(role: unknown): boolean {
 async function ensureCoachProfileForAdmin(input: {
   adminId: number | string;
   role: unknown;
-  locationId?: string | null;
 }) {
   if (!isCoachLikeRole(input.role)) return;
   const adminIdStr = String(input.adminId);
   const { data: existing, error: existingErr } = await supabaseAdmin
     .from("coaches")
-    .select("id, location_id")
+    .select("id")
     .eq("user_id", adminIdStr)
     .maybeSingle();
   if (existingErr) throw new HttpError(500, "Failed to verify coach profile", existingErr);
 
-  if (existing) {
-    if (input.locationId && existing.location_id !== input.locationId) {
-      const { error: updErr } = await supabaseAdmin
-        .from("coaches")
-        .update({ location_id: input.locationId })
-        .eq("id", existing.id);
-      if (updErr) throw new HttpError(500, "Failed to sync coach location", updErr);
-    }
-    return;
-  }
-
-  if (!input.locationId) {
-    throw new HttpError(400, "Coach users must have a location before creating coach profile");
-  }
+  if (existing) return;
   const { error: createErr } = await supabaseAdmin.from("coaches").insert({
     user_id: adminIdStr,
-    location_id: input.locationId,
     weekly_hour_limit_mins: 2400,
     travel_buffer_minutes: 30,
   });
@@ -286,55 +271,95 @@ async function ensureCoachProfileForAdmin(input: {
 
 router.get('/staff', async (req, res, next) => {
   try {
-    const { data, error } = await supabaseAdmin
-      .from("admins")
-      .select("id, name, email, role, location_id")
-      .order("name", { ascending: true });
-    if (error) throw new HttpError(500, "Failed to fetch staff", error);
-    res.json({ ok: true, data: data ?? [] });
+    const [staffRes, locRes] = await Promise.all([
+      supabaseAdmin.from("admins").select("id, name, email, role, location_id, phone").order("name", { ascending: true }),
+      supabaseAdmin.from("admin_location_access").select("admin_id, location_id"),
+    ]);
+    if (staffRes.error) throw new HttpError(500, "Failed to fetch staff", staffRes.error);
+    // Group location_ids by admin_id
+    const locsByAdmin: Record<string, string[]> = {};
+    for (const row of (locRes.data ?? [])) {
+      const key = String(row.admin_id);
+      if (!locsByAdmin[key]) locsByAdmin[key] = [];
+      locsByAdmin[key].push(row.location_id);
+    }
+    const mapped = (staffRes.data ?? []).map(s => ({
+      ...s,
+      location_ids: locsByAdmin[String(s.id)] ?? (s.location_id ? [s.location_id] : []),
+    }));
+    res.json({ ok: true, data: mapped });
   } catch (e) { next(e); }
 });
+
+/** Upsert entries in admin_location_access for a given admin. */
+async function syncAdminLocations(adminId: number | string, locationIds: string[]): Promise<void> {
+  await supabaseAdmin.from("admin_location_access").delete().eq("admin_id", adminId);
+  if (locationIds.length === 0) return;
+  const rows = locationIds.map(lid => ({ admin_id: adminId, location_id: lid }));
+  const { error } = await supabaseAdmin.from("admin_location_access").insert(rows);
+  if (error) throw new HttpError(500, "Failed to sync staff locations", error);
+}
+
+async function getAdminLocationIds(adminId: number | string): Promise<string[]> {
+  const { data, error } = await supabaseAdmin
+    .from("admin_location_access")
+    .select("location_id")
+    .eq("admin_id", adminId);
+  if (error) throw new HttpError(500, "Failed to fetch staff locations", error);
+  return (data ?? []).map((row) => row.location_id);
+}
+
 router.post('/staff', async (req, res, next) => {
   try {
-    const { name, email, role, location_id } = req.body as { name?: string; email?: string; role?: string; location_id?: string | null };
+    const { name, email, role, location_id, location_ids, phone } = req.body as {
+      name?: string; email?: string; role?: string;
+      location_id?: string | null; location_ids?: string[];
+      phone?: string | null;
+    };
     if (!name || !name.trim()) throw new HttpError(400, "name is required");
     if (!email || !email.trim()) throw new HttpError(400, "email is required");
+    // primary location: first of location_ids, or legacy location_id
+    const allLocIds = location_ids ?? (location_id ? [location_id] : []);
+    const primaryLocId = allLocIds[0] ?? null;
     const { data, error } = await supabaseAdmin
       .from("admins")
-      .insert({ name: name.trim(), email: email.trim(), role: role ?? null, location_id: location_id ?? null })
-      .select("id, name, email, role, location_id")
+      .insert({ name: name.trim(), email: email.trim(), role: role ?? null, location_id: primaryLocId, phone: phone ?? null })
+      .select("id, name, email, role, location_id, phone")
       .single();
     if (error) throw new HttpError(500, "Failed to create staff member", error);
-    await ensureCoachProfileForAdmin({
-      adminId: data.id,
-      role: data.role,
-      locationId: data.location_id ?? null,
-    });
-    res.status(201).json({ ok: true, data });
+    await syncAdminLocations(data.id, allLocIds);
+    await ensureCoachProfileForAdmin({ adminId: data.id, role: data.role });
+    res.status(201).json({ ok: true, data: { ...data, location_ids: allLocIds } });
   } catch (e) { next(e); }
 });
 router.patch('/staff/:staffId', async (req, res, next) => {
   try {
-    const { name, email, role, location_id } = req.body as { name?: string; email?: string; role?: string; location_id?: string | null };
+    const { name, email, role, location_id, location_ids, phone } = req.body as {
+      name?: string; email?: string; role?: string;
+      location_id?: string | null; location_ids?: string[];
+      phone?: string | null;
+    };
     const updates: Record<string, unknown> = {};
     if (name !== undefined) updates.name = name;
     if (email !== undefined) updates.email = email;
     if (role !== undefined) updates.role = role;
-    if (location_id !== undefined) updates.location_id = location_id;
+    if (phone !== undefined) updates.phone = phone;
+    // Resolve primary location from location_ids or legacy location_id
+    const allLocIds = location_ids ?? (location_id !== undefined ? (location_id ? [location_id] : []) : undefined);
+    if (allLocIds !== undefined) updates.location_id = allLocIds[0] ?? null;
+    else if (location_id !== undefined) updates.location_id = location_id;
     if (Object.keys(updates).length === 0) throw new HttpError(400, "At least one field required");
     const { data, error } = await supabaseAdmin
       .from("admins")
       .update(updates)
       .eq("id", req.params.staffId)
-      .select("id, name, email, role, location_id")
+      .select("id, name, email, role, location_id, phone")
       .single();
     if (error) throw new HttpError(500, "Failed to update staff member", error);
-    await ensureCoachProfileForAdmin({
-      adminId: data.id,
-      role: data.role,
-      locationId: data.location_id ?? null,
-    });
-    res.json({ ok: true, data });
+    if (allLocIds !== undefined) await syncAdminLocations(data.id, allLocIds);
+    await ensureCoachProfileForAdmin({ adminId: data.id, role: data.role });
+    const finalLocIds = allLocIds ?? await getAdminLocationIds(data.id);
+    res.json({ ok: true, data: { ...data, location_ids: finalLocIds } });
   } catch (e) { next(e); }
 });
 router.delete('/staff/:staffId', async (req, res, next) => {

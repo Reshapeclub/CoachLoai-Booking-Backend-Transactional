@@ -492,7 +492,27 @@ export class SessionService {
       .select("*, admins!coaches_user_id_fkey(id, name, email, role, location_id)")
       .order("user_id", { ascending: true });
     if (error) throw new HttpError(500, "Failed to fetch coaches", error);
-    return data ?? [];
+    const coaches = data ?? [];
+    if (coaches.length === 0) return coaches;
+    const adminIds = coaches
+      .map((c) => (c as { user_id?: string | number }).user_id)
+      .filter((id): id is string | number => id !== undefined && id !== null);
+    const { data: accessRows, error: accessErr } = await supabaseAdmin
+      .from("admin_location_access")
+      .select("admin_id, location_id")
+      .in("admin_id", adminIds);
+    if (accessErr) throw new HttpError(500, "Failed to fetch coach location access", accessErr);
+    const locsByAdmin = new Map<string, string[]>();
+    for (const row of accessRows ?? []) {
+      const key = String(row.admin_id);
+      const arr = locsByAdmin.get(key) ?? [];
+      arr.push(row.location_id);
+      locsByAdmin.set(key, arr);
+    }
+    return coaches.map((coach) => ({
+      ...coach,
+      location_ids: locsByAdmin.get(String((coach as { user_id: string | number }).user_id)) ?? [],
+    }));
   }
 
   async listLocations() {

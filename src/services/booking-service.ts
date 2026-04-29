@@ -2,6 +2,136 @@ import { supabaseAdmin } from "../db/supabase.js";
 import { HttpError } from "../lib/http-error.js";
 
 export class BookingService {
+  private readonly knownSessionAccessCodes = new Set([
+    "reshape30",
+    "reshape45",
+    "hybrid",
+    "predators",
+    "beat30",
+    "beat45",
+    "abset",
+  ]);
+
+  private normalizeAccessCode(value: unknown): string {
+    return String(value ?? "")
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "");
+  }
+
+  private async getMemberAccessProfile(memberId: string): Promise<{
+    locationCodes: Set<string>;
+    trainingLevels: Set<string>;
+    sessionAccess: Set<string>;
+  }> {
+    const [locationRowsRes, trainingRowsRes, sessionRowsRes] = await Promise.all([
+      supabaseAdmin
+        .from("member_location_access")
+        .select("location_code")
+        .eq("member_id", memberId),
+      supabaseAdmin
+        .from("member_training_levels")
+        .select("level_code")
+        .eq("member_id", memberId),
+      supabaseAdmin
+        .from("member_session_access")
+        .select("session_code")
+        .eq("member_id", memberId),
+    ]);
+
+    if (locationRowsRes.error) {
+      throw new HttpError(500, "Failed to load member location access", locationRowsRes.error);
+    }
+    if (trainingRowsRes.error) {
+      throw new HttpError(500, "Failed to load member training levels", trainingRowsRes.error);
+    }
+    if (sessionRowsRes.error) {
+      throw new HttpError(500, "Failed to load member session access", sessionRowsRes.error);
+    }
+
+    const toCodeSet = (rows: unknown[] | null | undefined, key: string) =>
+      new Set(
+        (rows ?? [])
+          .map((row) => this.normalizeAccessCode((row as Record<string, unknown>)[key]))
+          .filter(Boolean),
+      );
+
+    return {
+      locationCodes: toCodeSet(locationRowsRes.data, "location_code"),
+      trainingLevels: toCodeSet(trainingRowsRes.data, "level_code"),
+      sessionAccess: toCodeSet(sessionRowsRes.data, "session_code"),
+    };
+  }
+
+  private isSessionAllowedForMember(
+    access: { locationCodes: Set<string>; trainingLevels: Set<string>; sessionAccess: Set<string> },
+    session: {
+      is_online?: boolean | null;
+      location_id?: string | null;
+      training_level?: string | null;
+      session_types?: { name?: string | null; category?: string | null } | Array<{ name?: string | null; category?: string | null }> | null;
+      locations?: { name?: string | null; slug?: string | null } | Array<{ name?: string | null; slug?: string | null }> | null;
+    },
+  ): boolean {
+    return this.getSessionAccessDebug(access, session).reason === null;
+  }
+
+  private getSessionAccessDebug(
+    access: { locationCodes: Set<string>; trainingLevels: Set<string>; sessionAccess: Set<string> },
+    session: {
+      is_online?: boolean | null;
+      location_id?: string | null;
+      training_level?: string | null;
+      session_types?: { name?: string | null; category?: string | null } | Array<{ name?: string | null; category?: string | null }> | null;
+      locations?: { name?: string | null; slug?: string | null } | Array<{ name?: string | null; slug?: string | null }> | null;
+    },
+  ): {
+    reason: "location" | "training_level" | "session_access" | null;
+    normalized: { sessionTypeCode: string; sessionCategoryCode: string; trainingLevelCode: string; locationNameCode: string; locationSlugCode: string };
+  } {
+    const sessionType = Array.isArray(session.session_types) ? session.session_types[0] : session.session_types;
+    const location = Array.isArray(session.locations) ? session.locations[0] : session.locations;
+    const sessionTypeCode = this.normalizeAccessCode(sessionType?.name);
+    const sessionCategoryCode = this.normalizeAccessCode(sessionType?.category);
+    const trainingLevelCode = this.normalizeAccessCode(session.training_level);
+    const locationNameCode = this.normalizeAccessCode(location?.name);
+    const locationSlugCode = this.normalizeAccessCode(location?.slug);
+
+    // Location access: if access list exists and session is in-person, location must match code/name/slug.
+    if (access.locationCodes.size > 0 && !session.is_online && session.location_id) {
+      const sessionLocCodes = new Set([locationSlugCode, locationNameCode]);
+      const locationAllowed = [...sessionLocCodes].some((code) => code && access.locationCodes.has(code));
+      if (!locationAllowed) {
+        return { reason: "location", normalized: { sessionTypeCode, sessionCategoryCode, trainingLevelCode, locationNameCode, locationSlugCode } };
+      }
+    }
+
+    // Training level access: if session has a level and member has allowed list, it must include it.
+    if (trainingLevelCode && access.trainingLevels.size > 0 && !access.trainingLevels.has(trainingLevelCode)) {
+      return { reason: "training_level", normalized: { sessionTypeCode, sessionCategoryCode, trainingLevelCode, locationNameCode, locationSlugCode } };
+    }
+
+    // Session access: if member has list, session name/category must map to one of allowed codes.
+    if (access.sessionAccess.size > 0) {
+      // Member > Training session-access UI does not include these category-level keys.
+      // Skip category gating for them so name-based access remains the source of truth.
+      if (sessionCategoryCode !== "11" && sessionCategoryCode !== "octave") {
+        const sessionIsInAccessScope =
+          this.knownSessionAccessCodes.has(sessionTypeCode) ||
+          this.knownSessionAccessCodes.has(sessionCategoryCode);
+        if (!sessionIsInAccessScope) {
+          return { reason: null, normalized: { sessionTypeCode, sessionCategoryCode, trainingLevelCode, locationNameCode, locationSlugCode } };
+        }
+        const sessionCodes = new Set([sessionTypeCode, sessionCategoryCode]);
+        const sessionAllowed = [...sessionCodes].some((code) => code && access.sessionAccess.has(code));
+        if (!sessionAllowed) {
+          return { reason: "session_access", normalized: { sessionTypeCode, sessionCategoryCode, trainingLevelCode, locationNameCode, locationSlugCode } };
+        }
+      }
+    }
+    return { reason: null, normalized: { sessionTypeCode, sessionCategoryCode, trainingLevelCode, locationNameCode, locationSlugCode } };
+  }
+
   async getMemberWaitlistEntries(memberId: string) {
     const { data, error } = await supabaseAdmin
       .from("waiting_list_entries")
@@ -114,6 +244,16 @@ export class BookingService {
 
     if (from && isDateOnly(from)) effectiveFrom = toStartOfDayUtc(from);
     if (to && isDateOnly(to)) effectiveTo = toEndOfDayUtc(to);
+    console.log("[getAvailableSessions] window", {
+      memberId,
+      now: new Date().toISOString(),
+      from: from ?? null,
+      to: to ?? null,
+      effectiveFrom,
+      effectiveTo: effectiveTo ?? null,
+      isOnline: isOnline ?? null,
+      locationId: locationId ?? null,
+    });
 
     const normalizedSex = String((user as { sex?: string | null }).sex ?? "")
       .trim()
@@ -125,7 +265,7 @@ export class BookingService {
 
     let query = supabaseAdmin
       .from("sessions")
-      .select("*, session_types(*), coaches!sessions_coach_id_fkey(admins(name))")
+      .select("*, session_types(*), locations(name, slug), coaches!sessions_coach_id_fkey(admins(name))")
       .gte("start_at", effectiveFrom)
       .order("start_at", { ascending: true });
     if (effectiveTo) query = query.lte("start_at", effectiveTo);
@@ -141,17 +281,32 @@ export class BookingService {
 
     const { data: sessions, error } = await query;
     if (error) throw new HttpError(500, "Failed to fetch available sessions", error);
+    const memberAccess = await this.getMemberAccessProfile(memberId);
+    console.log(memberAccess, "memberAccess");
     const list = (sessions ?? []) as Array<
       Record<string, unknown> & {
         id: string;
         capacity: number;
         coaches?: { admins?: { name?: string } };
-        session_types?: { token_type_id?: string; audience?: string | null } | null;
+        session_types?: { token_type_id?: string; audience?: string | null; name?: string | null; category?: string | null } | null;
+        locations?: { name?: string | null; slug?: string | null } | null;
+        is_online?: boolean | null;
+        location_id?: string | null;
+        training_level?: string | null;
       }
     >;
     if (list.length === 0) return [];
 
     // Enforce allowance gating at token level and audience level.
+    const rejectedDebug: Array<{
+      sessionId: string;
+      reason: string;
+      sessionTypeCode?: string;
+      sessionCategoryCode?: string;
+      trainingLevelCode?: string;
+      locationNameCode?: string;
+      locationSlugCode?: string;
+    }> = [];
     const eligibleList = allowedTokenTypeIds.size
       ? list.filter((s) => {
         const tokenTypeId = s.session_types?.token_type_id;
@@ -159,9 +314,33 @@ export class BookingService {
           .trim()
           .toLowerCase();
         const audienceAllowed = allowedAudiences.has(audience || "mixed");
-        return tokenTypeId ? allowedTokenTypeIds.has(String(tokenTypeId)) && audienceAllowed : false;
+        const accessDebug = this.getSessionAccessDebug(memberAccess, s);
+        if (!tokenTypeId || !allowedTokenTypeIds.has(String(tokenTypeId))) {
+          rejectedDebug.push({ sessionId: String(s.id), reason: "token" });
+          return false;
+        }
+        if (!audienceAllowed) {
+          rejectedDebug.push({ sessionId: String(s.id), reason: "audience" });
+          return false;
+        }
+        if (accessDebug.reason) {
+          rejectedDebug.push({
+            sessionId: String(s.id),
+            reason: accessDebug.reason,
+            sessionTypeCode: accessDebug.normalized.sessionTypeCode,
+            sessionCategoryCode: accessDebug.normalized.sessionCategoryCode,
+            trainingLevelCode: accessDebug.normalized.trainingLevelCode,
+            locationNameCode: accessDebug.normalized.locationNameCode,
+            locationSlugCode: accessDebug.normalized.locationSlugCode,
+          });
+          return false;
+        }
+        return true;
       })
       : [];
+    if (rejectedDebug.length > 0) {
+      console.log("[getAvailableSessions] rejected", rejectedDebug);
+    }
     if (eligibleList.length === 0) return [];
 
     const sessionIds = eligibleList.map((s) => s.id);
@@ -226,6 +405,21 @@ export class BookingService {
   }
 
   async createBooking(input: { memberId: string; membershipId: string; sessionId: string }) {
+    const [memberAccess, sessionRes] = await Promise.all([
+      this.getMemberAccessProfile(input.memberId),
+      supabaseAdmin
+        .from("sessions")
+        .select("id, is_online, location_id, training_level, session_types(name, category), locations(name, slug)")
+        .eq("id", input.sessionId)
+        .single(),
+    ]);
+    if (sessionRes.error || !sessionRes.data) {
+      throw new HttpError(404, "Session not found", sessionRes.error);
+    }
+    if (!this.isSessionAllowedForMember(memberAccess, sessionRes.data as any)) {
+      throw new HttpError(403, "Member is not allowed to book this session");
+    }
+
     const { data, error } = await supabaseAdmin.rpc("clm_create_booking", {
       p_member_id: input.memberId,
       p_membership_id: input.membershipId,
@@ -247,6 +441,21 @@ export class BookingService {
   }
 
   async joinWaitlist(input: { memberId: string; membershipId: string; sessionId: string }) {
+    const [memberAccess, sessionRes] = await Promise.all([
+      this.getMemberAccessProfile(input.memberId),
+      supabaseAdmin
+        .from("sessions")
+        .select("id, is_online, location_id, training_level, session_types(name, category), locations(name, slug)")
+        .eq("id", input.sessionId)
+        .single(),
+    ]);
+    if (sessionRes.error || !sessionRes.data) {
+      throw new HttpError(404, "Session not found", sessionRes.error);
+    }
+    if (!this.isSessionAllowedForMember(memberAccess, sessionRes.data as any)) {
+      throw new HttpError(403, "Member is not allowed to join waitlist for this session");
+    }
+
     const { data, error } = await supabaseAdmin.rpc("clm_join_waitlist", {
       p_member_id: input.memberId,
       p_membership_id: input.membershipId,
