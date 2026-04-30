@@ -272,7 +272,7 @@ async function ensureCoachProfileForAdmin(input: {
 router.get('/staff', async (req, res, next) => {
   try {
     const [staffRes, locRes] = await Promise.all([
-      supabaseAdmin.from("admins").select("id, name, email, role, location_id, phone").order("name", { ascending: true }),
+      supabaseAdmin.from("admins").select("id, name, email, role, location_id, phone, created_at").order("created_at", { ascending: false }),
       supabaseAdmin.from("admin_location_access").select("admin_id, location_id"),
     ]);
     if (staffRes.error) throw new HttpError(500, "Failed to fetch staff", staffRes.error);
