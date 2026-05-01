@@ -107,7 +107,9 @@ export class BookingService {
     }
 
     // Training level access: if session has a level and member has allowed list, it must include it.
-    if (trainingLevelCode && access.trainingLevels.size > 0 && !access.trainingLevels.has(trainingLevelCode)) {
+    // Exception: 1:1 sessions and Elite category sessions bypass training level gating.
+    const bypassTrainingLevelCheck = sessionTypeCode === "1:1" || sessionCategoryCode === "elite";
+    if (!bypassTrainingLevelCheck && trainingLevelCode && access.trainingLevels.size > 0 && !access.trainingLevels.has(trainingLevelCode)) {
       return { reason: "training_level", normalized: { sessionTypeCode, sessionCategoryCode, trainingLevelCode, locationNameCode, locationSlugCode } };
     }
 
