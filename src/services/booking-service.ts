@@ -664,16 +664,24 @@ export class BookingService {
     return weeks.map(week => {
       const wStartIso = week.start.toISOString();
       const nextWStartIso = new Date(week.start.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString();
+      const wStartMs = new Date(wStartIso).getTime();
+      const nextWStartMs = new Date(nextWStartIso).getTime();
       // Bookings in this week
       const weekBookings = allBookings.filter(b => {
         const s = Array.isArray(b.sessions) ? b.sessions[0] : b.sessions;
-        return s && s.start_at >= wStartIso && s.start_at < nextWStartIso;
+        const sessionStartMs = s?.start_at ? new Date(String(s.start_at)).getTime() : NaN;
+        return Number.isFinite(sessionStartMs) && sessionStartMs >= wStartMs && sessionStartMs < nextWStartMs;
       });
       const weekWaitlist = allWaitlist.filter(w => {
         const s = Array.isArray(w.sessions) ? w.sessions[0] : w.sessions;
-        return s && s.start_at >= wStartIso && s.start_at < nextWStartIso;
+        const sessionStartMs = s?.start_at ? new Date(String(s.start_at)).getTime() : NaN;
+        return Number.isFinite(sessionStartMs) && sessionStartMs >= wStartMs && sessionStartMs < nextWStartMs;
       });
-      const unusedCurrentWeekTokens = [...allTokens].filter(t => t.week_start === wStartIso && t.quantity > 0 && t.source === 'weekly');
+      const unusedCurrentWeekTokens = [...allTokens].filter(t => {
+        if (!(t.quantity > 0 && t.source === "weekly" && t.week_start)) return false;
+        const tokenWeekStartMs = new Date(String(t.week_start)).getTime();
+        return Number.isFinite(tokenWeekStartMs) && tokenWeekStartMs === wStartMs;
+      });
       const circles: Array<{ status: "attended" | "waitlist" | "lost" | "rollover_used" | "future_used" | "available"; date?: string }> = [];
       // 1. Process bookings in this week
       for (const b of weekBookings) {
@@ -689,8 +697,9 @@ export class BookingService {
         } else if (b.status === "no_show") {
           status = "lost";
         } else if (tokenWeekStart) {
-          if (tokenWeekStart < wStartIso) status = "rollover_used";
-          else if (tokenWeekStart > wStartIso) status = "future_used";
+          const tokenWeekStartMs = new Date(String(tokenWeekStart)).getTime();
+          if (Number.isFinite(tokenWeekStartMs) && tokenWeekStartMs < wStartMs) status = "rollover_used";
+          else if (Number.isFinite(tokenWeekStartMs) && tokenWeekStartMs > wStartMs) status = "future_used";
           else status = "attended";
         }
         circles.push({ status, date: sessionDate });
