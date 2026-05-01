@@ -702,7 +702,7 @@ export class BookingService {
       }
 
       const baseCircles = circles.filter(c => c.status === "attended" || c.status === "lost" || c.status === "waitlist");
-      const extraCircles = circles.filter(c => c.status === "rollover_used" || c.status === "future_used");
+      // const extraCircles = circles.filter(c => c.status === "rollover_used" || c.status === "future_used");
       const finalCircles: typeof circles = [];
 
       for (let i = 0; i < baseQtyPerWeek; i++) {
@@ -715,20 +715,20 @@ export class BookingService {
           finalCircles.push({ status: "available" });
         }
       }
-      if (baseCircles.length > baseQtyPerWeek) {
-        finalCircles.push(...baseCircles.slice(baseQtyPerWeek));
-      }
+      // if (baseCircles.length > baseQtyPerWeek) {
+      //   finalCircles.push(...baseCircles.slice(baseQtyPerWeek));
+      // }
 
-      finalCircles.push(...extraCircles);
-      const currentWeekOtherTokens = allTokens.filter(t => t.week_start !== wStartIso && t.quantity > 0 && t.source === 'weekly');
-      const adminBonusTokens = allTokens.filter(t => t.source !== 'weekly' && t.quantity > 0);
+      // finalCircles.push(...extraCircles);
+      // const currentWeekOtherTokens = allTokens.filter(t => t.week_start !== wStartIso && t.quantity > 0 && t.source === 'weekly');
+      // const adminBonusTokens = allTokens.filter(t => t.source !== 'weekly' && t.quantity > 0);
 
-      for (const t of currentWeekOtherTokens) {
-        for (let i = 0; i < t.quantity; i++) finalCircles.push({ status: "available" });
-      }
-      for (const t of adminBonusTokens) {
-        for (let i = 0; i < t.quantity; i++) finalCircles.push({ status: "available" });
-      }
+      // for (const t of currentWeekOtherTokens) {
+      //   for (let i = 0; i < t.quantity; i++) finalCircles.push({ status: "available" });
+      // }
+      // for (const t of adminBonusTokens) {
+      //   for (let i = 0; i < t.quantity; i++) finalCircles.push({ status: "available" });
+      // }
 
       const tally = {
         attended: finalCircles.filter(c => c.status === "attended").length,
