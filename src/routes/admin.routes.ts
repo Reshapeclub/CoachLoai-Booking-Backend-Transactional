@@ -24,6 +24,9 @@ import {
   addAllowedSessionTypeSchema,
   putMemberDashboardMembershipAccessSchema,
   patchMemberDashboardMembershipSchema,
+  createAdminMemberGiftSessionSchema,
+  patchAdminMemberGiftSessionSchema,
+  consumeAdminMemberGiftSessionSchema,
   createCoachSchema,
   updateCoachSchema,
   addCoachAvailabilitySchema,
@@ -153,6 +156,81 @@ router.get('/members/:memberId/membership/history', async (req, res, next) => {
     const { memberId } = validate(z.object({ memberId: z.string().uuid() }), req.params);
     const rows = await membershipService.getAdminMemberMembershipHistory(memberId);
     res.json({ ok: true, data: rows });
+  } catch (e) {
+    next(e);
+  }
+});
+// Gift sessions: stored on `tokens` with source = 'gift' (must be before /members/:memberId/membership single-segment routes if any conflict — none)
+router.get("/members/:memberId/membership/gifts", async (req, res, next) => {
+  try {
+    const { memberId } = validate(z.object({ memberId: z.string().uuid() }), req.params);
+    const data = await tokenService.listMemberGiftSessions(memberId);
+    res.json({ ok: true, data });
+  } catch (e) {
+    next(e);
+  }
+});
+router.post("/members/:memberId/membership/gifts", async (req, res, next) => {
+  try {
+    const { memberId } = validate(z.object({ memberId: z.string().uuid() }), req.params);
+    const raw = req.body as Record<string, unknown>;
+    const body = validate(createAdminMemberGiftSessionSchema, raw);
+    const sessionType = String(body.session_type ?? body.sessionType ?? "");
+    const startYmd = String(body.start_date ?? body.startDate ?? "");
+    const expiryYmd = String(body.expiry_date ?? body.expiryDate ?? "");
+    const data = await tokenService.createMemberGiftSession({
+      memberId,
+      mode: body.mode,
+      sessionType,
+      amount: body.amount,
+      startDateYmd: startYmd,
+      expiryDateYmd: expiryYmd,
+      coachId: body.coachId ?? null,
+      adminUserId: req.user?.id ?? null,
+    });
+    res.status(201).json({ ok: true, data });
+  } catch (e) {
+    next(e);
+  }
+});
+router.post("/members/:memberId/membership/gifts/:giftId/consume", async (req, res, next) => {
+  try {
+    const { memberId, giftId } = validate(
+      z.object({ memberId: z.string().uuid(), giftId: z.string().uuid() }),
+      req.params,
+    );
+    const raw = req.body as Record<string, unknown>;
+    const body = validate(consumeAdminMemberGiftSessionSchema, raw);
+    const consumedOn = body.consumed_on ?? body.consumedOn;
+    const data = await tokenService.consumeMemberGiftSession({
+      memberId,
+      giftTokenId: giftId,
+      quantity: body.quantity,
+      consumedOnYmd: typeof consumedOn === "string" ? consumedOn : undefined,
+      note: body.note ?? null,
+    });
+    res.json({ ok: true, data });
+  } catch (e) {
+    next(e);
+  }
+});
+router.patch("/members/:memberId/membership/gifts/:giftId", async (req, res, next) => {
+  try {
+    const { memberId, giftId } = validate(
+      z.object({ memberId: z.string().uuid(), giftId: z.string().uuid() }),
+      req.params,
+    );
+    const raw = req.body as Record<string, unknown>;
+    const body = validate(patchAdminMemberGiftSessionSchema, raw);
+    const expiryYmd = body.expiry_date ?? body.expiryDate;
+    const data = await tokenService.patchMemberGiftSession({
+      memberId,
+      giftTokenId: giftId,
+      mode: body.mode,
+      status: body.status,
+      expiryDateYmd: typeof expiryYmd === "string" ? expiryYmd : undefined,
+    });
+    res.json({ ok: true, data });
   } catch (e) {
     next(e);
   }

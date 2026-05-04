@@ -1,5 +1,6 @@
 import { supabaseAdmin } from "../db/supabase.js";
 import { HttpError } from "../lib/http-error.js";
+import { TokenService } from "./token-service.js";
 
 type MembershipMode = "inperson" | "remote";
 type PlanTier = "structure" | "pace" | "performance";
@@ -663,6 +664,8 @@ export class MembershipService {
       .filter(Boolean);
     const syntheticHistory = this.#buildDashboardHistoryEvents(rows);
 
+    const giftList = await new TokenService().listMemberGiftSessions(memberId);
+
     return {
       membership: membershipPayload,
       training: {
@@ -681,7 +684,7 @@ export class MembershipService {
         current: null,
         active: null,
       },
-      gifts: [] as unknown[],
+      gifts: giftList,
       access: {
         memberLocations,
         member_locations: memberLocations,

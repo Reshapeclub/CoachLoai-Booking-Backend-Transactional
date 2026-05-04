@@ -312,7 +312,7 @@ create table if not exists tokens (
   week_start timestamptz,
   created_at timestamptz not null default now(),
   expiry_at timestamptz not null,
-  source text not null check (source in ('weekly','admin','purchase')),
+  source text not null check (source in ('weekly','admin','purchase','gift')),
   source_meta jsonb not null default '{}'::jsonb,
   coach_id uuid NULL references coaches(id)
 )

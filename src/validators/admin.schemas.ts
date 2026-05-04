@@ -143,6 +143,52 @@ export const addAllowedSessionTypeSchema = z.object({
   sessionTypeId: z.string().uuid(),
 });
 
+const giftSessionTypeCodeSchema = z.enum(["oneToOne", "elite", "octave", "group"]);
+
+/** POST /admin/members/:memberId/membership/gifts — inserts a row on `tokens` with source = gift */
+export const createAdminMemberGiftSessionSchema = z
+  .object({
+    mode: z.enum(["inperson", "remote"]).optional(),
+    session_type: giftSessionTypeCodeSchema.optional(),
+    sessionType: giftSessionTypeCodeSchema.optional(),
+    amount: z.number().int().positive(),
+    start_date: z.string().min(1).optional(),
+    startDate: z.string().min(1).optional(),
+    expiry_date: z.string().min(1).optional(),
+    expiryDate: z.string().min(1).optional(),
+    coachId: z.string().uuid().optional(),
+  })
+  .refine((v) => v.session_type !== undefined || v.sessionType !== undefined, {
+    message: "session_type or sessionType is required",
+  })
+  .refine((v) => v.start_date !== undefined || v.startDate !== undefined, {
+    message: "start_date or startDate is required",
+  })
+  .refine((v) => v.expiry_date !== undefined || v.expiryDate !== undefined, {
+    message: "expiry_date or expiryDate is required",
+  });
+
+/** PATCH /admin/members/:memberId/membership/gifts/:giftId — giftId is the tokens.id */
+export const patchAdminMemberGiftSessionSchema = z
+  .object({
+    mode: z.enum(["inperson", "remote"]).optional(),
+    status: z.enum(["active", "expired", "cancelled", "used"]).optional(),
+    expiry_date: z.string().min(1).optional(),
+    expiryDate: z.string().min(1).optional(),
+  })
+  .refine((v) => v.status !== undefined || v.expiry_date !== undefined || v.expiryDate !== undefined, {
+    message: "At least one of status, expiry_date, or expiryDate is required",
+  });
+
+/** POST /admin/members/:memberId/membership/gifts/:giftId/consume — decrements tokens.quantity */
+export const consumeAdminMemberGiftSessionSchema = z.object({
+  mode: z.enum(["inperson", "remote"]).optional(),
+  quantity: z.number().int().positive(),
+  consumed_on: z.string().min(1).optional(),
+  consumedOn: z.string().min(1).optional(),
+  note: z.string().nullable().optional(),
+});
+
 // Coach schemas
 export const createCoachSchema = z.object({
   userId: z.number().int().positive(),
