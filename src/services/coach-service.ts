@@ -2,10 +2,25 @@ import { supabaseAdmin } from "../db/supabase.js";
 import { HttpError } from "../lib/http-error.js";
 
 export class CoachService {
+  private coachesListCache:
+    | { expiresAt: number; value: Array<Record<string, unknown>> }
+    | null = null;
+
+  private invalidateCoachesListCache() {
+    this.coachesListCache = null;
+  }
+
   async listCoaches() {
+    const now = Date.now();
+    if (this.coachesListCache && this.coachesListCache.expiresAt > now) {
+      return this.coachesListCache.value;
+    }
+
     const { data, error } = await supabaseAdmin
       .from("coaches")
-      .select("*, admins!coaches_user_id_fkey(id, name, email,role, location_id)")
+      .select(
+        "id, user_id, weekly_hour_limit_mins, travel_buffer_minutes, created_at, admins!coaches_user_id_fkey(id, name, email, role, location_id, photo_url)",
+      )
       .order("created_at", { ascending: true });
     if (error) throw new HttpError(500, "Failed to fetch coaches", error);
     const coaches = data ?? [];
@@ -13,6 +28,13 @@ export class CoachService {
     const adminIds = coaches
       .map((c) => (c as { user_id?: string | number }).user_id)
       .filter((id): id is string | number => id !== undefined && id !== null);
+    if (adminIds.length === 0) {
+      this.coachesListCache = {
+        expiresAt: now + 10_000,
+        value: coaches as Array<Record<string, unknown>>,
+      };
+      return coaches;
+    }
     const { data: accessRows, error: accessErr } = await supabaseAdmin
       .from("admin_location_access")
       .select("admin_id, location_id")
@@ -25,10 +47,15 @@ export class CoachService {
       arr.push(row.location_id);
       locsByAdmin.set(key, arr);
     }
-    return coaches.map((coach) => ({
+    const enriched = coaches.map((coach) => ({
       ...coach,
       location_ids: locsByAdmin.get(String((coach as { user_id: string | number }).user_id)) ?? [],
     }));
+    this.coachesListCache = {
+      expiresAt: now + 10_000,
+      value: enriched as Array<Record<string, unknown>>,
+    };
+    return enriched;
   }
 
   async getCoach(coachUserId: string) {
@@ -72,6 +99,7 @@ export class CoachService {
       .select()
       .single();
     if (error) throw new HttpError(500, "Failed to create coach", error);
+    this.invalidateCoachesListCache();
     return data;
   }
 
@@ -91,12 +119,14 @@ export class CoachService {
       .select()
       .single();
     if (error) throw new HttpError(500, "Failed to update coach", error);
+    this.invalidateCoachesListCache();
     return data;
   }
 
   async deleteCoach(coachUserId: string) {
     const { error } = await supabaseAdmin.from("coaches").delete().eq("id", coachUserId);
     if (error) throw new HttpError(500, "Failed to delete coach", error);
+    this.invalidateCoachesListCache();
     return { ok: true };
   }
 

@@ -269,6 +269,7 @@ export class BookingService {
       .from("sessions")
       .select("*, session_types(*), locations(name, slug), coaches!sessions_coach_id_fkey(admins(name))")
       .gte("start_at", effectiveFrom)
+      .eq("is_cancelled", false)
       .order("start_at", { ascending: true });
     if (effectiveTo) query = query.lte("start_at", effectiveTo);
     if (sessionTypeId) query = query.eq("session_type_id", sessionTypeId);

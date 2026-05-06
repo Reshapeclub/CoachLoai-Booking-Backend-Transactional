@@ -107,6 +107,7 @@ export async function validateCoachForSession(opts: {
     .from("sessions")
     .select("id")
     .eq("coach_id", opts.coachId)
+    .eq("is_cancelled", false)
     .lt("start_at", opts.endAt)
     .gt("end_at", opts.startAt);
   if (opts.excludeSessionId) overlapQuery = overlapQuery.neq("id", opts.excludeSessionId);
@@ -118,7 +119,8 @@ export async function validateCoachForSession(opts: {
   const { data: otherSessions } = await supabaseAdmin
     .from("sessions")
     .select("id, start_at, end_at, location_id")
-    .eq("coach_id", opts.coachId);
+    .eq("coach_id", opts.coachId)
+    .eq("is_cancelled", false);
   if (opts.excludeSessionId) {
     const filtered = (otherSessions ?? []).filter((s: { id: string }) => s.id !== opts.excludeSessionId);
     for (const s of filtered) {
@@ -158,6 +160,7 @@ export async function validateCoachForSession(opts: {
       .from("sessions")
       .select("start_at, end_at")
       .eq("coach_id", opts.coachId)
+      .eq("is_cancelled", false)
       .gte("start_at", weekStart.toISOString())
       .lt("start_at", weekEnd.toISOString());
 

@@ -1,4 +1,4 @@
-import { Router } from "express";
+import express, { Router } from "express";
 import type { NextFunction, Request, Response } from "express";
 import { z } from "zod";
 import { requireAdminAuth } from "../middleware/auth.js";
@@ -51,6 +51,7 @@ import { MembershipService } from "../services/membership-service.js";
 import { TokenService } from "../services/token-service.js";
 import { BookingService } from "../services/booking-service.js";
 import { MeetingService } from "../services/meeting-service.js";
+import { validateCoachForSession } from "../services/coach-roster-validator.js";
 import { supabaseAdmin } from "../db/supabase.js";
 import { HttpError } from "../lib/http-error.js";
 import { runWeeklyTokenGeneration } from "../jobs/weekly-token-generation.js";
@@ -134,6 +135,45 @@ router.post('/sessions/:sessionId/cancel', async (req, res, next) => {
       }),
     );
   } catch (e) { next(e); }
+});
+router.post("/sessions/:sessionId/reinstate", async (req, res, next) => {
+  try {
+    const { sessionId } = validate(z.object({ sessionId: z.string().uuid() }), req.params);
+    const { data: session, error: sessionErr } = await supabaseAdmin
+      .from("sessions")
+      .select("id, coach_id, session_type_id, location_id, start_at, end_at, is_cancelled")
+      .eq("id", sessionId)
+      .single();
+    if (sessionErr || !session) throw new HttpError(404, "Session not found");
+    if (session.is_cancelled !== true) throw new HttpError(422, "Session is not cancelled");
+    if (!session.coach_id) throw new HttpError(422, "Session has no assigned coach");
+
+    await validateCoachForSession({
+      coachId: session.coach_id,
+      sessionTypeId: session.session_type_id,
+      locationId: session.location_id,
+      startAt: session.start_at,
+      endAt: session.end_at,
+      excludeSessionId: sessionId,
+    });
+
+    const { error: updErr } = await supabaseAdmin
+      .from("sessions")
+      .update({ is_cancelled: false })
+      .eq("id", sessionId);
+    if (updErr) throw new HttpError(500, "Failed to reinstate session", updErr);
+
+    await supabaseAdmin.from("audit_logs").insert({
+      actor_type: "admin",
+      actor_id: req.user?.id ?? null,
+      action: "session.admin_reinstate",
+      meta: { sessionId },
+    });
+
+    res.json({ ok: true, data: { sessionId, is_cancelled: false } });
+  } catch (e) {
+    next(e);
+  }
 });
 // Admin fetch bookings routes
 router.get('/bookings', async (req, res, next) => { try { const q = validate(adminBookingsListQuerySchema, req.query); res.json({ ok: true, data: await bookingService.listAdminBookings({ from: q.from, to: q.to, memberId: q.memberId, sessionId: q.sessionId, status: q.status, limit: q.limit }) }); } catch (e) { next(e); } });
@@ -350,7 +390,7 @@ async function ensureCoachProfileForAdmin(input: {
 router.get('/staff', async (req, res, next) => {
   try {
     const [staffRes, locRes] = await Promise.all([
-      supabaseAdmin.from("admins").select("id, name, email, role, location_id, phone, created_at").order("created_at", { ascending: false }),
+      supabaseAdmin.from("admins").select("id, name, email, role, location_id, phone, photo_url, created_at").order("created_at", { ascending: false }),
       supabaseAdmin.from("admin_location_access").select("admin_id, location_id"),
     ]);
     if (staffRes.error) throw new HttpError(500, "Failed to fetch staff", staffRes.error);
@@ -387,12 +427,47 @@ async function getAdminLocationIds(adminId: number | string): Promise<string[]> 
   return (data ?? []).map((row) => row.location_id);
 }
 
+router.post(
+  "/staff/photo-upload",
+  express.json({ limit: "5mb" }),
+  async (req, res, next) => {
+    try {
+      const { fileName, contentType, base64 } = req.body as {
+        fileName?: string;
+        contentType?: string;
+        base64?: string;
+      };
+      if (!fileName || !base64) throw new HttpError(400, "fileName and base64 are required");
+      if (!contentType || !contentType.startsWith("image/")) throw new HttpError(400, "Only image uploads are allowed");
+
+      const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, "_");
+      const storagePath = `staff/${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${safeName}`;
+      const fileBytes = Buffer.from(base64, "base64");
+      const bucket = "image";
+
+      const { error: uploadErr } = await supabaseAdmin.storage
+        .from(bucket)
+        .upload(storagePath, fileBytes, { contentType, upsert: false });
+      if (uploadErr) throw new HttpError(500, "Failed to upload staff profile photo", uploadErr);
+
+      const { data } = supabaseAdmin.storage.from(bucket).getPublicUrl(storagePath);
+      const photoUrl = data?.publicUrl;
+      if (!photoUrl) throw new HttpError(500, "Failed to resolve photo URL");
+
+      res.status(201).json({ ok: true, data: { photo_url: photoUrl, path: storagePath } });
+    } catch (e) {
+      next(e);
+    }
+  },
+);
+
 router.post('/staff', async (req, res, next) => {
   try {
-    const { name, email, role, location_id, location_ids, phone } = req.body as {
+    const { name, email, role, location_id, location_ids, phone, photo_url } = req.body as {
       name?: string; email?: string; role?: string;
       location_id?: string | null; location_ids?: string[];
       phone?: string | null;
+      photo_url?: string | null;
     };
     if (!name || !name.trim()) throw new HttpError(400, "name is required");
     if (!email || !email.trim()) throw new HttpError(400, "email is required");
@@ -404,8 +479,8 @@ router.post('/staff', async (req, res, next) => {
     const primaryLocId = allLocIds[0] ?? null;
     const { data, error } = await supabaseAdmin
       .from("admins")
-      .insert({ name: name.trim(), email: email.trim(), role: role ?? null, location_id: primaryLocId, phone: phone ?? null })
-      .select("id, name, email, role, location_id, phone")
+      .insert({ name: name.trim(), email: email.trim(), role: role ?? null, location_id: primaryLocId, phone: phone ?? null, photo_url: photo_url ?? null })
+      .select("id, name, email, role, location_id, phone, photo_url")
       .single();
     if (error) throw new HttpError(500, "Failed to create staff member", error);
     await syncAdminLocations(data.id, allLocIds);
@@ -415,16 +490,18 @@ router.post('/staff', async (req, res, next) => {
 });
 router.patch('/staff/:staffId', async (req, res, next) => {
   try {
-    const { name, email, role, location_id, location_ids, phone } = req.body as {
+    const { name, email, role, location_id, location_ids, phone, photo_url } = req.body as {
       name?: string; email?: string; role?: string;
       location_id?: string | null; location_ids?: string[];
       phone?: string | null;
+      photo_url?: string | null;
     };
     const updates: Record<string, unknown> = {};
     if (name !== undefined) updates.name = name;
     if (email !== undefined) updates.email = email;
     if (role !== undefined) updates.role = role;
     if (phone !== undefined) updates.phone = phone;
+    if (photo_url !== undefined) updates.photo_url = photo_url;
     // Resolve primary location from location_ids or legacy location_id
     const allLocIds = location_ids ?? (location_id !== undefined ? (location_id ? [location_id] : []) : undefined);
     if (allLocIds !== undefined && allLocIds.length === 0) {
@@ -449,7 +526,7 @@ router.patch('/staff/:staffId', async (req, res, next) => {
       .from("admins")
       .update(updates)
       .eq("id", req.params.staffId)
-      .select("id, name, email, role, location_id, phone")
+      .select("id, name, email, role, location_id, phone, photo_url")
       .single();
     if (error) throw new HttpError(500, "Failed to update staff member", error);
     if (allLocIds !== undefined) await syncAdminLocations(data.id, allLocIds);

@@ -15,7 +15,7 @@ app.use((req, res, next) => {
   if (req.path === "/webhooks/stripe" && req.method === "POST") {
     return express.raw({ type: "application/json" })(req, res, next);
   }
-  return express.json()(req, res, next);
+  return express.json({ limit: "5mb" })(req, res, next);
 });
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'clm-booking-backend-transactional' }));
 app.use(routes);
