@@ -156,21 +156,16 @@ export class BookingService {
 
   /** Waitlist rows for sessions whose start_at falls in [from, to] (admin dashboard). */
   async listAdminWaitlistEntries(filters: { from?: string; to?: string }) {
-    let sessionQuery = supabaseAdmin.from("sessions").select("id");
-    if (filters.from) sessionQuery = sessionQuery.gte("start_at", filters.from);
-    if (filters.to) sessionQuery = sessionQuery.lte("start_at", filters.to);
-    const { data: sessionRows, error: sessionErr } = await sessionQuery;
-    if (sessionErr) throw new HttpError(500, "Failed to resolve sessions for waitlist", sessionErr);
-    const sessionIds = (sessionRows ?? []).map((r) => String((r as { id: string }).id));
-    if (sessionIds.length === 0) return [];
-
-    const { data, error } = await supabaseAdmin
+    let query = supabaseAdmin
       .from("waiting_list_entries")
       .select(
-        "id, session_id, member_id, joined_at, sessions(start_at, capacity, session_types(category), locations(name), coaches!sessions_coach_id_fkey(admins(name)))), profiles!waiting_list_entries_member_id_fkey(full_name, first_name, last_name)",
+        "id, session_id, member_id, joined_at, sessions!inner(start_at, capacity, session_types(category), locations(name), coaches!sessions_coach_id_fkey(admins(name)))), profiles!waiting_list_entries_member_id_fkey(full_name, first_name, last_name)",
       )
-      .in("session_id", sessionIds)
       .order("joined_at", { ascending: true });
+    if (filters.from) query = query.gte("sessions.start_at", filters.from);
+    if (filters.to) query = query.lte("sessions.start_at", filters.to);
+
+    const { data, error } = await query;
     if (error) throw new HttpError(500, "Failed to fetch waitlist entries", error);
     return data ?? [];
   }
@@ -782,16 +777,6 @@ export class BookingService {
     limit?: number;
   }) {
     const limit = Math.min(filters.limit ?? 200, 500);
-    let sessionIdsInRange: string[] | undefined;
-    if (filters.from != null || filters.to != null) {
-      let sq = supabaseAdmin.from("sessions").select("id");
-      if (filters.from) sq = sq.gte("start_at", filters.from);
-      if (filters.to) sq = sq.lte("start_at", filters.to);
-      const { data: sessRows, error: sessErr } = await sq;
-      if (sessErr) throw new HttpError(500, "Failed to resolve sessions for date filter", sessErr);
-      sessionIdsInRange = (sessRows ?? []).map((r) => (r as { id: string }).id);
-      if (sessionIdsInRange.length === 0) return [];
-    }
 
     let query = supabaseAdmin
       .from("bookings")
@@ -804,7 +789,8 @@ export class BookingService {
     if (filters.memberId) query = query.eq("member_id", filters.memberId);
     if (filters.sessionId) query = query.eq("session_id", filters.sessionId);
     if (filters.status) query = query.eq("status", filters.status);
-    if (sessionIdsInRange) query = query.in("session_id", sessionIdsInRange);
+    if (filters.from) query = query.gte("sessions.start_at", filters.from);
+    if (filters.to) query = query.lte("sessions.start_at", filters.to);
 
     const { data, error } = await query;
     if (error) throw new HttpError(500, "Failed to fetch bookings", error);

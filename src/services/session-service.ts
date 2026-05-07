@@ -2,6 +2,16 @@ import { supabaseAdmin } from "../db/supabase.js";
 import { HttpError } from "../lib/http-error.js";
 import { validateCoachForSession } from "./coach-roster-validator.js";
 
+/** PostgREST URLs with `.in("session_id", uuid[])` overflow ~16KB when the array is large; keep chunks small. */
+const SESSION_ID_IN_CHUNK = 80;
+
+function chunkIds<T>(ids: T[], size: number): T[][] {
+  if (size <= 0) return [ids];
+  const out: T[][] = [];
+  for (let i = 0; i < ids.length; i += size) out.push(ids.slice(i, i + size));
+  return out;
+}
+
 export class SessionService {
   async listSessionTypes() {
     const { data, error } = await supabaseAdmin
@@ -45,9 +55,12 @@ export class SessionService {
   }
 
   async listSessions(from?: string, to?: string) {
+    // Explicit columns + slimmer session_types — avoids huge JSON when listing thousands of rows (admin heatmap).
     let query = supabaseAdmin
       .from("sessions")
-      .select("*, session_types(*), coaches!sessions_coach_id_fkey(admins(name, id)), locations(name)")
+      .select(
+        "id, session_type_id, token_type_id, coach_id, location_id, start_at, end_at, capacity, training_level, is_cancelled, is_online, created_at, session_types(id, name, category, default_capacity, default_duration_mins, color, audience, token_type_id, category_icon, icon, display_order), coaches!sessions_coach_id_fkey(admins(name, id)), locations(name)",
+      )
       .order("start_at", { ascending: true });
     if (from) query = query.gte("start_at", from);
     if (to) query = query.lte("start_at", to);
@@ -65,26 +78,59 @@ export class SessionService {
     const bookedCountBySessionId: Record<string, number> = {};
     const waitlistCountBySessionId: Record<string, number> = {};
     if (sessionIds.length > 0) {
-      const { data: bookings, error: bookingsErr } = await supabaseAdmin
-        .from("bookings")
-        .select("session_id")
-        .in("session_id", sessionIds)
-        .eq("status", "booked");
-      if (bookingsErr) throw new HttpError(500, "Failed to fetch session bookings", bookingsErr);
-      (bookings ?? []).forEach((b) => {
-        const sessionId = String(b.session_id);
-        bookedCountBySessionId[sessionId] = (bookedCountBySessionId[sessionId] ?? 0) + 1;
-      });
-
-      const { data: waitRows, error: waitErr } = await supabaseAdmin
-        .from("waiting_list_entries")
-        .select("session_id")
-        .in("session_id", sessionIds);
-      if (waitErr) throw new HttpError(500, "Failed to fetch session waitlist counts", waitErr);
-      (waitRows ?? []).forEach((w) => {
-        const sessionId = String((w as { session_id: string }).session_id);
-        waitlistCountBySessionId[sessionId] = (waitlistCountBySessionId[sessionId] ?? 0) + 1;
-      });
+      // Admin always passes from+to; one bounded query each beats dozens of sequential `.in()` chunks (was hanging).
+      if (from && to) {
+        const [bookedRes, waitRes] = await Promise.all([
+          supabaseAdmin
+            .from("bookings")
+            // PostgREST (PGRST108): filters on sessions.* require sessions in select; !inner applies date window.
+            .select("session_id, sessions!inner(start_at)")
+            .eq("status", "booked")
+            .gte("sessions.start_at", from)
+            .lte("sessions.start_at", to),
+          supabaseAdmin
+            .from("waiting_list_entries")
+            .select("session_id, sessions!inner(start_at)")
+            .gte("sessions.start_at", from)
+            .lte("sessions.start_at", to),
+        ]);
+        if (bookedRes.error) throw new HttpError(500, "Failed to fetch session bookings", bookedRes.error);
+        if (waitRes.error) throw new HttpError(500, "Failed to fetch session waitlist counts", waitRes.error);
+        (bookedRes.data ?? []).forEach((b) => {
+          const sessionId = String((b as { session_id: string }).session_id);
+          bookedCountBySessionId[sessionId] = (bookedCountBySessionId[sessionId] ?? 0) + 1;
+        });
+        (waitRes.data ?? []).forEach((w) => {
+          const sessionId = String((w as { session_id: string }).session_id);
+          waitlistCountBySessionId[sessionId] = (waitlistCountBySessionId[sessionId] ?? 0) + 1;
+        });
+      } else {
+        const chunks = chunkIds(sessionIds, SESSION_ID_IN_CHUNK);
+        const bookedChunks = await Promise.all(
+          chunks.map((idChunk) =>
+            supabaseAdmin.from("bookings").select("session_id").in("session_id", idChunk).eq("status", "booked"),
+          ),
+        );
+        for (const { data: bookings, error: bookingsErr } of bookedChunks) {
+          if (bookingsErr) throw new HttpError(500, "Failed to fetch session bookings", bookingsErr);
+          (bookings ?? []).forEach((b) => {
+            const sessionId = String(b.session_id);
+            bookedCountBySessionId[sessionId] = (bookedCountBySessionId[sessionId] ?? 0) + 1;
+          });
+        }
+        const waitChunks = await Promise.all(
+          chunks.map((idChunk) =>
+            supabaseAdmin.from("waiting_list_entries").select("session_id").in("session_id", idChunk),
+          ),
+        );
+        for (const { data: waitRows, error: waitErr } of waitChunks) {
+          if (waitErr) throw new HttpError(500, "Failed to fetch session waitlist counts", waitErr);
+          (waitRows ?? []).forEach((w) => {
+            const sessionId = String((w as { session_id: string }).session_id);
+            waitlistCountBySessionId[sessionId] = (waitlistCountBySessionId[sessionId] ?? 0) + 1;
+          });
+        }
+      }
     }
 
     return sessions.map((s) => {
