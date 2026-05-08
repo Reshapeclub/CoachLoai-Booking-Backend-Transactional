@@ -20,6 +20,7 @@ router.use(requireAuth, requireProfileRole('member'));
 
 // Member booking routes
 router.get('/booking-context', async (req, res, next) => { try { res.json({ ok: true, data: await bookingService.getBookingContext(req.user!.id) }); } catch (e) { next(e); } });
+router.get('/sessions/allowed', async (req, res, next) => { try { res.json({ ok: true, data: await bookingService.getMembershipSessionAllowanceSummary(req.user!.id) }); } catch (e) { next(e); } });
 router.get('/sessions/available', async (req, res, next) => { try { const from = typeof req.query.from === 'string' ? req.query.from : undefined; const to = typeof req.query.to === 'string' ? req.query.to : undefined; const sessionTypeId = typeof req.query.sessionTypeId === 'string' ? req.query.sessionTypeId : undefined; const locationId = typeof req.query.locationId === 'string' ? req.query.locationId : undefined; const isOnline = req.query.isOnline === 'true'; res.json({ ok: true, data: await bookingService.getAvailableSessions(req.user!.id, from, to, sessionTypeId, locationId, isOnline) }); } catch (e) { next(e); } });
 router.get('/sessions/:sessionId', async (req, res, next) => { try { res.json({ ok: true, data: await bookingService.getSessionDetail(req.params.sessionId) }); } catch (e) { next(e); } });
 router.get('/bookings', async (req, res, next) => { try { const status = typeof req.query.status === 'string' ? req.query.status : undefined; res.json({ ok: true, data: await bookingService.getBookings(req.user!.id, status) }); } catch (e) { next(e); } });

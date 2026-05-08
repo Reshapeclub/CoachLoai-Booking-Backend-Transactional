@@ -385,6 +385,60 @@ export class BookingService {
     });
   }
 
+  /**
+   * Returns membership session allowance summary for schedule tab:
+   */
+  async getMembershipSessionAllowanceSummary(memberId: string) {
+    const { data: activeMembershipId, error: membershipErr } = await supabaseAdmin.rpc(
+      "clm_find_active_membership",
+      { p_member_id: memberId, p_now: new Date().toISOString() }
+    );
+    if (membershipErr) throw new HttpError(500, "Failed to resolve active membership", membershipErr);
+    if (!activeMembershipId) return [];
+
+    const { data: allowanceRows, error: allowanceErr } = await supabaseAdmin
+      .from("membership_session_allowances")
+      .select("token_type_id, weekly_allowance")
+      .eq("membership_id", activeMembershipId)
+      .gt("weekly_allowance", 0);
+    if (allowanceErr) throw new HttpError(500, "Failed to fetch membership allowances", allowanceErr);
+    const rows = (allowanceRows ?? []) as Array<{ token_type_id: string; weekly_allowance: number }>;
+    if (rows.length === 0) return [];
+
+    const tokenTypeIds = Array.from(new Set(rows.map((r) => String(r.token_type_id)).filter(Boolean)));
+    const { data: sessionTypes, error: stErr } = await supabaseAdmin
+      .from("session_types")
+      .select("id, name, category, token_type_id, display_order, is_active")
+      .in("token_type_id", tokenTypeIds)
+      .order("display_order", { ascending: true })
+      .order("created_at", { ascending: true });
+    if (stErr) throw new HttpError(500, "Failed to fetch session type labels", stErr);
+
+    const stByToken = new Map<string, { session_type_id: string | null; label: string; category: string | null }>();
+    for (const st of (sessionTypes ?? []) as Array<Record<string, unknown>>) {
+      const tokenTypeId = String(st.token_type_id ?? "");
+      if (!tokenTypeId || stByToken.has(tokenTypeId)) continue;
+      const category = st.category != null ? String(st.category) : null;
+      const name = st.name != null ? String(st.name) : null;
+      stByToken.set(tokenTypeId, {
+        session_type_id: st.id != null ? String(st.id) : null,
+        label: (category && category.trim()) || (name && name.trim()) || "Session",
+        category,
+      });
+    }
+
+    return rows.map((r) => {
+      const meta = stByToken.get(String(r.token_type_id));
+      return {
+        token_type_id: String(r.token_type_id),
+        weekly_allowance: Number(r.weekly_allowance) || 0,
+        session_type_id: meta?.session_type_id ?? null,
+        label: meta?.label ?? "Session",
+        category: meta?.category ?? null,
+      };
+    });
+  }
+
   async getSessionDetail(sessionId: string) {
     const { data, error } = await supabaseAdmin
       .from("sessions")
