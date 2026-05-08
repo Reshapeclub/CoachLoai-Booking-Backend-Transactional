@@ -342,6 +342,19 @@ router.delete('/members/:memberId/session-types/:sessionTypeId', async (req, res
 router.get('/members/:memberId/session-types', async (req, res, next) => { try { const { data, error } = await supabaseAdmin.from('member_session_tags').select('*, session_types(*)').eq('member_id', req.params.memberId); if (error) throw new HttpError(500, 'Failed to fetch member session types', error); res.json({ ok: true, data: data ?? [] }); } catch (e) { next(e); } });
 // Admin coach routes
 router.get('/coaches', async (req, res, next) => { try { res.json({ ok: true, data: await coachService.listCoaches() }); } catch (e) { next(e); } });
+router.get('/coaches/rota-snapshot', async (req, res, next) => {
+  try {
+    const q = validate(
+      z.object({
+        weekStartDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        includeHolidays: z.coerce.boolean().optional(),
+      }),
+      req.query,
+    );
+    const data = await coachService.getRotaSnapshot(q.weekStartDate, q.includeHolidays ?? false);
+    res.json({ ok: true, data });
+  } catch (e) { next(e); }
+});
 router.get('/coaches/:coachUserId', async (req, res, next) => { try { res.json({ ok: true, data: await coachService.getCoach(req.params.coachUserId) }); } catch (e) { next(e); } });
 router.post('/coaches', async (req, res, next) => { try { const body = validate(createCoachSchema, req.body); res.json({ ok: true, data: await coachService.createCoach({ userId: body.userId, weeklyHourLimitMins: body.weeklyHourLimitMins, travelBufferMinutes: body.travelBufferMinutes }) }); } catch (e) { next(e); } });
 router.patch('/coaches/:coachUserId', async (req, res, next) => { try { const body = validate(updateCoachSchema, req.body); res.json({ ok: true, data: await coachService.updateCoach(req.params.coachUserId, body) }); } catch (e) { next(e); } });
@@ -671,15 +684,15 @@ router.get('/staff/:staffId/stats', async (req, res, next) => {
     fourWeeksAgo.setDate(now.getDate() - 28);
 
     // SESS — non-cancelled sessions starting this week
-    const { data: weekSessions, error: e1 } = await supabaseAdmin
+    const { count: weekSessionsCount, error: e1 } = await supabaseAdmin
       .from("sessions")
-      .select("id")
+      .select("*", { count: "exact", head: true })
       .eq("coach_id", coachId)
       .eq("is_cancelled", false)
       .gte("start_at", monday.toISOString())
       .lte("start_at", now.toISOString());
     if (e1) throw new HttpError(500, "Failed to fetch week sessions", e1);
-    const sess = (weekSessions ?? []).length;
+    const sess = weekSessionsCount ?? 0;
 
     // Past sessions (completed, not cancelled) for UTIL + NO-SHOW
     const { data: pastSessions, error: e2 } = await supabaseAdmin
@@ -695,13 +708,14 @@ router.get('/staff/:staffId/stats', async (req, res, next) => {
       return res.json({ ok: true, isCoach: true, data: { sess, util: null, noshow: null, notes } });
     }
 
-    const sessionIds = pastSessions.map((s: { id: string }) => s.id);
-
-    // Bookings for past sessions
+    // Bookings for those past sessions, bounded via sessions join (avoids large session_id IN lists).
     const { data: bookings, error: e3 } = await supabaseAdmin
       .from("bookings")
-      .select("session_id, status")
-      .in("session_id", sessionIds);
+      .select("session_id, status, sessions!inner(id)")
+      .eq("sessions.coach_id", coachId)
+      .eq("sessions.is_cancelled", false)
+      .gte("sessions.start_at", fourWeeksAgo.toISOString())
+      .lt("sessions.start_at", now.toISOString());
     if (e3) throw new HttpError(500, "Failed to fetch bookings", e3);
 
     const bk = (bookings ?? []) as { session_id: string; status: string }[];

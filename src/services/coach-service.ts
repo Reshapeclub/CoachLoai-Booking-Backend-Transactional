@@ -352,4 +352,78 @@ export class CoachService {
     if (error) throw new HttpError(500, "Failed to fetch coach allowed session types", error);
     return data ?? [];
   }
+
+  /**
+   * Bulk payload for rota tab: coaches + effective availability rows (+ optional upcoming holidays).
+   * Effective availability mirrors getCoachAvailability behavior:
+   * - if a coach has any rows for `weekStartDate`, return only those rows
+   * - otherwise return default rows (`week_start_date IS NULL`)
+   */
+  async getRotaSnapshot(weekStartDate?: string, includeHolidays = false) {
+    const coaches = await this.listCoaches();
+    const coachIds = coaches
+      .map((c) => String((c as { id?: unknown }).id ?? "").trim())
+      .filter((id) => id.length > 0);
+    if (coachIds.length === 0) {
+      return { coaches, availabilityByCoachId: {} as Record<string, unknown[]>, holidaysByCoachId: {} as Record<string, unknown[]> };
+    }
+
+    const [weekRowsRes, defaultRowsRes, holidayRowsRes] = await Promise.all([
+      weekStartDate
+        ? supabaseAdmin
+            .from("coach_availability")
+            .select("*")
+            .in("coach_id", coachIds)
+            .eq("week_start_date", weekStartDate)
+        : Promise.resolve({ data: [] as unknown[], error: null }),
+      supabaseAdmin
+        .from("coach_availability")
+        .select("*")
+        .in("coach_id", coachIds)
+        .is("week_start_date", null),
+      includeHolidays
+        ? supabaseAdmin
+            .from("coach_holidays")
+            .select("*")
+            .in("coach_id", coachIds)
+            .gte("end_at", new Date().toISOString())
+            .order("start_at", { ascending: true })
+        : Promise.resolve({ data: [] as unknown[], error: null }),
+    ]);
+    if (weekRowsRes.error) throw new HttpError(500, "Failed to fetch weekly coach availability", weekRowsRes.error);
+    if (defaultRowsRes.error) throw new HttpError(500, "Failed to fetch default coach availability", defaultRowsRes.error);
+    if (holidayRowsRes.error) throw new HttpError(500, "Failed to fetch coach holidays", holidayRowsRes.error);
+
+    const weekRows = (weekRowsRes.data ?? []) as Array<Record<string, unknown>>;
+    const defaultRows = (defaultRowsRes.data ?? []) as Array<Record<string, unknown>>;
+    const holidays = (holidayRowsRes.data ?? []) as Array<Record<string, unknown>>;
+
+    const weekByCoach: Record<string, Record<string, unknown>[]> = {};
+    const defaultByCoach: Record<string, Record<string, unknown>[]> = {};
+    const holidaysByCoachId: Record<string, Record<string, unknown>[]> = {};
+
+    for (const row of weekRows) {
+      const cid = String(row.coach_id ?? "");
+      if (!cid) continue;
+      (weekByCoach[cid] ??= []).push(row);
+    }
+    for (const row of defaultRows) {
+      const cid = String(row.coach_id ?? "");
+      if (!cid) continue;
+      (defaultByCoach[cid] ??= []).push(row);
+    }
+    for (const row of holidays) {
+      const cid = String(row.coach_id ?? "");
+      if (!cid) continue;
+      (holidaysByCoachId[cid] ??= []).push(row);
+    }
+
+    const availabilityByCoachId: Record<string, Record<string, unknown>[]> = {};
+    for (const cid of coachIds) {
+      const week = weekByCoach[cid] ?? [];
+      availabilityByCoachId[cid] = week.length > 0 ? week : (defaultByCoach[cid] ?? []);
+    }
+
+    return { coaches, availabilityByCoachId, holidaysByCoachId };
+  }
 }
