@@ -1,6 +1,15 @@
 import { supabaseAdmin } from "../db/supabase.js";
 import { HttpError } from "../lib/http-error.js";
 
+export type AvailabilityKind = "session" | "meeting";
+
+function minsToHHMM(mins: number): string {
+  const m = Math.max(0, Math.min(1440, Math.round(mins)));
+  const hh = Math.floor(m / 60);
+  const mm = m % 60;
+  return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
+}
+
 export class CoachService {
   private coachesListCache:
     | { expiresAt: number; value: Array<Record<string, unknown>> }
@@ -136,6 +145,7 @@ export class CoachService {
     startMins: number;
     endMins: number;
     weekStartDate?: string;
+    kind?: AvailabilityKind;
   }) {
     const { data, error } = await supabaseAdmin
       .from("coach_availability")
@@ -145,6 +155,7 @@ export class CoachService {
         day_of_week: input.dayOfWeek,
         start_mins: input.startMins,
         end_mins: input.endMins,
+        kind: input.kind ?? "session",
       })
       .select()
       .single();
@@ -158,41 +169,50 @@ export class CoachService {
     return { ok: true };
   }
 
-  async getCoachAvailability(coachUserId: string, weekStartDate?: string) {
+  async getCoachAvailability(coachUserId: string, weekStartDate?: string, kind?: AvailabilityKind) {
     if (weekStartDate) {
-      const { data: weekRows, error: weekErr } = await supabaseAdmin
+      let weekQuery = supabaseAdmin
         .from("coach_availability")
         .select("*")
         .eq("coach_id", coachUserId)
-        .eq("week_start_date", weekStartDate)
+        .eq("week_start_date", weekStartDate);
+      if (kind) weekQuery = weekQuery.eq("kind", kind);
+      const { data: weekRows, error: weekErr } = await weekQuery
         .order("day_of_week", { ascending: true })
         .order("start_mins", { ascending: true });
       if (weekErr) throw new HttpError(500, "Failed to fetch coach weekly availability", weekErr);
       if ((weekRows ?? []).length > 0) return weekRows ?? [];
     }
 
-    const { data: defaultRows, error: defaultErr } = await supabaseAdmin
+    let defaultQuery = supabaseAdmin
       .from("coach_availability")
       .select("*")
       .eq("coach_id", coachUserId)
-      .is("week_start_date", null)
+      .is("week_start_date", null);
+    if (kind) defaultQuery = defaultQuery.eq("kind", kind);
+    const { data: defaultRows, error: defaultErr } = await defaultQuery
       .order("day_of_week", { ascending: true })
       .order("start_mins", { ascending: true });
     if (defaultErr) throw new HttpError(500, "Failed to fetch coach default availability", defaultErr);
     return defaultRows ?? [];
   }
 
-  /**
-   * Replaces all availability windows for a coach (admin rota / weekly pattern).
-   * A day with no windows in `windows` is effectively OFF (old rows for that day are removed by the delete,
-   * then not re-inserted). `windows: []` clears the whole week.
-   */
+  /** Replaces only rows of the given `kind`; rejects overlap with the other kind's windows. */
   async replaceCoachAvailability(
     coachId: string,
     windows: { dayOfWeek: number; startMins: number; endMins: number }[],
-    weekStartDate?: string
+    weekStartDate?: string,
+    kind: AvailabilityKind = "session",
   ) {
-    let deleteQuery = supabaseAdmin.from("coach_availability").delete().eq("coach_id", coachId);
+    if (windows.length > 0) {
+      await this.assertNoCrossKindOverlap(coachId, windows, weekStartDate, kind);
+    }
+
+    let deleteQuery = supabaseAdmin
+      .from("coach_availability")
+      .delete()
+      .eq("coach_id", coachId)
+      .eq("kind", kind);
     if (weekStartDate) deleteQuery = deleteQuery.eq("week_start_date", weekStartDate);
     else deleteQuery = deleteQuery.is("week_start_date", null);
     const { error: delErr } = await deleteQuery;
@@ -207,11 +227,68 @@ export class CoachService {
           day_of_week: w.dayOfWeek,
           start_mins: w.startMins,
           end_mins: w.endMins,
+          kind,
         }))
       )
       .select();
     if (error) throw new HttpError(500, "Failed to set coach availability", error);
     return data ?? [];
+  }
+
+  private async assertNoCrossKindOverlap(
+    coachId: string,
+    incoming: { dayOfWeek: number; startMins: number; endMins: number }[],
+    weekStartDate: string | undefined,
+    kind: AvailabilityKind,
+  ) {
+    const otherKind: AvailabilityKind = kind === "session" ? "meeting" : "session";
+    const otherWindows = await this.getActiveAvailabilityForKind(coachId, otherKind, weekStartDate);
+    if (otherWindows.length === 0) return;
+    const byDay = new Map<number, Array<{ start_mins: number; end_mins: number }>>();
+    for (const row of otherWindows) {
+      const dow = Number(row.day_of_week);
+      const arr = byDay.get(dow) ?? [];
+      arr.push({ start_mins: Number(row.start_mins), end_mins: Number(row.end_mins) });
+      byDay.set(dow, arr);
+    }
+    for (const w of incoming) {
+      const others = byDay.get(w.dayOfWeek) ?? [];
+      for (const o of others) {
+        if (w.startMins < o.end_mins && o.start_mins < w.endMins) {
+          const dayName = ["", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][w.dayOfWeek] ?? `day ${w.dayOfWeek}`;
+          const otherLabel = otherKind === "session" ? "session" : "meeting";
+          throw new HttpError(
+            400,
+            `${kind === "session" ? "Session" : "Meeting"} window ${minsToHHMM(w.startMins)}-${minsToHHMM(w.endMins)} on ${dayName} overlaps existing ${otherLabel} window ${minsToHHMM(o.start_mins)}-${minsToHHMM(o.end_mins)}. A coach cannot be simultaneously available for both kinds at the same time.`,
+          );
+        }
+      }
+    }
+  }
+
+  private async getActiveAvailabilityForKind(
+    coachId: string,
+    kind: AvailabilityKind,
+    weekStartDate?: string,
+  ): Promise<Array<{ day_of_week: number; start_mins: number; end_mins: number }>> {
+    if (weekStartDate) {
+      const { data: weekRows, error: weekErr } = await supabaseAdmin
+        .from("coach_availability")
+        .select("day_of_week, start_mins, end_mins")
+        .eq("coach_id", coachId)
+        .eq("kind", kind)
+        .eq("week_start_date", weekStartDate);
+      if (weekErr) throw new HttpError(500, "Failed to fetch coach availability", weekErr);
+      if ((weekRows ?? []).length > 0) return weekRows ?? [];
+    }
+    const { data: defaultRows, error: defaultErr } = await supabaseAdmin
+      .from("coach_availability")
+      .select("day_of_week, start_mins, end_mins")
+      .eq("coach_id", coachId)
+      .eq("kind", kind)
+      .is("week_start_date", null);
+    if (defaultErr) throw new HttpError(500, "Failed to fetch coach availability", defaultErr);
+    return defaultRows ?? [];
   }
 
   async addCoachHoliday(input: { coachUserId: string; startAt: string; endAt: string }) {

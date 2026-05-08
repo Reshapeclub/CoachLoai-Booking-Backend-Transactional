@@ -21,8 +21,8 @@ app.get('/health', (_req, res) => res.json({ ok: true, service: 'clm-booking-bac
 app.use(routes);
 app.use(errorHandler);
 
-// Weekly token generation: every Monday at 00:00 UK time
-cron.schedule("0 0 * * 1", async () => {
+// Weekly token generation: every Monday at 02:00 UK time
+cron.schedule("0 2 * * 1", async () => {
   try {
     await runWeeklyTokenGeneration();
     console.log("[cron] Weekly token generation completed");

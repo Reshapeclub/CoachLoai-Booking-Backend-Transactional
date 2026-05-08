@@ -1,5 +1,16 @@
+import { DateTime } from "luxon";
 import { supabaseAdmin } from "../db/supabase.js";
 import { HttpError } from "../lib/http-error.js";
+
+function toLondonRotaParts(iso: string): { dayOfWeek: number; minutesFromMidnight: number; weekStartDate: string } {
+  const dt = DateTime.fromISO(iso, { zone: "utc" }).setZone("Europe/London");
+  if (!dt.isValid) throw new HttpError(400, `Invalid datetime: ${iso}`);
+  const dayOfWeek = dt.weekday; // luxon: 1=Mon..7=Sun
+  const minutesFromMidnight = dt.hour * 60 + dt.minute;
+  const weekStartDate = dt.startOf("week").toISODate();
+  if (!weekStartDate) throw new HttpError(400, `Could not derive week start for: ${iso}`);
+  return { dayOfWeek, minutesFromMidnight, weekStartDate };
+}
 
 export class MeetingService {
   async listMeetingTypesAdmin() {
@@ -224,6 +235,9 @@ export class MeetingService {
     capacity?: number;
     isActive?: boolean;
   }) {
+    if (input.coachId) {
+      await this.assertCoachMeetingSlotConstraints(input.coachId, input.slotStart, input.slotEnd);
+    }
     const { data, error } = await supabaseAdmin
       .from("meeting_slots")
       .insert({
@@ -241,6 +255,107 @@ export class MeetingService {
     return data;
   }
 
+  private async assertCoachMeetingSlotConstraints(coachId: string, slotStart: string, slotEnd: string) {
+    await this.assertSlotInCoachMeetingWindows(coachId, slotStart, slotEnd);
+    await this.assertSlotDoesNotOverlapSessionRota(coachId, slotStart, slotEnd);
+    await this.assertSlotDoesNotOverlapBookedSessions(coachId, slotStart, slotEnd);
+  }
+
+  private async fetchCoachDayAvailabilityMins(
+    coachId: string,
+    kind: "session" | "meeting",
+    dayOfWeek: number,
+    weekStartDate: string,
+  ): Promise<Array<{ start_mins: number; end_mins: number }>> {
+    const { data: weekRows, error: weekErr } = await supabaseAdmin
+      .from("coach_availability")
+      .select("start_mins, end_mins")
+      .eq("coach_id", coachId)
+      .eq("kind", kind)
+      .eq("day_of_week", dayOfWeek)
+      .eq("week_start_date", weekStartDate);
+    if (weekErr) throw new HttpError(500, "Failed to fetch coach availability", weekErr);
+    if ((weekRows ?? []).length > 0) return (weekRows ?? []) as Array<{ start_mins: number; end_mins: number }>;
+
+    const { data: defaultRows, error: defaultErr } = await supabaseAdmin
+      .from("coach_availability")
+      .select("start_mins, end_mins")
+      .eq("coach_id", coachId)
+      .eq("kind", kind)
+      .eq("day_of_week", dayOfWeek)
+      .is("week_start_date", null);
+    if (defaultErr) throw new HttpError(500, "Failed to fetch coach availability", defaultErr);
+    return (defaultRows ?? []) as Array<{ start_mins: number; end_mins: number }>;
+  }
+
+  private async assertSlotInCoachMeetingWindows(coachId: string, slotStart: string, slotEnd: string) {
+    const startParts = toLondonRotaParts(slotStart);
+    const endParts = toLondonRotaParts(slotEnd);
+    if (endParts.dayOfWeek !== startParts.dayOfWeek) {
+      throw new HttpError(400, "Meeting slot must start and end on the same day");
+    }
+    if (endParts.minutesFromMidnight <= startParts.minutesFromMidnight) {
+      throw new HttpError(400, "Meeting slot end must be after start");
+    }
+
+    const dayOfWeek = startParts.dayOfWeek;
+    const weekStartDate = startParts.weekStartDate;
+    const availRows = await this.fetchCoachDayAvailabilityMins(coachId, "meeting", dayOfWeek, weekStartDate);
+
+    if (availRows.length === 0) {
+      throw new HttpError(
+        400,
+        "Coach has no meeting availability windows for this day. Configure the meeting rota first.",
+      );
+    }
+    const inWindow = availRows.some(
+      (r) =>
+        startParts.minutesFromMidnight >= Number(r.start_mins) &&
+        endParts.minutesFromMidnight <= Number(r.end_mins),
+    );
+    if (!inWindow) {
+      throw new HttpError(400, "Meeting slot is outside the coach's meeting availability windows");
+    }
+  }
+
+  private async assertSlotDoesNotOverlapSessionRota(coachId: string, slotStart: string, slotEnd: string) {
+    const startParts = toLondonRotaParts(slotStart);
+    const endParts = toLondonRotaParts(slotEnd);
+    const S = startParts.minutesFromMidnight;
+    const E = endParts.minutesFromMidnight;
+    const sessionRows = await this.fetchCoachDayAvailabilityMins(
+      coachId,
+      "session",
+      startParts.dayOfWeek,
+      startParts.weekStartDate,
+    );
+    for (const r of sessionRows) {
+      const s = Number(r.start_mins);
+      const e = Number(r.end_mins);
+      if (S < e && s < E) {
+        throw new HttpError(
+          400,
+          "Meeting slot overlaps this coach's session availability. Choose a time outside session rota or adjust rota first.",
+        );
+      }
+    }
+  }
+
+  private async assertSlotDoesNotOverlapBookedSessions(coachId: string, slotStart: string, slotEnd: string) {
+    const { data, error } = await supabaseAdmin
+      .from("sessions")
+      .select("id")
+      .eq("coach_id", coachId)
+      .eq("is_cancelled", false)
+      .lt("start_at", slotEnd)
+      .gt("end_at", slotStart)
+      .limit(1);
+    if (error) throw new HttpError(500, "Failed to check session conflicts", error);
+    if ((data ?? []).length > 0) {
+      throw new HttpError(400, "Meeting slot overlaps an existing session for this coach");
+    }
+  }
+
   async updateMeetingSlot(
     meetingSlotId: string,
     input: {
@@ -253,6 +368,21 @@ export class MeetingService {
       isActive?: boolean;
     }
   ) {
+    if (input.coachId !== undefined || input.slotStart !== undefined || input.slotEnd !== undefined) {
+      const { data: existing, error: fetchErr } = await supabaseAdmin
+        .from("meeting_slots")
+        .select("coach_id, slot_start, slot_end")
+        .eq("id", meetingSlotId)
+        .single();
+      if (fetchErr || !existing) throw new HttpError(404, "Meeting slot not found");
+      const nextCoachId = input.coachId !== undefined ? input.coachId : existing.coach_id;
+      const nextStart = input.slotStart ?? existing.slot_start;
+      const nextEnd = input.slotEnd ?? existing.slot_end;
+      if (nextCoachId) {
+        await this.assertCoachMeetingSlotConstraints(nextCoachId, nextStart, nextEnd);
+      }
+    }
+
     const updates: Record<string, unknown> = {};
     if (input.meetingTypeId !== undefined) updates.meeting_type_id = input.meetingTypeId;
     if (input.locationId !== undefined) updates.location_id = input.locationId;

@@ -315,7 +315,7 @@ create table if not exists tokens (
   source text not null check (source in ('weekly','admin','purchase','gift')),
   source_meta jsonb not null default '{}'::jsonb,
   coach_id uuid NULL references coaches(id)
-)
+);
 
 do $$
 begin

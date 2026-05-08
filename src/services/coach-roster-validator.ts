@@ -43,7 +43,8 @@ export async function validateCoachForSession(opts: {
     .select("start_mins, end_mins")
     .eq("coach_id", opts.coachId)
     .eq("day_of_week", dayOfWeek)
-    .eq("week_start_date", sessionWeekStart);
+    .eq("week_start_date", sessionWeekStart)
+    .eq("kind", "session");
   if (weekErr) throw new HttpError(500, "Failed to fetch coach weekly availability", weekErr);
   console.log("weekRows", weekRows);
   let availRows = weekRows ?? [];
@@ -53,7 +54,8 @@ export async function validateCoachForSession(opts: {
       .select("start_mins, end_mins")
       .eq("coach_id", opts.coachId)
       .eq("day_of_week", dayOfWeek)
-      .is("week_start_date", null);
+      .is("week_start_date", null)
+      .eq("kind", "session");
     if (defaultErr) throw new HttpError(500, "Failed to fetch coach default availability", defaultErr);
     availRows = defaultRows ?? [];
   }
