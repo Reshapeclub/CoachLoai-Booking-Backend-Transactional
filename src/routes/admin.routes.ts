@@ -422,6 +422,47 @@ router.get('/staff', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+router.get('/staff/:staffId', async (req, res, next) => {
+  try {
+    const { data: staffRow, error: staffError } = await supabaseAdmin
+      .from("admins")
+      .select("id, name, email, role, location_id, phone, photo_url, created_at")
+      .eq("id", req.params.staffId)
+      .maybeSingle();
+    if (staffError) throw new HttpError(500, "Failed to fetch staff member", staffError);
+    if (!staffRow) throw new HttpError(404, "Staff member not found");
+
+    const { data: locRows, error: locError } = await supabaseAdmin
+      .from("admin_location_access")
+      .select("location_id, locations(id, name, slug)")
+      .eq("admin_id", req.params.staffId);
+    if (locError) throw new HttpError(500, "Failed to fetch staff locations", locError);
+
+    const locationIds = (locRows ?? [])
+      .map((row) => row.location_id)
+      .filter((value): value is string => Boolean(value));
+
+    const locations = (locRows ?? [])
+      .map((row) => ({
+        id: row.location_id,
+        name: (row as { locations?: { name?: string | null } | null }).locations?.name ?? null,
+        slug: (row as { locations?: { slug?: string | null } | null }).locations?.slug ?? null,
+      }))
+      .filter((row) => row.id);
+
+    res.json({
+      ok: true,
+      data: {
+        ...staffRow,
+        location_ids: locationIds.length
+          ? locationIds
+          : (staffRow.location_id ? [staffRow.location_id] : []),
+        locations,
+      },
+    });
+  } catch (e) { next(e); }
+});
+
 /** Upsert entries in admin_location_access for a given admin. */
 async function syncAdminLocations(adminId: number | string, locationIds: string[]): Promise<void> {
   await supabaseAdmin.from("admin_location_access").delete().eq("admin_id", adminId);
