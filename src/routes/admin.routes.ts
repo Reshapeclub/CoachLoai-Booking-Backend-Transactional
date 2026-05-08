@@ -719,6 +719,8 @@ router.get('/staff/:staffId/stats', async (req, res, next) => {
     const monday = new Date(now);
     monday.setDate(now.getDate() - (dow === 0 ? 6 : dow - 1));
     monday.setHours(0, 0, 0, 0);
+    const nextMonday = new Date(monday);
+    nextMonday.setDate(monday.getDate() + 7);
 
     // ── Past 4 weeks for historical stats ──
     const fourWeeksAgo = new Date(now);
@@ -731,7 +733,7 @@ router.get('/staff/:staffId/stats', async (req, res, next) => {
       .eq("coach_id", coachId)
       .eq("is_cancelled", false)
       .gte("start_at", monday.toISOString())
-      .lte("start_at", now.toISOString());
+      .lt("start_at", nextMonday.toISOString());
     if (e1) throw new HttpError(500, "Failed to fetch week sessions", e1);
     const sess = weekSessionsCount ?? 0;
 
