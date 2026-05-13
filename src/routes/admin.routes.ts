@@ -407,8 +407,6 @@ type DirectoryStatsRow = {
   notes: number;
 };
 
-const BOOKINGS_IN_CHUNK = 250;
-
 /** DB-side GROUP BY (sql/009_team_directory_stats_rpc.sql); falls back to row scan if RPC missing. */
 async function fetchStaffNoteCountsMap(): Promise<Map<number, number>> {
   const { data, error } = await supabaseAdmin.rpc("clm_staff_note_counts");
@@ -469,25 +467,66 @@ async function fetchWeekSessionCountByCoach(
   return weekCountByCoach;
 }
 
-async function fetchBookingsForSessionsChunked(
-  sessionIds: string[],
-): Promise<{ session_id: string; status: string }[]> {
-  if (sessionIds.length === 0) return [];
-  const chunks: string[][] = [];
-  for (let i = 0; i < sessionIds.length; i += BOOKINGS_IN_CHUNK) {
-    chunks.push(sessionIds.slice(i, i + BOOKINGS_IN_CHUNK));
+async function fetchPastStatsByCoach(
+  windowStartIso: string,
+  windowEndIso: string,
+  coachIds: string[],
+): Promise<Map<string, { util: number | null; noshow: number | null }>> {
+  const out = new Map<string, { util: number | null; noshow: number | null }>();
+  if (coachIds.length === 0) return out;
+
+  const { data, error } = await supabaseAdmin.rpc("clm_coach_past_stats", {
+    p_window_start: windowStartIso,
+    p_window_end: windowEndIso,
+    p_coach_ids: coachIds,
+  });
+
+  if (!error && Array.isArray(data)) {
+    for (const row of data as { coach_id?: unknown; util_pct?: unknown; noshow_pct?: unknown }[]) {
+      const coachId = String(row.coach_id ?? "");
+      if (!coachId) continue;
+      const util = Number(row.util_pct);
+      const noshow = Number(row.noshow_pct);
+      out.set(coachId, {
+        util: Number.isFinite(util) ? util : null,
+        noshow: Number.isFinite(noshow) ? noshow : null,
+      });
+    }
+    return out;
   }
-  const results = await Promise.all(
-    chunks.map(async (ids) => {
-      const { data: bk, error: bErr } = await supabaseAdmin
-        .from("bookings")
-        .select("session_id, status")
-        .in("session_id", ids);
-      if (bErr) throw new HttpError(500, "Failed to fetch bookings for directory stats", bErr);
-      return (bk ?? []) as { session_id: string; status: string }[];
-    }),
-  );
-  return results.flat();
+
+  const { data: pastSessions, error: pErr } = await supabaseAdmin
+    .from("sessions")
+    .select("id, coach_id, capacity, bookings(status)")
+    .eq("is_cancelled", false)
+    .gte("start_at", windowStartIso)
+    .lt("start_at", windowEndIso)
+    .in("coach_id", coachIds);
+  if (pErr) throw new HttpError(500, "Failed to fetch past sessions for directory stats", pErr);
+
+  const byCoach = new Map<string, { sessionCount: number; utilSum: number; nonCancelled: number; noShow: number }>();
+  for (const row of (pastSessions ?? []) as Array<{ coach_id: string; capacity?: number; bookings?: Array<{ status?: string }> }>) {
+    const coachId = String(row.coach_id ?? "");
+    if (!coachId) continue;
+    const bucket = byCoach.get(coachId) ?? { sessionCount: 0, utilSum: 0, nonCancelled: 0, noShow: 0 };
+    bucket.sessionCount += 1;
+    const bookings = Array.isArray(row.bookings) ? row.bookings : [];
+    const nonCancelledCount = bookings.filter((b) => String(b?.status) !== "cancelled").length;
+    const noShowCount = bookings.filter((b) => String(b?.status) === "no_show").length;
+    const capacity = Number(row.capacity) || 0;
+    bucket.utilSum += capacity > 0 ? Math.min(nonCancelledCount / capacity, 1) : 0;
+    bucket.nonCancelled += nonCancelledCount;
+    bucket.noShow += noShowCount;
+    byCoach.set(coachId, bucket);
+  }
+
+  for (const [coachId, bucket] of byCoach) {
+    out.set(coachId, {
+      util: bucket.sessionCount > 0 ? Math.round((bucket.utilSum / bucket.sessionCount) * 100) : null,
+      noshow: bucket.nonCancelled > 0 ? Math.round((bucket.noShow / bucket.nonCancelled) * 100) : 0,
+    });
+  }
+  return out;
 }
 
 /** Shared Team-tab stats map (used by GET /staff?includeStats=1 and GET /staff/directory-stats). */
@@ -545,57 +584,16 @@ async function computeDirectoryStatsByAdminId(
   const fourWeeksAgo = new Date(now);
   fourWeeksAgo.setDate(now.getDate() - 28);
 
-  const [{ data: pastSessions, error: pErr }, weekCountByCoach] = await Promise.all([
-    supabaseAdmin
-      .from("sessions")
-      .select("id, coach_id, capacity")
-      .eq("is_cancelled", false)
-      .gte("start_at", fourWeeksAgo.toISOString())
-      .lt("start_at", now.toISOString())
-      .in("coach_id", coachIds),
+  const [weekCountByCoach, pastStatsByCoach] = await Promise.all([
     fetchWeekSessionCountByCoach(monday, nextMonday, coachIds),
+    fetchPastStatsByCoach(fourWeeksAgo.toISOString(), now.toISOString(), coachIds),
   ]);
-  if (pErr) throw new HttpError(500, "Failed to fetch past sessions for directory stats", pErr);
-
-  const pastList = (pastSessions ?? []) as { id: string; coach_id: string; capacity: number }[];
-  const allPastSessionIds = pastList.map((s) => s.id);
-
-  const bookings =
-    allPastSessionIds.length > 0 ? await fetchBookingsForSessionsChunked(allPastSessionIds) : [];
-
-  const bookingsBySessionId = new Map<string, { session_id: string; status: string }[]>();
-  for (const b of bookings) {
-    const list = bookingsBySessionId.get(b.session_id) ?? [];
-    list.push(b);
-    bookingsBySessionId.set(b.session_id, list);
-  }
-
-  const pastByCoach = new Map<string, { id: string; capacity: number }[]>();
-  for (const s of pastList) {
-    const list = pastByCoach.get(s.coach_id) ?? [];
-    list.push({ id: s.id, capacity: s.capacity });
-    pastByCoach.set(s.coach_id, list);
-  }
 
   for (const [adminId, coachId] of adminToCoachId) {
     const sess = weekCountByCoach.get(coachId) ?? 0;
-    const past = pastByCoach.get(coachId) ?? [];
-    let util: number | null = null;
-    let noshow: number | null = null;
-    if (past.length > 0) {
-      const sessionIdSet = new Set(past.map((s) => s.id));
-      const coachBookings = bookings.filter((b) => sessionIdSet.has(b.session_id));
-      let utilSum = 0;
-      for (const s of past) {
-        const sessBk = bookingsBySessionId.get(s.id) ?? [];
-        const booked = sessBk.filter((b) => b.status !== "cancelled").length;
-        utilSum += s.capacity > 0 ? booked / s.capacity : 0;
-      }
-      util = Math.round((utilSum / past.length) * 100);
-      const nonCancelled = coachBookings.filter((b) => b.status !== "cancelled");
-      const noShows = coachBookings.filter((b) => b.status === "no_show");
-      noshow = nonCancelled.length > 0 ? Math.round((noShows.length / nonCancelled.length) * 100) : 0;
-    }
+    const pastStats = pastStatsByCoach.get(coachId);
+    const util = pastStats?.util ?? null;
+    const noshow = pastStats?.noshow ?? null;
     const row = out[adminId];
     if (row) {
       row.sess = sess;
