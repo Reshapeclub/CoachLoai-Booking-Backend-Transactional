@@ -1,6 +1,9 @@
 -- CLM Booking RPC Functions
 -- Core: member_memberships + membership_pause_weeks
 
+-- Monday 00:00 **UTC** (same convention as weekly-token-generation.ts getCurrentWeekStartIso).
+-- Using session timezone here caused week_start on tokens to not match v_session_week in pick,
+-- which led to "No valid token available" for future-week bookings.
 create or replace function clm_current_week_start(p_now timestamptz)
 returns timestamptz
 language plpgsql
@@ -8,15 +11,17 @@ immutable
 as $$
 declare
   v_dow int;
-  v_start timestamptz;
+  v_day date;
+  v_start date;
 begin
-  v_dow := extract(dow from p_now);
+  v_day := (p_now at time zone 'utc')::date;
+  v_dow := extract(dow from v_day);
   if v_dow = 0 then
-    v_start := date_trunc('day', p_now) - interval '6 days';
+    v_start := v_day - 6;
   else
-    v_start := date_trunc('day', p_now) - ((v_dow - 1) || ' days')::interval;
+    v_start := v_day - (v_dow - 1);
   end if;
-  return v_start;
+  return (v_start::timestamp without time zone at time zone 'utc');
 end;
 $$;
 
@@ -41,7 +46,7 @@ begin
     and (mm.termination_date is null or p_now < mm.termination_date)
     and not exists (
       select 1 from membership_pause_weeks mpw
-      where mpw.membership_id = mm.id and mpw.week_start = v_week_start
+      where mpw.membership_id = mm.id and clm_current_week_start(mpw.week_start) = v_week_start
     )
   order by mm.created_at desc
   limit 1;
@@ -70,7 +75,7 @@ begin
   if v_mm.termination_date is not null and p_now >= v_mm.termination_date then return; end if;
   if exists (
     select 1 from membership_pause_weeks mpw
-    where mpw.membership_id = v_mm.id and mpw.week_start = p_week_start
+    where mpw.membership_id = v_mm.id and clm_current_week_start(mpw.week_start) = clm_current_week_start(p_week_start)
   ) then return; end if;
 
   for v_row in
@@ -82,7 +87,8 @@ begin
       select 1 from tokens t
       where t.member_id = v_mm.member_id
         and t.token_type_id = v_row.token_type_id
-        and t.week_start = p_week_start
+        and t.week_start is not null
+        and clm_current_week_start(t.week_start) = clm_current_week_start(p_week_start)
         and t.source = 'weekly'
     ) then
       insert into tokens(member_id, token_type_id, quantity, week_start, expiry_at, source, source_meta)
@@ -120,26 +126,33 @@ begin
   if p_session_week is not null then
     select t.id into v_token_id
     from tokens t
-    where t.member_id = p_member_id and t.token_type_id = p_token_type_id and t.quantity > 0 and p_now < t.expiry_at and t.week_start = p_session_week
+    where t.member_id = p_member_id and t.token_type_id = p_token_type_id and t.quantity > 0 and p_now < t.expiry_at
+      and t.week_start is not null and clm_current_week_start(t.week_start) = clm_current_week_start(p_session_week)
     order by t.created_at asc limit 1 for update;
     if v_token_id is not null then return v_token_id; end if;
   end if;
 
   select t.id into v_token_id
   from tokens t
-  where t.member_id = p_member_id and t.token_type_id = p_token_type_id and t.quantity > 0 and p_now < t.expiry_at and t.week_start = v_current_week
+  where t.member_id = p_member_id and t.token_type_id = p_token_type_id and t.quantity > 0 and p_now < t.expiry_at
+    and t.week_start is not null and clm_current_week_start(t.week_start) = v_current_week
   order by t.created_at asc limit 1 for update;
   if v_token_id is not null then return v_token_id; end if;
 
   select t.id into v_token_id
   from tokens t
-  where t.member_id = p_member_id and t.token_type_id = p_token_type_id and t.quantity > 0 and p_now < t.expiry_at and (t.week_start is null or t.week_start < v_current_week)
+  where t.member_id = p_member_id and t.token_type_id = p_token_type_id and t.quantity > 0 and p_now < t.expiry_at
+    and (
+      t.week_start is null
+      or (t.week_start is not null and clm_current_week_start(t.week_start) < v_current_week)
+    )
   order by coalesce(t.week_start, t.created_at) asc, t.created_at asc limit 1 for update;
   if v_token_id is not null then return v_token_id; end if;
 
   select t.id into v_token_id
   from tokens t
-  where t.member_id = p_member_id and t.token_type_id = p_token_type_id and t.quantity > 0 and p_now < t.expiry_at and t.week_start = v_next_week
+  where t.member_id = p_member_id and t.token_type_id = p_token_type_id and t.quantity > 0 and p_now < t.expiry_at
+    and t.week_start is not null and clm_current_week_start(t.week_start) = v_next_week
   order by t.created_at asc limit 1 for update;
 
   return v_token_id;
@@ -183,10 +196,10 @@ begin
 
   if not (p_now >= v_membership.start_date and p_now < v_membership.end_date) then raise exception 'Membership not active'; end if;
   if v_membership.termination_date is not null and p_now >= v_membership.termination_date then raise exception 'Membership terminated'; end if;
-  if exists (select 1 from membership_pause_weeks mpw where mpw.membership_id = v_membership.id and mpw.week_start = v_current_week) then raise exception 'Membership paused'; end if;
+  if exists (select 1 from membership_pause_weeks mpw where mpw.membership_id = v_membership.id and clm_current_week_start(mpw.week_start) = v_current_week) then raise exception 'Membership paused'; end if;
   if v_session.start_at >= v_membership.end_date then raise exception 'Cannot book beyond membership end date'; end if;
   if v_membership.termination_date is not null and v_session.start_at >= v_membership.termination_date then raise exception 'Cannot book beyond termination date'; end if;
-  if exists (select 1 from membership_pause_weeks mpw where mpw.membership_id = v_membership.id and mpw.week_start = v_session_week) then raise exception 'Cannot book in paused week'; end if;
+  if exists (select 1 from membership_pause_weeks mpw where mpw.membership_id = v_membership.id and clm_current_week_start(mpw.week_start) = v_session_week) then raise exception 'Cannot book in paused week'; end if;
   if v_session.start_at > v_horizon then raise exception 'Session beyond booking horizon'; end if;
   if not coalesce(v_session.is_online, false) and v_session.location_id is not null then
     if not exists (
@@ -458,7 +471,7 @@ begin
       and (mm.termination_date is null or p_now < mm.termination_date)
       and not exists (
         select 1 from membership_pause_weeks mpw
-        where mpw.membership_id = mm.id and mpw.week_start = p_week_start
+        where mpw.membership_id = mm.id and clm_current_week_start(mpw.week_start) = clm_current_week_start(p_week_start)
       )
   loop
     for v_row in
