@@ -1,3 +1,23 @@
+-- Team tab: staff directory list (GET /admin/staff … ORDER BY created_at DESC)
+create index if not exists idx_admins_created_at_desc
+  on admins (created_at desc);
+
+-- Team tab: note counts use staff_notes(staff_id); index idx_staff_notes_staff_id is in 001_schema.sql
+
+-- Team tab: task list + drawer (tables may be created outside this repo; skip if missing)
+do $$
+begin
+  if exists (
+    select 1 from information_schema.tables
+    where table_schema = 'public' and table_name = 'staff_tasks'
+  ) then
+    create index if not exists idx_staff_tasks_source_created
+      on staff_tasks (source, created_at desc);
+    create index if not exists idx_staff_tasks_assignee_created
+      on staff_tasks (assigned_to_admin_id, created_at desc);
+  end if;
+end $$;
+
 -- Sessions tab / schedule / staff stats
 create index if not exists idx_sessions_coach_active_start
   on sessions (coach_id, is_cancelled, start_at);

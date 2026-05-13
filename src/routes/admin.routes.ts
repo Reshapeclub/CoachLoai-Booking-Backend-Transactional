@@ -400,26 +400,271 @@ async function ensureCoachProfileForAdmin(input: {
   if (createErr) throw new HttpError(500, "Failed to auto-create coach profile", createErr);
 }
 
+type DirectoryStatsRow = {
+  sess: number | null;
+  util: number | null;
+  noshow: number | null;
+  notes: number;
+};
+
+const BOOKINGS_IN_CHUNK = 250;
+
+/** DB-side GROUP BY (sql/009_team_directory_stats_rpc.sql); falls back to row scan if RPC missing. */
+async function fetchStaffNoteCountsMap(): Promise<Map<number, number>> {
+  const { data, error } = await supabaseAdmin.rpc("clm_staff_note_counts");
+  if (!error && Array.isArray(data)) {
+    const m = new Map<number, number>();
+    for (const row of data as { staff_id?: unknown; note_count?: unknown }[]) {
+      const sid = Number(row.staff_id);
+      const cnt = Number(row.note_count);
+      if (Number.isFinite(sid) && Number.isFinite(cnt)) m.set(sid, cnt);
+    }
+    return m;
+  }
+  const { data: rows, error: e2 } = await supabaseAdmin.from("staff_notes").select("staff_id");
+  if (e2) throw new HttpError(500, "Failed to fetch staff notes counts", e2);
+  const m = new Map<number, number>();
+  for (const row of rows ?? []) {
+    const sid = Number((row as { staff_id?: unknown }).staff_id);
+    if (!Number.isFinite(sid)) continue;
+    m.set(sid, (m.get(sid) ?? 0) + 1);
+  }
+  return m;
+}
+
+async function fetchWeekSessionCountByCoach(
+  monday: Date,
+  nextMonday: Date,
+  coachIds: string[],
+): Promise<Map<string, number>> {
+  const weekCountByCoach = new Map<string, number>();
+  if (coachIds.length === 0) return weekCountByCoach;
+
+  const { data, error } = await supabaseAdmin.rpc("clm_coach_week_session_counts", {
+    p_week_start: monday.toISOString(),
+    p_week_end: nextMonday.toISOString(),
+    p_coach_ids: coachIds,
+  });
+  if (!error && Array.isArray(data)) {
+    for (const row of data as { coach_id?: unknown; cnt?: unknown }[]) {
+      const cid = String(row.coach_id);
+      const cnt = Number(row.cnt);
+      if (cid && Number.isFinite(cnt)) weekCountByCoach.set(cid, cnt);
+    }
+    return weekCountByCoach;
+  }
+
+  const { data: weekRows, error: wErr } = await supabaseAdmin
+    .from("sessions")
+    .select("coach_id")
+    .eq("is_cancelled", false)
+    .gte("start_at", monday.toISOString())
+    .lt("start_at", nextMonday.toISOString())
+    .in("coach_id", coachIds);
+  if (wErr) throw new HttpError(500, "Failed to fetch week sessions for directory stats", wErr);
+  for (const r of weekRows ?? []) {
+    const cid = String((r as { coach_id?: unknown }).coach_id);
+    weekCountByCoach.set(cid, (weekCountByCoach.get(cid) ?? 0) + 1);
+  }
+  return weekCountByCoach;
+}
+
+async function fetchBookingsForSessionsChunked(
+  sessionIds: string[],
+): Promise<{ session_id: string; status: string }[]> {
+  if (sessionIds.length === 0) return [];
+  const chunks: string[][] = [];
+  for (let i = 0; i < sessionIds.length; i += BOOKINGS_IN_CHUNK) {
+    chunks.push(sessionIds.slice(i, i + BOOKINGS_IN_CHUNK));
+  }
+  const results = await Promise.all(
+    chunks.map(async (ids) => {
+      const { data: bk, error: bErr } = await supabaseAdmin
+        .from("bookings")
+        .select("session_id, status")
+        .in("session_id", ids);
+      if (bErr) throw new HttpError(500, "Failed to fetch bookings for directory stats", bErr);
+      return (bk ?? []) as { session_id: string; status: string }[];
+    }),
+  );
+  return results.flat();
+}
+
+/** Shared Team-tab stats map (used by GET /staff?includeStats=1 and GET /staff/directory-stats). */
+async function computeDirectoryStatsByAdminId(
+  admins: Array<{ id?: unknown; role?: unknown }>,
+): Promise<Record<string, DirectoryStatsRow>> {
+  const coachLikeIds = admins
+    .filter((a) => isCoachLikeRole(a.role))
+    .map((a) => String(a.id))
+    .filter(Boolean);
+
+  const [notesByStaffId, coachLookup] = await Promise.all([
+    fetchStaffNoteCountsMap(),
+    coachLikeIds.length > 0
+      ? supabaseAdmin.from("coaches").select("id, user_id").in("user_id", coachLikeIds)
+      : Promise.resolve({ data: [] as { id: string; user_id: string }[], error: null as null }),
+  ]);
+
+  const out: Record<string, DirectoryStatsRow> = {};
+
+  for (const a of admins) {
+    const idStr = String(a.id);
+    const idNum = Number(idStr);
+    out[idStr] = {
+      sess: null,
+      util: null,
+      noshow: null,
+      notes: Number.isFinite(idNum) ? (notesByStaffId.get(idNum) ?? 0) : 0,
+    };
+  }
+
+  if (coachLookup.error) {
+    throw new HttpError(500, "Failed to fetch coaches for directory stats", coachLookup.error);
+  }
+
+  const adminToCoachId = new Map<string, string>();
+  for (const c of coachLookup.data ?? []) {
+    const uid = (c as { user_id?: unknown }).user_id;
+    const cid = (c as { id?: unknown }).id;
+    if (uid != null && cid != null) adminToCoachId.set(String(uid), String(cid));
+  }
+
+  const coachIds = [...new Set(adminToCoachId.values())];
+  if (coachIds.length === 0) {
+    return out;
+  }
+
+  const now = new Date();
+  const dow = now.getDay();
+  const monday = new Date(now);
+  monday.setDate(now.getDate() - (dow === 0 ? 6 : dow - 1));
+  monday.setHours(0, 0, 0, 0);
+  const nextMonday = new Date(monday);
+  nextMonday.setDate(monday.getDate() + 7);
+  const fourWeeksAgo = new Date(now);
+  fourWeeksAgo.setDate(now.getDate() - 28);
+
+  const [{ data: pastSessions, error: pErr }, weekCountByCoach] = await Promise.all([
+    supabaseAdmin
+      .from("sessions")
+      .select("id, coach_id, capacity")
+      .eq("is_cancelled", false)
+      .gte("start_at", fourWeeksAgo.toISOString())
+      .lt("start_at", now.toISOString())
+      .in("coach_id", coachIds),
+    fetchWeekSessionCountByCoach(monday, nextMonday, coachIds),
+  ]);
+  if (pErr) throw new HttpError(500, "Failed to fetch past sessions for directory stats", pErr);
+
+  const pastList = (pastSessions ?? []) as { id: string; coach_id: string; capacity: number }[];
+  const allPastSessionIds = pastList.map((s) => s.id);
+
+  const bookings =
+    allPastSessionIds.length > 0 ? await fetchBookingsForSessionsChunked(allPastSessionIds) : [];
+
+  const bookingsBySessionId = new Map<string, { session_id: string; status: string }[]>();
+  for (const b of bookings) {
+    const list = bookingsBySessionId.get(b.session_id) ?? [];
+    list.push(b);
+    bookingsBySessionId.set(b.session_id, list);
+  }
+
+  const pastByCoach = new Map<string, { id: string; capacity: number }[]>();
+  for (const s of pastList) {
+    const list = pastByCoach.get(s.coach_id) ?? [];
+    list.push({ id: s.id, capacity: s.capacity });
+    pastByCoach.set(s.coach_id, list);
+  }
+
+  for (const [adminId, coachId] of adminToCoachId) {
+    const sess = weekCountByCoach.get(coachId) ?? 0;
+    const past = pastByCoach.get(coachId) ?? [];
+    let util: number | null = null;
+    let noshow: number | null = null;
+    if (past.length > 0) {
+      const sessionIdSet = new Set(past.map((s) => s.id));
+      const coachBookings = bookings.filter((b) => sessionIdSet.has(b.session_id));
+      let utilSum = 0;
+      for (const s of past) {
+        const sessBk = bookingsBySessionId.get(s.id) ?? [];
+        const booked = sessBk.filter((b) => b.status !== "cancelled").length;
+        utilSum += s.capacity > 0 ? booked / s.capacity : 0;
+      }
+      util = Math.round((utilSum / past.length) * 100);
+      const nonCancelled = coachBookings.filter((b) => b.status !== "cancelled");
+      const noShows = coachBookings.filter((b) => b.status === "no_show");
+      noshow = nonCancelled.length > 0 ? Math.round((noShows.length / nonCancelled.length) * 100) : 0;
+    }
+    const row = out[adminId];
+    if (row) {
+      row.sess = sess;
+      row.util = util;
+      row.noshow = noshow;
+    }
+  }
+
+  return out;
+}
+
 router.get('/staff', async (req, res, next) => {
   try {
+    const wantStats =
+      req.query.includeStats === "1" ||
+      req.query.includeStats === "true" ||
+      req.query.includeStats === "yes";
+
     const [staffRes, locRes] = await Promise.all([
-      supabaseAdmin.from("admins").select("id, name, email, role, location_id, phone, photo_url, created_at").order("created_at", { ascending: false }),
+      supabaseAdmin
+        .from("admins")
+        .select("id, name, email, role, location_id, phone, photo_url, created_at")
+        .order("created_at", { ascending: false }),
       supabaseAdmin.from("admin_location_access").select("admin_id, location_id"),
     ]);
     if (staffRes.error) throw new HttpError(500, "Failed to fetch staff", staffRes.error);
-    // Group location_ids by admin_id
+    if (locRes.error) throw new HttpError(500, "Failed to fetch staff locations", locRes.error);
+
     const locsByAdmin: Record<string, string[]> = {};
-    for (const row of (locRes.data ?? [])) {
+    for (const row of locRes.data ?? []) {
       const key = String(row.admin_id);
       if (!locsByAdmin[key]) locsByAdmin[key] = [];
       locsByAdmin[key].push(row.location_id);
     }
-    const mapped = (staffRes.data ?? []).map(s => ({
+    let mapped = (staffRes.data ?? []).map((s) => ({
       ...s,
       location_ids: locsByAdmin[String(s.id)] ?? (s.location_id ? [s.location_id] : []),
     }));
+
+    if (wantStats && mapped.length > 0) {
+      const statsByAdmin = await computeDirectoryStatsByAdminId(staffRes.data ?? []);
+      mapped = mapped.map((row) => ({
+        ...row,
+        directory_stats: statsByAdmin[String(row.id)] ?? {
+          sess: null,
+          util: null,
+          noshow: null,
+          notes: 0,
+        },
+      }));
+    }
+
     res.json({ ok: true, data: mapped });
-  } catch (e) { next(e); }
+  } catch (e) {
+    next(e);
+  }
+});
+
+/** Bulk stats map (legacy / fallback); prefer GET /staff?includeStats=1 for one HTTP round-trip. */
+router.get("/staff/directory-stats", async (_req, res, next) => {
+  try {
+    const { data: admins, error: adminsErr } = await supabaseAdmin.from("admins").select("id, role");
+    if (adminsErr) throw new HttpError(500, "Failed to fetch admins", adminsErr);
+
+    const out = await computeDirectoryStatsByAdminId(admins ?? []);
+    res.json({ ok: true, data: out });
+  } catch (e) {
+    next(e);
+  }
 });
 
 router.get('/staff/:staffId', async (req, res, next) => {

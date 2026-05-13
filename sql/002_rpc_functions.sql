@@ -50,10 +50,61 @@ begin
 end;
 $$;
 
+create or replace function clm_ensure_weekly_tokens_for_membership_week(
+  p_membership_id uuid,
+  p_week_start timestamptz,
+  p_now timestamptz default now()
+)
+returns void
+language plpgsql
+as $$
+declare
+  v_mm member_memberships%rowtype;
+  v_row record;
+begin
+  select * into v_mm from member_memberships where id = p_membership_id;
+  if not found then return; end if;
+
+  if v_mm.status <> 'active' then return; end if;
+  if not (p_now >= v_mm.start_date and p_now < v_mm.end_date) then return; end if;
+  if v_mm.termination_date is not null and p_now >= v_mm.termination_date then return; end if;
+  if exists (
+    select 1 from membership_pause_weeks mpw
+    where mpw.membership_id = v_mm.id and mpw.week_start = p_week_start
+  ) then return; end if;
+
+  for v_row in
+    select msa.token_type_id, msa.weekly_allowance
+    from membership_session_allowances msa
+    where msa.membership_id = v_mm.id and msa.weekly_allowance > 0
+  loop
+    if not exists (
+      select 1 from tokens t
+      where t.member_id = v_mm.member_id
+        and t.token_type_id = v_row.token_type_id
+        and t.week_start = p_week_start
+        and t.source = 'weekly'
+    ) then
+      insert into tokens(member_id, token_type_id, quantity, week_start, expiry_at, source, source_meta)
+      values (
+        v_mm.member_id,
+        v_row.token_type_id,
+        v_row.weekly_allowance,
+        p_week_start,
+        p_week_start + interval '14 days',
+        'weekly',
+        jsonb_build_object('weekStart', p_week_start)
+      );
+    end if;
+  end loop;
+end;
+$$;
+
 create or replace function clm_pick_token_id(
   p_member_id uuid,
   p_token_type_id uuid,
-  p_now timestamptz
+  p_now timestamptz,
+  p_session_week timestamptz default null
 )
 returns uuid
 language plpgsql
@@ -65,6 +116,14 @@ declare
 begin
   v_current_week := clm_current_week_start(p_now);
   v_next_week := v_current_week + interval '7 days';
+
+  if p_session_week is not null then
+    select t.id into v_token_id
+    from tokens t
+    where t.member_id = p_member_id and t.token_type_id = p_token_type_id and t.quantity > 0 and p_now < t.expiry_at and t.week_start = p_session_week
+    order by t.created_at asc limit 1 for update;
+    if v_token_id is not null then return v_token_id; end if;
+  end if;
 
   select t.id into v_token_id
   from tokens t
@@ -158,7 +217,8 @@ begin
   select count(*) into v_booked_count from bookings where session_id=v_session.id and status='booked';
   if v_booked_count >= v_session.capacity then raise exception 'Session full'; end if;
 
-  v_token_id := clm_pick_token_id(p_member_id, v_session.token_type_id, p_now);
+  perform clm_ensure_weekly_tokens_for_membership_week(v_membership.id, v_session_week, p_now);
+  v_token_id := clm_pick_token_id(p_member_id, v_session.token_type_id, p_now, v_session_week);
   if v_token_id is null then raise exception 'No valid token available'; end if;
 
   update tokens set quantity = quantity - 1 where id = v_token_id and quantity > 0;
@@ -268,6 +328,7 @@ declare
   v_membership member_memberships%rowtype;
   v_session sessions%rowtype;
   v_member profiles%rowtype;
+  v_session_week timestamptz;
   v_has_token boolean;
   v_position int;
 begin
@@ -298,7 +359,9 @@ begin
   if v_session.start_at > (p_now + interval '28 days') then raise exception 'Session beyond booking horizon'; end if;
   if (select count(*) from bookings where session_id=p_session_id and status='booked') < v_session.capacity then raise exception 'Session has available space'; end if;
 
-  v_has_token := clm_pick_token_id(p_member_id, v_session.token_type_id, p_now) is not null;
+  v_session_week := clm_current_week_start(v_session.start_at);
+  perform clm_ensure_weekly_tokens_for_membership_week(p_membership_id, v_session_week, p_now);
+  v_has_token := clm_pick_token_id(p_member_id, v_session.token_type_id, p_now, v_session_week) is not null;
   if not v_has_token then raise exception 'No valid token available'; end if;
 
   insert into waiting_list_entries(session_id, member_id, joined_at)
