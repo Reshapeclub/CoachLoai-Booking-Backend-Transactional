@@ -40,18 +40,17 @@ export async function validateCoachForSession(opts: {
 
   const { data: weekRows, error: weekErr } = await supabaseAdmin
     .from("coach_availability")
-    .select("start_mins, end_mins")
+    .select("start_mins, end_mins, location_id, break_start_mins, break_duration_mins")
     .eq("coach_id", opts.coachId)
     .eq("day_of_week", dayOfWeek)
     .eq("week_start_date", sessionWeekStart)
     .eq("kind", "session");
   if (weekErr) throw new HttpError(500, "Failed to fetch coach weekly availability", weekErr);
-  console.log("weekRows", weekRows);
   let availRows = weekRows ?? [];
   if (availRows.length === 0) {
     const { data: defaultRows, error: defaultErr } = await supabaseAdmin
       .from("coach_availability")
-      .select("start_mins, end_mins")
+      .select("start_mins, end_mins, location_id, break_start_mins, break_duration_mins")
       .eq("coach_id", opts.coachId)
       .eq("day_of_week", dayOfWeek)
       .is("week_start_date", null)
@@ -63,12 +62,35 @@ export async function validateCoachForSession(opts: {
   const withinAvailability =
     hasSlots &&
     (availRows ?? []).some(
-      (r: { start_mins: number; end_mins: number }) => startMins >= r.start_mins && endMins <= r.end_mins
+      (r: {
+        start_mins: number;
+        end_mins: number;
+        location_id?: string | null;
+        break_start_mins?: number | null;
+        break_duration_mins?: number | null;
+      }) => {
+        const timeOk = startMins >= r.start_mins && endMins <= r.end_mins;
+        if (!timeOk) return false;
+        const bd = r.break_duration_mins;
+        const bs = r.break_start_mins;
+        if (bd != null && bd > 0 && bs != null) {
+          const b0 = Number(bs);
+          const b1 = b0 + Number(bd);
+          if (startMins < b1 && endMins > b0) return false;
+        }
+        if (!opts.locationId) return true;
+        const winLoc = r.location_id;
+        if (!winLoc) return true;
+        return winLoc === opts.locationId;
+      },
     );
   if (!hasSlots)
     throw new HttpError(400, "Coach has no availability windows for this day");
   if (!withinAvailability)
-    throw new HttpError(400, "Session time is outside coach availability windows");
+    throw new HttpError(
+      400,
+      "This coach is on break during the selected session time, or the slot is outside their rota windows. Please choose another time or coach.",
+    );
 
   // 3. Not during approved holiday
   const { data: holidays } = await supabaseAdmin
@@ -110,6 +132,7 @@ export async function validateCoachForSession(opts: {
     .select("id")
     .eq("coach_id", opts.coachId)
     .eq("is_cancelled", false)
+    .is("deleted_at", null)
     .lt("start_at", opts.endAt)
     .gt("end_at", opts.startAt);
   if (opts.excludeSessionId) overlapQuery = overlapQuery.neq("id", opts.excludeSessionId);
@@ -122,7 +145,8 @@ export async function validateCoachForSession(opts: {
     .from("sessions")
     .select("id, start_at, end_at, location_id")
     .eq("coach_id", opts.coachId)
-    .eq("is_cancelled", false);
+    .eq("is_cancelled", false)
+    .is("deleted_at", null);
   if (opts.excludeSessionId) {
     const filtered = (otherSessions ?? []).filter((s: { id: string }) => s.id !== opts.excludeSessionId);
     for (const s of filtered) {
@@ -163,6 +187,7 @@ export async function validateCoachForSession(opts: {
       .select("start_at, end_at")
       .eq("coach_id", opts.coachId)
       .eq("is_cancelled", false)
+      .is("deleted_at", null)
       .gte("start_at", weekStart.toISOString())
       .lt("start_at", weekEnd.toISOString());
 

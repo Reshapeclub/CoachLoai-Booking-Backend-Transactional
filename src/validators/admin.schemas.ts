@@ -76,6 +76,10 @@ export const setCoachSchema = z.object({
 });
 export const setSessionTypeSchema = z.object({ newSessionTypeId: z.string().min(1) });
 export const refundModeSchema = z.object({ refund: z.enum(["refund", "charge"]) });
+export const adminMoveBookingSchema = z.object({
+  targetSessionId: z.string().uuid(),
+  overrideEligibility: z.boolean().optional(),
+});
 export const createMembershipSchema = z.object({
   memberId: z.string().min(1),
   mode: z.enum(["inperson", "remote"]),
@@ -209,21 +213,36 @@ export const addCoachAvailabilitySchema = z.object({
   kind: availabilityKindSchema.optional(),
 }).refine((v) => v.endMins > v.startMins, { message: "endMins must be after startMins" });
 
+const availabilityWindowSchema = z
+  .object({
+    dayOfWeek: z.number().int().min(1).max(7),
+    startMins: z.number().int().min(0).max(1439),
+    endMins: z.number().int().min(1).max(1440),
+    /** When set, session must be at this location during this window; null/omit = any assigned site. */
+    locationId: z.string().uuid().nullable().optional(),
+    breakStartMins: z.number().int().min(0).max(1439).nullable().optional(),
+    breakDurationMins: z.union([z.literal(30), z.literal(60)]).nullable().optional(),
+  })
+  .refine((w) => w.endMins > w.startMins, { message: "endMins must be after startMins" })
+  .refine(
+    (w) => {
+      const bs = w.breakStartMins;
+      const bd = w.breakDurationMins;
+      if (bd == null && (bs == null || bs === undefined)) return true;
+      if (bd == null || bs == null || bs === undefined) return false;
+      return bs >= w.startMins && bs + bd <= w.endMins;
+    },
+    {
+      message:
+        "breakStartMins and breakDurationMins (30 or 60) must both be set, and the break must fall inside the window",
+    },
+  );
+
 /** Replace all `coach_availability` rows for a coach (used by admin rota). */
 export const replaceCoachAvailabilitySchema = z.object({
   weekStartDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   kind: availabilityKindSchema.optional(),
-  windows: z
-    .array(
-      z
-        .object({
-          dayOfWeek: z.number().int().min(1).max(7),
-          startMins: z.number().int().min(0).max(1439),
-          endMins: z.number().int().min(1).max(1440),
-        })
-        .refine((w) => w.endMins > w.startMins, { message: "endMins must be after startMins" })
-    )
-    .max(21),
+  windows: z.array(availabilityWindowSchema).max(56),
 });
 
 export const coachAvailabilityQuerySchema = z.object({

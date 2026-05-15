@@ -36,6 +36,7 @@ import {
   addCoachSessionTypeSchema,
   adminBookingsListQuerySchema,
   adminWaitlistEntriesQuerySchema,
+  adminMoveBookingSchema,
   createMeetingTypeSchema,
   updateMeetingTypeSchema,
   adminMeetingSlotsQuerySchema,
@@ -109,7 +110,7 @@ router.get('/waitlist-entries', async (req, res, next) => {
     next(e);
   }
 });
-router.get('/sessions', async (req, res, next) => { try { const from = typeof req.query.from === 'string' ? req.query.from : undefined; const to = typeof req.query.to === 'string' ? req.query.to : undefined; res.json({ ok: true, data: await sessionService.listSessions(from, to) }); } catch (e) { next(e); } });
+router.get('/sessions', async (req, res, next) => { try { const from = typeof req.query.from === 'string' ? req.query.from : undefined; const to = typeof req.query.to === 'string' ? req.query.to : undefined; const includeDeleted = req.query.include_deleted === 'true' || req.query.include_deleted === '1'; res.json({ ok: true, data: await sessionService.listSessions(from, to, { includeDeleted }) }); } catch (e) { next(e); } });
 router.get('/sessions/:sessionId/members', async (req, res, next) => { try { res.json({ ok: true, data: await sessionService.getSessionMembers(req.params.sessionId) }); } catch (e) { next(e); } });
 router.get('/sessions/:sessionId/waitlist', async (req, res, next) => { try { res.json({ ok: true, data: await bookingService.getSessionWaitlist(req.params.sessionId) }); } catch (e) { next(e); } });
 router.post('/sessions', async (req, res, next) => { try { const body = validate(createSessionSchema, req.body); const { data: st, error } = await supabaseAdmin.from('session_types').select('*').eq('id', body.sessionTypeId).single(); if (error || !st) throw new HttpError(404, 'Session type not found'); const start = new Date(body.start); const end = new Date(start.getTime() + (body.durationMins ?? st.default_duration_mins) * 60 * 1000); const trainingLevel = body.trainingLevel; res.json({ ok: true, data: await sessionService.createSession({ sessionTypeId: body.sessionTypeId, tokenTypeId: body.tokenTypeId ?? st.token_type_id, coachId: body.coachId, locationId: body.locationId ?? null, isOnline: body.isOnline ?? false, startAt: start.toISOString(), endAt: end.toISOString(), capacity: body.capacity ?? st.default_capacity, allowOvertime: body.allowOvertime, trainingLevel }) }); } catch (e) { next(e); } });
@@ -124,6 +125,7 @@ router.post('/sessions/:sessionId/cancel', async (req, res, next) => {
       .from("sessions")
       .select("coach_id")
       .eq("id", req.params.sessionId)
+      .is("deleted_at", null)
       .single();
     if (sessionErr || !session) throw new HttpError(404, "Session not found");
     if (!session.coach_id) throw new HttpError(422, "Session has no assigned coach");
@@ -136,6 +138,24 @@ router.post('/sessions/:sessionId/cancel', async (req, res, next) => {
     );
   } catch (e) { next(e); }
 });
+router.delete("/sessions/:sessionId", async (req, res, next) => {
+  try {
+    const { sessionId } = validate(z.object({ sessionId: z.string().uuid() }), req.params);
+    await sessionService.adminDeleteSession(sessionId);
+    res.json({ ok: true });
+  } catch (e) {
+    next(e);
+  }
+});
+router.post("/sessions/:sessionId/restore", async (req, res, next) => {
+  try {
+    const { sessionId } = validate(z.object({ sessionId: z.string().uuid() }), req.params);
+    await sessionService.adminRestoreSession(sessionId);
+    res.json({ ok: true });
+  } catch (e) {
+    next(e);
+  }
+});
 router.post("/sessions/:sessionId/reinstate", async (req, res, next) => {
   try {
     const { sessionId } = validate(z.object({ sessionId: z.string().uuid() }), req.params);
@@ -143,6 +163,7 @@ router.post("/sessions/:sessionId/reinstate", async (req, res, next) => {
       .from("sessions")
       .select("id, coach_id, session_type_id, location_id, start_at, end_at, is_cancelled")
       .eq("id", sessionId)
+      .is("deleted_at", null)
       .single();
     if (sessionErr || !session) throw new HttpError(404, "Session not found");
     if (session.is_cancelled !== true) throw new HttpError(422, "Session is not cancelled");
@@ -180,6 +201,20 @@ router.get('/bookings', async (req, res, next) => { try { const q = validate(adm
 router.get('/bookings/:bookingId', async (req, res, next) => { try { res.json({ ok: true, data: await bookingService.getAdminBookingById(req.params.bookingId) }); } catch (e) { next(e); } });
 router.post('/bookings/:bookingId/remove-member', async (req, res, next) => { try { const body = validate(refundModeSchema, req.body); res.json(await bookingService.adminRemoveMember({ bookingId: req.params.bookingId, refund: body.refund, adminId: req.user!.id })); } catch (e) { next(e); } });
 router.post('/bookings/:bookingId/no-show', async (req, res, next) => { try { res.json(await bookingService.adminMarkNoShow({ bookingId: req.params.bookingId, adminId: req.user!.id })); } catch (e) { next(e); } });
+router.post('/bookings/:bookingId/move-to-session', async (req, res, next) => {
+  try {
+    const body = validate(adminMoveBookingSchema, req.body);
+    const data = await bookingService.adminMoveBookingToSession({
+      bookingId: req.params.bookingId,
+      targetSessionId: body.targetSessionId,
+      adminId: req.user!.id,
+      overrideEligibility: body.overrideEligibility,
+    });
+    res.json({ ok: true, data });
+  } catch (e) {
+    next(e);
+  }
+});
 // Admin membership routes
 router.post('/memberships', async (req, res, next) => { try { const body = validate(createMembershipSchema, req.body); res.json({ ok: true, data: await membershipService.createMembership({ memberId: body.memberId, mode: body.mode, currentPackage: body.currentPackage, startDate: body.startDate, endDate: body.endDate }) }); } catch (e) { next(e); } });
 router.get('/memberships/:membershipId', async (req, res, next) => { try { res.json({ ok: true, data: await membershipService.getMembershipById(req.params.membershipId) }); } catch (e) { next(e); } });

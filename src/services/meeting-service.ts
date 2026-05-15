@@ -347,6 +347,7 @@ export class MeetingService {
       .select("id")
       .eq("coach_id", coachId)
       .eq("is_cancelled", false)
+      .is("deleted_at", null)
       .lt("start_at", slotEnd)
       .gt("end_at", slotStart)
       .limit(1);

@@ -265,6 +265,7 @@ export class BookingService {
       .select("*, session_types(*), locations(name, slug), coaches!sessions_coach_id_fkey(admins(name))")
       .gte("start_at", effectiveFrom)
       .eq("is_cancelled", false)
+      .is("deleted_at", null)
       .order("start_at", { ascending: true });
     if (effectiveTo) query = query.lte("start_at", effectiveTo);
     if (sessionTypeId) query = query.eq("session_type_id", sessionTypeId);
@@ -444,6 +445,7 @@ export class BookingService {
       .from("sessions")
       .select("*, session_types(*), coaches!sessions_coach_id_fkey(admins(name))")
       .eq("id", sessionId)
+      .is("deleted_at", null)
       .single();
     if (error) throw new HttpError(404, "Session not found", error);
     const s = data as Record<string, unknown> & { coaches?: { admins?: { name?: string } } };
@@ -463,6 +465,7 @@ export class BookingService {
         .from("sessions")
         .select("id, is_online, location_id, training_level, session_types(name, category), locations(name, slug)")
         .eq("id", input.sessionId)
+        .is("deleted_at", null)
         .single(),
     ]);
     if (sessionRes.error || !sessionRes.data) {
@@ -499,6 +502,7 @@ export class BookingService {
         .from("sessions")
         .select("id, is_online, location_id, training_level, session_types(name, category), locations(name, slug)")
         .eq("id", input.sessionId)
+        .is("deleted_at", null)
         .single(),
     ]);
     if (sessionRes.error || !sessionRes.data) {
@@ -888,6 +892,144 @@ export class BookingService {
     });
 
     return { ok: true, bookingId: input.bookingId, status: "no_show" };
+  }
+
+  /**
+   * Move an active booking to another session (Re-Shape §19.2).
+   * Token types must match. Optional eligibility override for admin.
+   */
+  async adminMoveBookingToSession(input: {
+    bookingId: string;
+    targetSessionId: string;
+    adminId: string | number;
+    overrideEligibility?: boolean;
+  }) {
+    const { data: booking, error: bErr } = await supabaseAdmin
+      .from("bookings")
+      .select(
+        "id, member_id, status, session_id, sessions(id, token_type_id, start_at, end_at, location_id, is_cancelled, capacity, training_level, is_online, session_types(name, category), locations(name, slug))",
+      )
+      .eq("id", input.bookingId)
+      .single();
+    if (bErr || !booking) throw new HttpError(404, "Booking not found");
+    const b = booking as Record<string, unknown>;
+    if (String(b.status) !== "booked") throw new HttpError(422, "Only active (booked) rows can be moved");
+    const memberId = String(b.member_id);
+    const sourceSession = b.sessions as Record<string, unknown> | null;
+    if (!sourceSession) throw new HttpError(422, "Source session missing");
+
+    const { data: target, error: tErr } = await supabaseAdmin
+      .from("sessions")
+      .select(
+        "id, token_type_id, start_at, end_at, location_id, is_cancelled, capacity, training_level, is_online, session_types(name, category), locations(name, slug)",
+      )
+      .eq("id", input.targetSessionId)
+      .is("deleted_at", null)
+      .single();
+    if (tErr || !target) throw new HttpError(404, "Target session not found");
+    const tgt = target as Record<string, unknown>;
+    if (tgt.is_cancelled === true) throw new HttpError(422, "Target session is cancelled");
+    if (String(sourceSession.id) === String(tgt.id)) throw new HttpError(400, "Member is already on this session");
+
+    const srcTok = String(sourceSession.token_type_id ?? "");
+    const tgtTok = String(tgt.token_type_id ?? "");
+    if (srcTok !== tgtTok) {
+      throw new HttpError(
+        400,
+        "Cannot move between sessions with different token types. Remove and rebook, or pick a session with the same token type.",
+      );
+    }
+
+    const access = await this.getMemberAccessProfile(memberId);
+    const sessionForGate = {
+      is_online: tgt.is_online,
+      location_id: tgt.location_id,
+      training_level: tgt.training_level,
+      session_types: tgt.session_types,
+      locations: tgt.locations,
+    };
+    if (!input.overrideEligibility && !this.isSessionAllowedForMember(access, sessionForGate as any)) {
+      throw new HttpError(
+        403,
+        "Member is not eligible for the target session. Confirm override in the admin UI to proceed.",
+      );
+    }
+
+    const tgtStart = String(tgt.start_at);
+    const { data: otherBookings, error: obErr } = await supabaseAdmin
+      .from("bookings")
+      .select("id, sessions(start_at)")
+      .eq("member_id", memberId)
+      .eq("status", "booked")
+      .neq("id", input.bookingId);
+    if (obErr) throw new HttpError(500, "Failed to check duplicate booking time", obErr);
+    const tgtMs = new Date(tgtStart).getTime();
+    for (const row of otherBookings ?? []) {
+      const sess = (row as { sessions?: { start_at?: string } | null }).sessions;
+      const st = sess?.start_at;
+      if (st && new Date(st).getTime() === tgtMs) {
+        throw new HttpError(400, "Member already has another booking at this time");
+      }
+    }
+
+    const { count: capCt, error: capErr } = await supabaseAdmin
+      .from("bookings")
+      .select("*", { count: "exact", head: true })
+      .eq("session_id", input.targetSessionId)
+      .eq("status", "booked");
+    if (capErr) throw new HttpError(500, "Failed to check target session capacity", capErr);
+    const cap = Number(tgt.capacity ?? 0);
+    if ((capCt ?? 0) >= cap) throw new HttpError(400, "Target session is full");
+
+    const { error: updErr } = await supabaseAdmin
+      .from("bookings")
+      .update({ session_id: input.targetSessionId })
+      .eq("id", input.bookingId);
+    if (updErr) throw new HttpError(500, "Failed to move booking", updErr);
+
+    const { count: dedCount, error: dedCountErr } = await supabaseAdmin
+      .from("booking_token_deductions")
+      .select("*", { count: "exact", head: true })
+      .eq("booking_id", input.bookingId);
+    if (!dedCountErr && (dedCount ?? 0) > 0) {
+      const { error: dedErr } = await supabaseAdmin
+        .from("booking_token_deductions")
+        .update({ token_type_id: tgtTok })
+        .eq("booking_id", input.bookingId);
+      if (dedErr) throw new HttpError(500, "Failed to sync token deduction row", dedErr);
+    }
+
+    const actorId =
+      typeof input.adminId === "string" && /^[0-9a-f-]{36}$/i.test(input.adminId) ? input.adminId : null;
+    await supabaseAdmin.from("audit_logs").insert({
+      actor_type: "admin",
+      actor_id: actorId,
+      action: "booking.admin_move_session",
+      meta: {
+        bookingId: input.bookingId,
+        memberId,
+        fromSessionId: sourceSession.id,
+        toSessionId: input.targetSessionId,
+        overrideEligibility: Boolean(input.overrideEligibility),
+      },
+    });
+
+    await supabaseAdmin.from("notifications").insert([
+      {
+        member_id: memberId,
+        channel: "in_app",
+        type: "booking_moved",
+        payload: { bookingId: input.bookingId, sessionId: input.targetSessionId },
+      },
+      {
+        member_id: memberId,
+        channel: "email",
+        type: "booking_moved",
+        payload: { bookingId: input.bookingId, sessionId: input.targetSessionId },
+      },
+    ]);
+
+    return { ok: true as const, bookingId: input.bookingId, sessionId: input.targetSessionId };
   }
 
   async adminCancelSession(input: { sessionId: string; refund: "refund" | "charge"; adminId: string }) {

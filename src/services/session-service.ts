@@ -54,14 +54,17 @@ export class SessionService {
     return data ?? [];
   }
 
-  async listSessions(from?: string, to?: string) {
+  async listSessions(from?: string, to?: string, opts?: { includeDeleted?: boolean }) {
     // Explicit columns + slimmer session_types — avoids huge JSON when listing thousands of rows (admin heatmap).
     let query = supabaseAdmin
       .from("sessions")
       .select(
-        "id, session_type_id, token_type_id, coach_id, location_id, start_at, end_at, capacity, training_level, is_cancelled, is_online, created_at, session_types(id, name, category, default_capacity, default_duration_mins, color, audience, token_type_id, category_icon, icon, display_order), coaches!sessions_coach_id_fkey(admins(name, id)), locations(name)",
+        "id, session_type_id, token_type_id, coach_id, location_id, start_at, end_at, capacity, training_level, is_cancelled, is_online, created_at, deleted_at, session_types(id, name, category, default_capacity, default_duration_mins, color, audience, token_type_id, category_icon, icon, display_order), coaches!sessions_coach_id_fkey(admins(name, id)), locations(name)",
       )
       .order("start_at", { ascending: true });
+    if (!opts?.includeDeleted) {
+      query = query.is("deleted_at", null);
+    }
     if (from) query = query.gte("start_at", from);
     if (to) query = query.lte("start_at", to);
     const { data, error } = await query;
@@ -381,6 +384,7 @@ export class SessionService {
       .from("sessions")
       .select("id, session_type_id, token_type_id, coach_id, location_id, start_at, end_at, capacity, is_online")
       .eq("id", sessionId)
+      .is("deleted_at", null)
       .single();
     if (currentErr || !current) throw new HttpError(404, "Session not found");
 
@@ -399,16 +403,6 @@ export class SessionService {
     const finalDuration = input.durationMins ?? Number(st.default_duration_mins ?? 45);
     const finalEnd = new Date(finalStart.getTime() + finalDuration * 60 * 1000);
     const finalCapacity = input.capacity ?? Number(current.capacity ?? st.default_capacity ?? 1);
-
-    const { count, error: countErr } = await supabaseAdmin
-      .from("bookings")
-      .select("*", { count: "exact", head: true })
-      .eq("session_id", sessionId)
-      .eq("status", "booked");
-    if (countErr) throw new HttpError(500, "Failed to check booked count", countErr);
-    const bookedCount = count ?? 0;
-    if (finalCapacity < bookedCount)
-      throw new HttpError(400, `Capacity cannot be less than current booked count (${bookedCount})`);
 
     await validateCoachForSession({
       coachId: finalCoachId,
@@ -439,6 +433,7 @@ export class SessionService {
       .from("sessions")
       .update(updates)
       .eq("id", sessionId)
+      .is("deleted_at", null)
       .select()
       .single();
     if (error) throw new HttpError(500, "Failed to update session", error);
@@ -446,19 +441,11 @@ export class SessionService {
   }
 
   async setCapacity(sessionId: string, capacity: number) {
-    const { count, error: countErr } = await supabaseAdmin
-      .from("bookings")
-      .select("*", { count: "exact", head: true })
-      .eq("session_id", sessionId)
-      .eq("status", "booked");
-    if (countErr) throw new HttpError(500, "Failed to check booked count", countErr);
-    const bookedCount = count ?? 0;
-    if (capacity < bookedCount)
-      throw new HttpError(400, `Capacity cannot be less than current booked count (${bookedCount})`);
     const { data, error } = await supabaseAdmin
       .from("sessions")
       .update({ capacity })
       .eq("id", sessionId)
+      .is("deleted_at", null)
       .select()
       .single();
     if (error) throw new HttpError(500, "Failed to update capacity", error);
@@ -474,6 +461,7 @@ export class SessionService {
       .from("sessions")
       .select("session_type_id, location_id, start_at, end_at")
       .eq("id", sessionId)
+      .is("deleted_at", null)
       .single();
     if (fetchErr || !session)
       throw new HttpError(404, "Session not found");
@@ -490,6 +478,7 @@ export class SessionService {
       .from("sessions")
       .update({ coach_id: coachId })
       .eq("id", sessionId)
+      .is("deleted_at", null)
       .select()
       .single();
     if (error) throw new HttpError(500, "Failed to update coach", error);
@@ -501,6 +490,7 @@ export class SessionService {
       .from("sessions")
       .select("coach_id, location_id, start_at, end_at")
       .eq("id", sessionId)
+      .is("deleted_at", null)
       .single();
     if (fetchErr || !session)
       throw new HttpError(404, "Session not found");
@@ -516,6 +506,7 @@ export class SessionService {
       .from("sessions")
       .update({ session_type_id: sessionTypeId, token_type_id: tokenTypeId })
       .eq("id", sessionId)
+      .is("deleted_at", null)
       .select()
       .single();
     if (error) throw new HttpError(500, "Failed to update session type", error);
@@ -532,13 +523,85 @@ export class SessionService {
     return data ?? [];
   }
 
+  /** Soft-delete: session hidden from schedules; no row remove. Blocked if any active bookings. */
+  async adminDeleteSession(sessionId: string) {
+    const { count, error: countErr } = await supabaseAdmin
+      .from("bookings")
+      .select("*", { count: "exact", head: true })
+      .eq("session_id", sessionId)
+      .eq("status", "booked");
+    if (countErr) throw new HttpError(500, "Failed to check bookings before delete", countErr);
+    if ((count ?? 0) > 0) {
+      throw new HttpError(
+        409,
+        "Cannot delete: this session still has active bookings. Remove or move members first, or cancel the session instead.",
+      );
+    }
+    const { data: row, error: selErr } = await supabaseAdmin
+      .from("sessions")
+      .select("id, deleted_at")
+      .eq("id", sessionId)
+      .maybeSingle();
+    if (selErr) throw new HttpError(500, "Failed to load session before delete", selErr);
+    if (!row) throw new HttpError(404, "Session not found");
+    if ((row as { deleted_at?: string | null }).deleted_at != null) {
+      throw new HttpError(422, "Session is already removed");
+    }
+    const { error: delErr } = await supabaseAdmin
+      .from("sessions")
+      .update({ deleted_at: new Date().toISOString() })
+      .eq("id", sessionId)
+      .is("deleted_at", null);
+    if (delErr) throw new HttpError(500, "Failed to soft-delete session", delErr);
+    return { ok: true as const };
+  }
+
+  /** Clear soft-delete so the session appears on schedules again. */
+  async adminRestoreSession(sessionId: string) {
+    const { data: row, error: selErr } = await supabaseAdmin
+      .from("sessions")
+      .select("id, deleted_at, coach_id, session_type_id, location_id, start_at, end_at, is_cancelled")
+      .eq("id", sessionId)
+      .maybeSingle();
+    if (selErr) throw new HttpError(500, "Failed to load session", selErr);
+    if (!row) throw new HttpError(404, "Session not found");
+    if ((row as { deleted_at?: string | null }).deleted_at == null) {
+      throw new HttpError(422, "Session is not removed");
+    }
+    if ((row as { is_cancelled?: boolean }).is_cancelled === true) {
+      throw new HttpError(422, "Cannot restore a cancelled session; reinstate it first.");
+    }
+    const coachId = String((row as { coach_id: string }).coach_id ?? "").trim();
+    if (!coachId) throw new HttpError(422, "Session has no coach assigned");
+    await validateCoachForSession({
+      coachId,
+      sessionTypeId: String((row as { session_type_id: string }).session_type_id),
+      locationId: (row as { location_id?: string | null }).location_id ?? null,
+      startAt: String((row as { start_at: string }).start_at),
+      endAt: String((row as { end_at: string }).end_at),
+      excludeSessionId: sessionId,
+    });
+    const { error: updErr } = await supabaseAdmin
+      .from("sessions")
+      .update({ deleted_at: null })
+      .eq("id", sessionId);
+    if (updErr) throw new HttpError(500, "Failed to restore session", updErr);
+    return { ok: true as const };
+  }
+
   async listCoaches() {
     const { data, error } = await supabaseAdmin
       .from("coaches")
-      .select("*, admins!coaches_user_id_fkey(id, name, email, role, location_id)")
+      .select("*, admins!coaches_user_id_fkey(id, name, email, role, location_id, photo_url, is_active)")
       .order("user_id", { ascending: true });
     if (error) throw new HttpError(500, "Failed to fetch coaches", error);
-    const coaches = data ?? [];
+    const coaches = (data ?? []).filter((row) => {
+      const c = row as { is_active?: boolean | null; admins?: { is_active?: boolean | null } | null };
+      if (c.is_active === false) return false;
+      const a = c.admins;
+      if (a && a.is_active === false) return false;
+      return true;
+    });
     if (coaches.length === 0) return coaches;
     const adminIds = coaches
       .map((c) => (c as { user_id?: string | number }).user_id)

@@ -1,13 +1,32 @@
+import { DateTime } from "luxon";
 import { supabaseAdmin } from "../db/supabase.js";
 import { HttpError } from "../lib/http-error.js";
 
 export type AvailabilityKind = "session" | "meeting";
+
+/** One row of `coach_availability` as sent by admin rota replace. */
+export type AvailabilityReplaceWindow = {
+  dayOfWeek: number;
+  startMins: number;
+  endMins: number;
+  locationId?: string | null;
+  breakStartMins?: number | null;
+  breakDurationMins?: number | null;
+};
 
 function minsToHHMM(mins: number): string {
   const m = Math.max(0, Math.min(1440, Math.round(mins)));
   const hh = Math.floor(m / 60);
   const mm = m % 60;
   return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
+}
+
+/** Soft-removed schedule rows (`deleted_at` set) must not block saving session rota. */
+function sessionIsOnLiveSchedule(row: { deleted_at?: unknown }): boolean {
+  const d = row.deleted_at;
+  if (d == null || d === undefined) return true;
+  if (typeof d === "string") return d.trim().length === 0;
+  return false;
 }
 
 export class CoachService {
@@ -28,11 +47,17 @@ export class CoachService {
     const { data, error } = await supabaseAdmin
       .from("coaches")
       .select(
-        "id, user_id, weekly_hour_limit_mins, travel_buffer_minutes, created_at, admins!coaches_user_id_fkey(id, name, email, role, location_id, photo_url)",
+        "id, user_id, weekly_hour_limit_mins, travel_buffer_minutes, created_at, is_active, admins!coaches_user_id_fkey(id, name, email, role, location_id, photo_url, is_active)",
       )
       .order("created_at", { ascending: true });
     if (error) throw new HttpError(500, "Failed to fetch coaches", error);
-    const coaches = data ?? [];
+    const coaches = (data ?? []).filter((row) => {
+      const c = row as { is_active?: boolean | null; admins?: { is_active?: boolean | null } | null };
+      if (c.is_active === false) return false;
+      const a = c.admins;
+      if (a && a.is_active === false) return false;
+      return true;
+    });
     if (coaches.length === 0) return coaches;
     const adminIds = coaches
       .map((c) => (c as { user_id?: string | number }).user_id)
@@ -200,12 +225,16 @@ export class CoachService {
   /** Replaces only rows of the given `kind`; rejects overlap with the other kind's windows. */
   async replaceCoachAvailability(
     coachId: string,
-    windows: { dayOfWeek: number; startMins: number; endMins: number }[],
+    windows: AvailabilityReplaceWindow[],
     weekStartDate?: string,
     kind: AvailabilityKind = "session",
   ) {
     if (windows.length > 0) {
       await this.assertNoCrossKindOverlap(coachId, windows, weekStartDate, kind);
+      await this.assertTravelGapsBetweenSessionWindows(coachId, windows);
+    }
+    if (weekStartDate && kind === "session") {
+      await this.assertSessionsFitNewSessionAvailability(coachId, weekStartDate, windows);
     }
 
     let deleteQuery = supabaseAdmin
@@ -228,6 +257,15 @@ export class CoachService {
           start_mins: w.startMins,
           end_mins: w.endMins,
           kind,
+          location_id: w.locationId ?? null,
+          break_start_mins:
+            w.breakDurationMins != null && w.breakDurationMins > 0 && w.breakStartMins != null
+              ? w.breakStartMins
+              : null,
+          break_duration_mins:
+            w.breakDurationMins != null && w.breakDurationMins > 0 && w.breakStartMins != null
+              ? w.breakDurationMins
+              : null,
         }))
       )
       .select();
@@ -235,9 +273,113 @@ export class CoachService {
     return data ?? [];
   }
 
+  private async assertTravelGapsBetweenSessionWindows(coachId: string, incoming: AvailabilityReplaceWindow[]) {
+    if (incoming.length === 0) return;
+    const { data: coachRow, error } = await supabaseAdmin
+      .from("coaches")
+      .select("travel_buffer_minutes")
+      .eq("id", coachId)
+      .single();
+    if (error || !coachRow) return;
+    const buffer = Math.max(
+      0,
+      Math.floor(Number((coachRow as { travel_buffer_minutes?: number | null }).travel_buffer_minutes ?? 30)),
+    );
+    const byDay = new Map<number, AvailabilityReplaceWindow[]>();
+    for (const w of incoming) {
+      const arr = byDay.get(w.dayOfWeek) ?? [];
+      arr.push(w);
+      byDay.set(w.dayOfWeek, arr);
+    }
+    for (const [, rows] of byDay) {
+      const sorted = [...rows].sort((a, b) => a.startMins - b.startMins);
+      for (let i = 1; i < sorted.length; i++) {
+        const prev = sorted[i - 1];
+        const cur = sorted[i];
+        const a = prev.locationId ? String(prev.locationId).trim() : "";
+        const b = cur.locationId ? String(cur.locationId).trim() : "";
+        if (!a || !b || a === b) continue;
+        const gap = cur.startMins - prev.endMins;
+        if (gap < buffer) {
+          throw new HttpError(
+            400,
+            `Allow at least ${buffer} minutes travel time between rota blocks at different locations on the same day (${minsToHHMM(prev.startMins)}-${minsToHHMM(prev.endMins)} then ${minsToHHMM(cur.startMins)}-${minsToHHMM(cur.endMins)}).`,
+          );
+        }
+      }
+    }
+  }
+
+  private async assertSessionsFitNewSessionAvailability(
+    coachId: string,
+    weekStartDate: string,
+    incoming: AvailabilityReplaceWindow[],
+  ) {
+    const weekBase = DateTime.fromISO(weekStartDate, { zone: "Europe/London" }).startOf("day");
+    const weekEnd = weekBase.plus({ days: 7 });
+    const weekStartUtc = weekBase.toUTC();
+    const weekEndUtc = weekEnd.toUTC();
+    const { data: sessionsRaw, error } = await supabaseAdmin
+      .from("sessions")
+      .select("id, start_at, end_at, location_id, deleted_at")
+      .eq("coach_id", coachId)
+      .eq("is_cancelled", false)
+      .lt("start_at", weekEndUtc.toISO()!)
+      .gt("end_at", weekStartUtc.toISO()!);
+    if (error) throw new HttpError(500, "Failed to load sessions for rota validation", error);
+
+    const sessions = (sessionsRaw ?? []).filter(sessionIsOnLiveSchedule);
+
+    const atMins = (day: DateTime, mins: number) => {
+      const h = Math.floor(mins / 60);
+      const mi = mins % 60;
+      return day.set({ hour: h, minute: mi, second: 0, millisecond: 0 });
+    };
+    const windowEndDt = (day: DateTime, endMins: number) => {
+      if (endMins >= 1440) return day.plus({ days: 1 }).startOf("day");
+      return atMins(day, endMins);
+    };
+
+    for (const sess of sessions) {
+      const sS = DateTime.fromISO(String((sess as { start_at: string }).start_at), { zone: "utc" }).setZone(
+        "Europe/London",
+      );
+      const sE = DateTime.fromISO(String((sess as { end_at: string }).end_at), { zone: "utc" }).setZone(
+        "Europe/London",
+      );
+      const sessLoc = (sess as { location_id?: string | null }).location_id;
+      const sid = String((sess as { id: string }).id);
+
+      let fits = false;
+      for (const w of incoming) {
+        const day = weekBase.plus({ days: w.dayOfWeek - 1 });
+        const wStart = atMins(day, w.startMins);
+        const wEnd = windowEndDt(day, w.endMins);
+        if (sS < wStart || sE > wEnd) continue;
+        if (w.locationId && sessLoc && String(w.locationId) !== String(sessLoc)) continue;
+
+        const bd = w.breakDurationMins;
+        const bs = w.breakStartMins;
+        if (bd != null && bd > 0 && bs != null) {
+          const b0 = atMins(day, bs);
+          const b1 = b0.plus({ minutes: bd });
+          if (sS < b1 && sE > b0) continue;
+        }
+        fits = true;
+        break;
+      }
+      if (!fits) {
+        throw new HttpError(
+          400,
+          `Cannot save rota: a scheduled session (${sS.toFormat("ccc HH:mm")}–${sE.toFormat("HH:mm")}, id ${sid.slice(0, 8)}…) would fall outside the submitted availability for this week or overlap a break. Move the session or adjust the rota (ensure every day with sessions still has matching working windows). Sessions removed from the schedule (soft-deleted) are ignored—if you already removed this slot, refresh the Schedule tab and try again.`,
+        );
+      }
+    }
+  }
+
   private async assertNoCrossKindOverlap(
     coachId: string,
-    incoming: { dayOfWeek: number; startMins: number; endMins: number }[],
+    incoming: AvailabilityReplaceWindow[],
     weekStartDate: string | undefined,
     kind: AvailabilityKind,
   ) {
@@ -369,7 +511,9 @@ export class CoachService {
       weekStartDate
         ? supabaseAdmin
             .from("coach_availability")
-            .select("id, coach_id, week_start_date, day_of_week, start_mins, end_mins, kind")
+            .select(
+              "id, coach_id, week_start_date, day_of_week, start_mins, end_mins, kind, location_id, break_start_mins, break_duration_mins",
+            )
             .in("coach_id", coachIds)
             .eq("week_start_date", weekStartDate)
         : Promise.resolve({ data: [] as unknown[], error: null }),
@@ -402,7 +546,9 @@ export class CoachService {
     if (fallbackCoachIds.length > 0) {
       const { data: fallbackRows, error: fallbackErr } = await supabaseAdmin
         .from("coach_availability")
-        .select("id, coach_id, week_start_date, day_of_week, start_mins, end_mins, kind")
+        .select(
+          "id, coach_id, week_start_date, day_of_week, start_mins, end_mins, kind, location_id, break_start_mins, break_duration_mins",
+        )
         .in("coach_id", fallbackCoachIds)
         .is("week_start_date", null);
       if (fallbackErr) throw new HttpError(500, "Failed to fetch default coach availability", fallbackErr);
