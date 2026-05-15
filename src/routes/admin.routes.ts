@@ -407,6 +407,9 @@ router.get('/coaches/:coachUserId/session-types', async (req, res, next) => { tr
 router.post('/coaches/:coachUserId/session-types/:sessionTypeId', async (req, res, next) => { try { const { coachUserId, sessionTypeId } = validate(addCoachSessionTypeSchema, { coachUserId: req.params.coachUserId, sessionTypeId: req.params.sessionTypeId }); res.json({ ok: true, data: await coachService.addCoachAllowedSessionType({ coachUserId, sessionTypeId }) }); } catch (e) { next(e); } });
 router.delete('/coaches/:coachUserId/session-types/:sessionTypeId', async (req, res, next) => { try { await coachService.removeCoachAllowedSessionType(req.params.coachUserId, req.params.sessionTypeId); res.json({ ok: true }); } catch (e) { next(e); } });
 // Staff (admins table)
+const STAFF_ADMIN_SELECT =
+  "id, name, email, role, location_id, phone, photo_url, created_at, is_active, deactivation_reason, deactivated_at, deactivated_by_admin_id";
+
 function isCoachLikeRole(role: unknown): boolean {
   if (typeof role !== "string") return false;
   const normalized = role.trim().toLowerCase().replace(/\s+/g, "");
@@ -650,7 +653,7 @@ router.get('/staff', async (req, res, next) => {
     const [staffRes, locRes] = await Promise.all([
       supabaseAdmin
         .from("admins")
-        .select("id, name, email, role, location_id, phone, photo_url, created_at")
+        .select(STAFF_ADMIN_SELECT)
         .order("created_at", { ascending: false }),
       supabaseAdmin.from("admin_location_access").select("admin_id, location_id"),
     ]);
@@ -704,7 +707,7 @@ router.get('/staff/:staffId', async (req, res, next) => {
   try {
     const { data: staffRow, error: staffError } = await supabaseAdmin
       .from("admins")
-      .select("id, name, email, role, location_id, phone, photo_url, created_at")
+      .select(STAFF_ADMIN_SELECT)
       .eq("id", req.params.staffId)
       .maybeSingle();
     if (staffError) throw new HttpError(500, "Failed to fetch staff member", staffError);
@@ -822,18 +825,52 @@ router.post('/staff', async (req, res, next) => {
 });
 router.patch('/staff/:staffId', async (req, res, next) => {
   try {
-    const { name, email, role, location_id, location_ids, phone, photo_url } = req.body as {
+    const body = req.body as {
       name?: string; email?: string; role?: string;
       location_id?: string | null; location_ids?: string[];
       phone?: string | null;
       photo_url?: string | null;
+      is_active?: boolean;
+      isActive?: boolean;
+      deactivation_reason?: string | null;
+      deactivationReason?: string | null;
     };
+    const { name, email, role, location_id, location_ids, phone, photo_url } = body;
+    const isActiveRaw = body.is_active !== undefined ? body.is_active : body.isActive;
+    const deactivationReasonRaw =
+      body.deactivation_reason !== undefined ? body.deactivation_reason : body.deactivationReason;
+
     const updates: Record<string, unknown> = {};
     if (name !== undefined) updates.name = name;
     if (email !== undefined) updates.email = email;
     if (role !== undefined) updates.role = role;
     if (phone !== undefined) updates.phone = phone;
     if (photo_url !== undefined) updates.photo_url = photo_url;
+
+    if (isActiveRaw !== undefined) {
+      if (typeof isActiveRaw !== "boolean") {
+        throw new HttpError(400, "is_active must be a boolean");
+      }
+      updates.is_active = isActiveRaw;
+      if (isActiveRaw === false) {
+        const reason =
+          deactivationReasonRaw === undefined || deactivationReasonRaw === null
+            ? null
+            : String(deactivationReasonRaw).trim() || null;
+        updates.deactivation_reason = reason;
+        updates.deactivated_at = new Date().toISOString();
+        const actorId = Number.parseInt(String(req.user?.id ?? ""), 10);
+        updates.deactivated_by_admin_id = Number.isFinite(actorId) ? actorId : null;
+      } else {
+        updates.deactivation_reason = null;
+        updates.deactivated_at = null;
+        updates.deactivated_by_admin_id = null;
+      }
+    } else if (deactivationReasonRaw !== undefined) {
+      const reason =
+        deactivationReasonRaw === null ? null : String(deactivationReasonRaw).trim() || null;
+      updates.deactivation_reason = reason;
+    }
     // Resolve primary location from location_ids or legacy location_id
     const allLocIds = location_ids ?? (location_id !== undefined ? (location_id ? [location_id] : []) : undefined);
     if (allLocIds !== undefined && allLocIds.length === 0) {
@@ -854,13 +891,32 @@ router.patch('/staff/:staffId', async (req, res, next) => {
     if (allLocIds !== undefined) updates.location_id = allLocIds[0] ?? null;
     else if (location_id !== undefined) updates.location_id = location_id;
     if (Object.keys(updates).length === 0) throw new HttpError(400, "At least one field required");
+
+    const staffId = req.params.staffId;
+    const { data: existingStaff, error: existingStaffErr } = await supabaseAdmin
+      .from("admins")
+      .select("id, role")
+      .eq("id", staffId)
+      .maybeSingle();
+    if (existingStaffErr) throw new HttpError(500, "Failed to verify staff member", existingStaffErr);
+    if (!existingStaff) throw new HttpError(404, "Staff member not found");
+
     const { data, error } = await supabaseAdmin
       .from("admins")
       .update(updates)
-      .eq("id", req.params.staffId)
-      .select("id, name, email, role, location_id, phone, photo_url")
+      .eq("id", staffId)
+      .select(STAFF_ADMIN_SELECT)
       .single();
     if (error) throw new HttpError(500, "Failed to update staff member", error);
+
+    if (isActiveRaw !== undefined && isCoachLikeRole(existingStaff.role ?? data.role)) {
+      const { error: coachActiveErr } = await supabaseAdmin
+        .from("coaches")
+        .update({ is_active: isActiveRaw })
+        .eq("user_id", String(staffId));
+      if (coachActiveErr) throw new HttpError(500, "Failed to sync coach active status", coachActiveErr);
+    }
+
     if (allLocIds !== undefined) await syncAdminLocations(data.id, allLocIds);
     await ensureCoachProfileForAdmin({ adminId: data.id, role: data.role });
     const finalLocIds = allLocIds ?? await getAdminLocationIds(data.id);
