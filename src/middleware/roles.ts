@@ -3,6 +3,16 @@ import { HttpError } from "../lib/http-error.js";
 import type { Role } from "../types/domain.js";
 import { supabaseAdmin } from "../db/supabase.js";
 
+function isCoachLikeAdminRole(role: string): boolean {
+  const normalized = role.trim().toLowerCase().replace(/\s+/g, "");
+  return normalized === "coach" || normalized === "headcoach";
+}
+
+/** GET /admin/staff (optional ?includeStats=1) — team directory for coaches and admins. */
+function isStaffDirectoryListRequest(req: Request): boolean {
+  return req.method === "GET" && (req.path === "/staff" || req.path === "/staff/");
+}
+
 export function requireRole(...roles: Role[]) {
   return (req: Request, _res: Response, next: NextFunction) => {
     if (!req.user) return next(new HttpError(401, "Authentication required"));
@@ -51,9 +61,17 @@ export function requireAdminTableAccess() {
     if (!adminRecord) return next(new HttpError(403, "Forbidden"));
 
     const role = typeof adminRecord.role === "string" ? adminRecord.role.toLowerCase() : "admin";
-    if (role !== "admin") return next(new HttpError(403, "Forbidden"));
 
-    req.user.role = "admin";
-    return next();
+    if (role === "admin") {
+      req.user.role = "admin";
+      return next();
+    }
+
+    if (isStaffDirectoryListRequest(req) && isCoachLikeAdminRole(role)) {
+      req.user.role = "coach";
+      return next();
+    }
+
+    return next(new HttpError(403, "Forbidden"));
   };
 }
