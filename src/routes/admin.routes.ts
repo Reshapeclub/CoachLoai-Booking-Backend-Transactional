@@ -651,16 +651,32 @@ router.get('/staff', async (req, res, next) => {
       req.query.includeStats === "1" ||
       req.query.includeStats === "true" ||
       req.query.includeStats === "yes";
+    const locationQuery =
+      typeof req.query.location === "string" ? req.query.location.trim() : "";
+    const locationFilterNorm = locationQuery.toLowerCase();
 
-    const [staffRes, locRes] = await Promise.all([
+    const [staffRes, locRes, allLocsRes] = await Promise.all([
       supabaseAdmin
         .from("admins")
         .select(STAFF_ADMIN_SELECT)
         .order("created_at", { ascending: false }),
       supabaseAdmin.from("admin_location_access").select("admin_id, location_id"),
+      supabaseAdmin.from("locations").select("id, name, slug"),
     ]);
     if (staffRes.error) throw new HttpError(500, "Failed to fetch staff", staffRes.error);
     if (locRes.error) throw new HttpError(500, "Failed to fetch staff locations", locRes.error);
+    if (allLocsRes.error) throw new HttpError(500, "Failed to fetch locations", allLocsRes.error);
+
+    const locNameById = new Map<string, string>();
+    const locSlugById = new Map<string, string>();
+    for (const loc of allLocsRes.data ?? []) {
+      const id = String((loc as { id?: unknown }).id ?? "");
+      if (!id) continue;
+      const name = typeof (loc as { name?: unknown }).name === "string" ? (loc as { name: string }).name.trim() : "";
+      const slug = typeof (loc as { slug?: unknown }).slug === "string" ? (loc as { slug: string }).slug.trim() : "";
+      if (name) locNameById.set(id, name);
+      if (slug) locSlugById.set(id, slug);
+    }
 
     const locsByAdmin: Record<string, string[]> = {};
     for (const row of locRes.data ?? []) {
@@ -668,10 +684,47 @@ router.get('/staff', async (req, res, next) => {
       if (!locsByAdmin[key]) locsByAdmin[key] = [];
       locsByAdmin[key].push(row.location_id);
     }
-    let mapped = (staffRes.data ?? []).map((s) => ({
-      ...s,
-      location_ids: locsByAdmin[String(s.id)] ?? (s.location_id ? [s.location_id] : []),
-    }));
+    let mapped = (staffRes.data ?? []).map((s) => {
+      const location_ids = locsByAdmin[String(s.id)] ?? (s.location_id ? [s.location_id] : []);
+      const locationNames = location_ids
+        .map((id) => locNameById.get(String(id)))
+        .filter((name): name is string => Boolean(name));
+      const locations = location_ids
+        .map((id) => ({
+          id,
+          name: locNameById.get(String(id)) ?? null,
+          slug: locSlugById.get(String(id)) ?? null,
+        }))
+        .filter((row) => row.name);
+      const primaryName =
+        locationNames[0] ?? (s.location_id ? locNameById.get(String(s.location_id)) : null) ?? null;
+      return {
+        ...s,
+        location_ids,
+        location_name: primaryName,
+        location: locationNames.length ? locationNames.join(", ") : primaryName,
+        locations,
+      };
+    });
+
+    if (locationFilterNorm && locationFilterNorm !== "all") {
+      mapped = mapped.filter((row) => {
+        const names = (row.locations ?? [])
+          .map((loc: { name?: string | null }) =>
+            typeof loc.name === "string" ? loc.name.trim().toLowerCase() : "",
+          )
+          .filter(Boolean);
+        const slugs = (row.locations ?? [])
+          .map((loc: { slug?: string | null }) =>
+            typeof loc.slug === "string" ? loc.slug.trim().toLowerCase() : "",
+          )
+          .filter(Boolean);
+        return (
+          names.some((name: string) => name === locationFilterNorm || name.includes(locationFilterNorm)) ||
+          slugs.some((slug: string) => slug === locationFilterNorm || slug.includes(locationFilterNorm))
+        );
+      });
+    }
 
     if (wantStats && mapped.length > 0) {
       const statsByAdmin = await computeDirectoryStatsByAdminId(staffRes.data ?? []);
