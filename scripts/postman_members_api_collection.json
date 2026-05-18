@@ -1,0 +1,321 @@
+{
+  "info": {
+    "_postman_id": "3e4deecf-e7fe-4207-b8f2-15ff2f6cd7fc",
+    "name": "CLM Member APIs",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "description": "Member API collection for CLM Booking Backend Transactional"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{token}}",
+        "type": "string"
+      }
+    ]
+  },
+  "item": [
+    {
+      "name": "Get Booking Context",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{baseUrl}}/member/booking-context"
+      }
+    },
+    {
+      "name": "Get Available Sessions",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/member/sessions/available?from={{from}}&to={{to}}&sessionTypeId={{sessionTypeId}}&locationId={{locationId}}",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "member",
+            "sessions",
+            "available"
+          ],
+          "query": [
+            {
+              "key": "from",
+              "value": "{{from}}"
+            },
+            {
+              "key": "to",
+              "value": "{{to}}"
+            },
+            {
+              "key": "sessionTypeId",
+              "value": "{{sessionTypeId}}"
+            },
+            {
+              "key": "locationId",
+              "value": "{{locationId}}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Get Session Detail",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{baseUrl}}/member/sessions/{{sessionId}}"
+      }
+    },
+    {
+      "name": "Get Bookings",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/member/bookings?status={{bookingStatus}}",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "member",
+            "bookings"
+          ],
+          "query": [
+            {
+              "key": "status",
+              "value": "{{bookingStatus}}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Create Booking",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"membershipId\": \"{{membershipId}}\",\n  \"sessionId\": \"{{sessionId}}\"\n}"
+        },
+        "url": "{{baseUrl}}/member/bookings"
+      }
+    },
+    {
+      "name": "Cancel Booking",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "url": "{{baseUrl}}/member/bookings/{{bookingId}}/cancel"
+      }
+    },
+    {
+      "name": "Get Waitlist",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{baseUrl}}/member/waitlist"
+      }
+    },
+    {
+      "name": "Join Waitlist",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"membershipId\": \"{{membershipId}}\",\n  \"sessionId\": \"{{sessionId}}\"\n}"
+        },
+        "url": "{{baseUrl}}/member/waitlist"
+      }
+    },
+    {
+      "name": "Get Token Wallet",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{baseUrl}}/member/tokens"
+      }
+    },
+    {
+      "name": "Get Additional Sessions Summary",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{baseUrl}}/member/tokens/additional-summary"
+      }
+    },
+    {
+      "name": "Get Token Purchase Options",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{baseUrl}}/member/tokens/purchase/options"
+      }
+    },
+    {
+      "name": "Create Token Purchase Checkout",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"membershipId\": \"{{membershipId}}\",\n  \"tokenTypeId\": \"{{tokenTypeId}}\",\n  \"quantity\": 1\n}"
+        },
+        "url": "{{baseUrl}}/member/tokens/purchase/checkout"
+      }
+    },
+    {
+      "name": "Get Locations",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{baseUrl}}/member/locations"
+      }
+    },
+    {
+      "name": "Get Meeting Types",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{baseUrl}}/member/meetings/types"
+      }
+    },
+    {
+      "name": "Get Meeting Availability",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/member/meetings/availability?meetingTypeId={{meetingTypeId}}&date={{meetingDate}}&locationId={{locationId}}",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "member",
+            "meetings",
+            "availability"
+          ],
+          "query": [
+            {
+              "key": "meetingTypeId",
+              "value": "{{meetingTypeId}}"
+            },
+            {
+              "key": "date",
+              "value": "{{meetingDate}}"
+            },
+            {
+              "key": "locationId",
+              "value": "{{locationId}}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Get Meeting Eligibility",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{baseUrl}}/member/meetings/eligibility"
+      }
+    },
+    {
+      "name": "Create Meeting Booking",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"meetingTypeId\": \"{{meetingTypeId}}\",\n  \"locationId\": \"{{locationId}}\",\n  \"meetingStart\": \"{{meetingStart}}\"\n}"
+        },
+        "url": "{{baseUrl}}/member/meetings"
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "https://transactional-api.coachloai.com"
+    },
+    {
+      "key": "token",
+      "value": "PASTE_BEARER_TOKEN_HERE"
+    },
+    {
+      "key": "from",
+      "value": ""
+    },
+    {
+      "key": "to",
+      "value": ""
+    },
+    {
+      "key": "sessionTypeId",
+      "value": ""
+    },
+    {
+      "key": "locationId",
+      "value": ""
+    },
+    {
+      "key": "sessionId",
+      "value": ""
+    },
+    {
+      "key": "bookingStatus",
+      "value": ""
+    },
+    {
+      "key": "bookingId",
+      "value": ""
+    },
+    {
+      "key": "membershipId",
+      "value": ""
+    },
+    {
+      "key": "tokenTypeId",
+      "value": ""
+    },
+    {
+      "key": "meetingTypeId",
+      "value": ""
+    },
+    {
+      "key": "meetingDate",
+      "value": "2026-03-27"
+    },
+    {
+      "key": "meetingStart",
+      "value": "2026-03-27T09:00:00.000Z"
+    }
+  ]
+}

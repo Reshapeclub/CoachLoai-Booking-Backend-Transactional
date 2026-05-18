@@ -16,8 +16,12 @@ export const env = {
   SUPABASE_ANON_KEY: process.env.SUPABASE_ANON_KEY ?? "",
   STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY ?? "",
   STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET ?? "",
-  EMAIL_PROVIDER_API_KEY: process.env.EMAIL_PROVIDER_API_KEY ?? "",
-  EMAIL_FROM: process.env.EMAIL_FROM ?? "noreply@example.com",
+  /** Optional override for From address; defaults to SMTP_USER when using Gmail SMTP */
+  EMAIL_FROM: process.env.EMAIL_FROM ?? "",
+  SMTP_HOST: process.env.SMTP_HOST ?? "",
+  SMTP_PORT: Number(process.env.SMTP_PORT) || 587,
+  SMTP_USER: process.env.SMTP_USER ?? "",
+  SMTP_PASS: process.env.SMTP_PASS ?? "",
   PUSH_PROVIDER_API_KEY: process.env.PUSH_PROVIDER_API_KEY ?? "",
   JWT_SECRET: process.env.JWT_SECRET ?? "",
 } as const;

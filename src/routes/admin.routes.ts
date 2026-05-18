@@ -56,6 +56,8 @@ import { validateCoachForSession } from "../services/coach-roster-validator.js";
 import { supabaseAdmin } from "../db/supabase.js";
 import { HttpError } from "../lib/http-error.js";
 import { runWeeklyTokenGeneration } from "../jobs/weekly-token-generation.js";
+import { provisionStaffAuthAccount, rollbackStaffAuthAccount } from "../services/staff-provisioning.js";
+import { sendStaffWelcomeEmail } from "../services/staff-welcome-email.js";
 
 const router = Router();
 const sessionService = new SessionService();
@@ -806,21 +808,70 @@ router.post('/staff', async (req, res, next) => {
     };
     if (!name || !name.trim()) throw new HttpError(400, "name is required");
     if (!email || !email.trim()) throw new HttpError(400, "email is required");
+    const normalizedEmail = email.trim().toLowerCase();
     // primary location: first of location_ids, or legacy location_id
     const allLocIds = location_ids ?? (location_id ? [location_id] : []);
     if (isCoachLikeRole(role) && allLocIds.length === 0) {
       throw new HttpError(400, "Coach users must have a location before creating coach profile");
     }
     const primaryLocId = allLocIds[0] ?? null;
-    const { data, error } = await supabaseAdmin
+
+    const { plainPassword, passwordHash, authUserId } = await provisionStaffAuthAccount({
+      email: normalizedEmail,
+      name: name.trim(),
+      role: role ?? null,
+    });
+
+    const insertPayload: Record<string, unknown> = {
+      name: name.trim(),
+      email: normalizedEmail,
+      role: role ?? null,
+      location_id: primaryLocId,
+      phone: phone ?? null,
+      photo_url: photo_url ?? null,
+      password: passwordHash,
+    };
+
+    let { data, error } = await supabaseAdmin
       .from("admins")
-      .insert({ name: name.trim(), email: email.trim(), role: role ?? null, location_id: primaryLocId, phone: phone ?? null, photo_url: photo_url ?? null })
+      .insert(insertPayload)
       .select("id, name, email, role, location_id, phone, photo_url")
       .single();
-    if (error) throw new HttpError(500, "Failed to create staff member", error);
+
+    if (error && String(error.message ?? "").toLowerCase().includes("password")) {
+      delete insertPayload.password;
+      ({ data, error } = await supabaseAdmin
+        .from("admins")
+        .insert(insertPayload)
+        .select("id, name, email, role, location_id, phone, photo_url")
+        .single());
+    }
+
+    if (error || !data) {
+      await rollbackStaffAuthAccount(authUserId);
+      throw new HttpError(500, "Failed to create staff member", error ?? undefined);
+    }
     await syncAdminLocations(data.id, allLocIds);
     await ensureCoachProfileForAdmin({ adminId: data.id, role: data.role });
-    res.status(201).json({ ok: true, data: { ...data, location_ids: allLocIds } });
+
+    const emailSent = await sendStaffWelcomeEmail(
+      normalizedEmail,
+      name.trim(),
+      plainPassword,
+      role ?? "Coach",
+    );
+    if (!emailSent) {
+      console.warn(
+        "[POST /admin/staff] Staff created but welcome email was not sent for",
+        normalizedEmail,
+      );
+    }
+
+    res.status(201).json({
+      ok: true,
+      data: { ...data, location_ids: allLocIds },
+      welcome_email_sent: emailSent,
+    });
   } catch (e) { next(e); }
 });
 router.patch('/staff/:staffId', async (req, res, next) => {
