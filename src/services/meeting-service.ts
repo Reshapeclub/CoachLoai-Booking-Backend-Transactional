@@ -19,6 +19,30 @@ function toLondonRotaParts(iso: string): { dayOfWeek: number; minutesFromMidnigh
   return { dayOfWeek, minutesFromMidnight, weekStartDate };
 }
 
+type CoachDayAvailabilityRow = {
+  start_mins: number;
+  end_mins: number;
+  location_id: string | null;
+};
+
+function minsToHHMM(mins: number): string {
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+}
+
+/** Gap in minutes between non-overlapping blocks on the same day; -1 if they overlap. */
+function sameDayTravelGapMinutes(
+  aStart: number,
+  aEnd: number,
+  bStart: number,
+  bEnd: number,
+): number {
+  if (aEnd <= bStart) return bStart - aEnd;
+  if (bEnd <= aStart) return aStart - bEnd;
+  return -1;
+}
+
 export class MeetingService {
   async listMeetingTypesAdmin() {
     const { data, error } = await supabaseAdmin
@@ -245,7 +269,12 @@ export class MeetingService {
     isActive?: boolean;
   }) {
     if (input.coachId) {
-      await this.assertCoachMeetingSlotConstraints(input.coachId, input.slotStart, input.slotEnd);
+      await this.assertCoachMeetingSlotConstraints(
+        input.coachId,
+        input.locationId,
+        input.slotStart,
+        input.slotEnd,
+      );
     }
     const { data, error } = await supabaseAdmin
       .from("meeting_slots")
@@ -264,10 +293,30 @@ export class MeetingService {
     return data;
   }
 
-  private async assertCoachMeetingSlotConstraints(coachId: string, slotStart: string, slotEnd: string) {
+  private async assertCoachMeetingSlotConstraints(
+    coachId: string,
+    locationId: string,
+    slotStart: string,
+    slotEnd: string,
+    excludeMeetingSlotId?: string,
+  ) {
     await this.assertSlotInCoachMeetingWindows(coachId, slotStart, slotEnd);
     await this.assertSlotDoesNotOverlapSessionRota(coachId, slotStart, slotEnd);
     await this.assertSlotDoesNotOverlapBookedSessions(coachId, slotStart, slotEnd);
+    await this.assertMeetingSlotTravelBuffer(coachId, locationId, slotStart, slotEnd, excludeMeetingSlotId);
+  }
+
+  private async fetchCoachTravelBufferMinutes(coachId: string): Promise<number> {
+    const { data: coachRow, error } = await supabaseAdmin
+      .from("coaches")
+      .select("travel_buffer_minutes")
+      .eq("id", coachId)
+      .single();
+    if (error || !coachRow) return 30;
+    return Math.max(
+      0,
+      Math.floor(Number((coachRow as { travel_buffer_minutes?: number | null }).travel_buffer_minutes ?? 30)),
+    );
   }
 
   private async fetchCoachDayAvailabilityMins(
@@ -276,25 +325,161 @@ export class MeetingService {
     dayOfWeek: number,
     weekStartDate: string,
   ): Promise<Array<{ start_mins: number; end_mins: number }>> {
+    const rows = await this.fetchCoachDayAvailabilityWithLocation(coachId, kind, dayOfWeek, weekStartDate);
+    return rows.map((r) => ({ start_mins: r.start_mins, end_mins: r.end_mins }));
+  }
+
+  private async fetchCoachDayAvailabilityWithLocation(
+    coachId: string,
+    kind: "session" | "meeting",
+    dayOfWeek: number,
+    weekStartDate: string,
+  ): Promise<CoachDayAvailabilityRow[]> {
     const { data: weekRows, error: weekErr } = await supabaseAdmin
       .from("coach_availability")
-      .select("start_mins, end_mins")
+      .select("start_mins, end_mins, location_id")
       .eq("coach_id", coachId)
       .eq("kind", kind)
       .eq("day_of_week", dayOfWeek)
       .eq("week_start_date", weekStartDate);
     if (weekErr) throw new HttpError(500, "Failed to fetch coach availability", weekErr);
-    if ((weekRows ?? []).length > 0) return (weekRows ?? []) as Array<{ start_mins: number; end_mins: number }>;
+    if ((weekRows ?? []).length > 0) return (weekRows ?? []) as CoachDayAvailabilityRow[];
 
     const { data: defaultRows, error: defaultErr } = await supabaseAdmin
       .from("coach_availability")
-      .select("start_mins, end_mins")
+      .select("start_mins, end_mins, location_id")
       .eq("coach_id", coachId)
       .eq("kind", kind)
       .eq("day_of_week", dayOfWeek)
       .is("week_start_date", null);
     if (defaultErr) throw new HttpError(500, "Failed to fetch coach availability", defaultErr);
-    return (defaultRows ?? []) as Array<{ start_mins: number; end_mins: number }>;
+    return (defaultRows ?? []) as CoachDayAvailabilityRow[];
+  }
+
+  private assertSameDayTravelGapOrThrow(
+    buffer: number,
+    newLoc: string,
+    newStart: number,
+    newEnd: number,
+    otherStart: number,
+    otherEnd: number,
+    otherLoc: string | null,
+    context: string,
+  ): void {
+    const other = otherLoc ? String(otherLoc).trim() : "";
+    if (!other || other === newLoc) return;
+    const gap = sameDayTravelGapMinutes(newStart, newEnd, otherStart, otherEnd);
+    if (gap >= 0 && gap < buffer) {
+      throw new HttpError(
+        400,
+        `Allow at least ${buffer} minutes travel time between commitments at different locations on the same day (${context}: ${minsToHHMM(otherStart)}-${minsToHHMM(otherEnd)} then ${minsToHHMM(newStart)}-${minsToHHMM(newEnd)}).`,
+      );
+    }
+  }
+
+  private async assertMeetingSlotTravelBuffer(
+    coachId: string,
+    locationId: string,
+    slotStart: string,
+    slotEnd: string,
+    excludeMeetingSlotId?: string,
+  ): Promise<void> {
+    const startParts = toLondonRotaParts(slotStart);
+    const endParts = toLondonRotaParts(slotEnd);
+    if (endParts.dayOfWeek !== startParts.dayOfWeek) return;
+
+    const newLoc = String(locationId).trim();
+    if (!newLoc) return;
+
+    const buffer = await this.fetchCoachTravelBufferMinutes(coachId);
+    if (buffer <= 0) return;
+
+    const S = startParts.minutesFromMidnight;
+    const E = endParts.minutesFromMidnight;
+    const dayOfWeek = startParts.dayOfWeek;
+    const weekStartDate = startParts.weekStartDate;
+
+    const londonYmd = DateTime.fromISO(slotStart, { zone: "utc" })
+      .setZone("Europe/London")
+      .toISODate();
+    if (!londonYmd) return;
+    const dayBounds = ukDayBoundsUtcIso(londonYmd);
+    if (!dayBounds) return;
+
+    const checkRota = (rows: CoachDayAvailabilityRow[], label: string) => {
+      for (const r of rows) {
+        this.assertSameDayTravelGapOrThrow(
+          buffer,
+          newLoc,
+          S,
+          E,
+          Number(r.start_mins),
+          Number(r.end_mins),
+          r.location_id,
+          label,
+        );
+      }
+    };
+
+    checkRota(
+      await this.fetchCoachDayAvailabilityWithLocation(coachId, "session", dayOfWeek, weekStartDate),
+      "session rota",
+    );
+    checkRota(
+      await this.fetchCoachDayAvailabilityWithLocation(coachId, "meeting", dayOfWeek, weekStartDate),
+      "meeting rota",
+    );
+
+    const { data: otherSlots, error: slotsErr } = await supabaseAdmin
+      .from("meeting_slots")
+      .select("id, slot_start, slot_end, location_id")
+      .eq("coach_id", coachId)
+      .lt("slot_start", dayBounds.to)
+      .gt("slot_end", dayBounds.from);
+    if (slotsErr) throw new HttpError(500, "Failed to check meeting slot travel buffer", slotsErr);
+
+    for (const slot of otherSlots ?? []) {
+      if (excludeMeetingSlotId && slot.id === excludeMeetingSlotId) continue;
+      const parts = toLondonRotaParts(slot.slot_start as string);
+      const endSlot = toLondonRotaParts(slot.slot_end as string);
+      if (parts.dayOfWeek !== dayOfWeek || endSlot.dayOfWeek !== dayOfWeek) continue;
+      this.assertSameDayTravelGapOrThrow(
+        buffer,
+        newLoc,
+        S,
+        E,
+        parts.minutesFromMidnight,
+        endSlot.minutesFromMidnight,
+        slot.location_id as string | null,
+        "meeting slot",
+      );
+    }
+
+    const { data: sessions, error: sessErr } = await supabaseAdmin
+      .from("sessions")
+      .select("start_at, end_at, location_id")
+      .eq("coach_id", coachId)
+      .eq("is_cancelled", false)
+      .is("deleted_at", null)
+      .lt("start_at", dayBounds.to)
+      .gt("end_at", dayBounds.from);
+    if (sessErr) throw new HttpError(500, "Failed to check session travel buffer", sessErr);
+
+    for (const sess of sessions ?? []) {
+      const parts = toLondonRotaParts(sess.start_at as string);
+      const endSess = toLondonRotaParts(sess.end_at as string);
+      if (parts.dayOfWeek !== dayOfWeek || endSess.dayOfWeek !== dayOfWeek) continue;
+      this.assertSameDayTravelGapOrThrow(
+        buffer,
+        newLoc,
+        S,
+        E,
+        parts.minutesFromMidnight,
+        endSess.minutesFromMidnight,
+        sess.location_id as string | null,
+        "booked session",
+      );
+    }
   }
 
   private async assertSlotInCoachMeetingWindows(coachId: string, slotStart: string, slotEnd: string) {
@@ -378,18 +563,30 @@ export class MeetingService {
       isActive?: boolean;
     }
   ) {
-    if (input.coachId !== undefined || input.slotStart !== undefined || input.slotEnd !== undefined) {
+    if (
+      input.coachId !== undefined ||
+      input.locationId !== undefined ||
+      input.slotStart !== undefined ||
+      input.slotEnd !== undefined
+    ) {
       const { data: existing, error: fetchErr } = await supabaseAdmin
         .from("meeting_slots")
-        .select("coach_id, slot_start, slot_end")
+        .select("coach_id, location_id, slot_start, slot_end")
         .eq("id", meetingSlotId)
         .single();
       if (fetchErr || !existing) throw new HttpError(404, "Meeting slot not found");
       const nextCoachId = input.coachId !== undefined ? input.coachId : existing.coach_id;
+      const nextLocationId = input.locationId ?? existing.location_id;
       const nextStart = input.slotStart ?? existing.slot_start;
       const nextEnd = input.slotEnd ?? existing.slot_end;
       if (nextCoachId) {
-        await this.assertCoachMeetingSlotConstraints(nextCoachId, nextStart, nextEnd);
+        await this.assertCoachMeetingSlotConstraints(
+          nextCoachId,
+          nextLocationId,
+          nextStart,
+          nextEnd,
+          meetingSlotId,
+        );
       }
     }
 

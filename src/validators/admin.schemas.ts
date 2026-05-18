@@ -221,7 +221,7 @@ const availabilityWindowSchema = z
     /** When set, session must be at this location during this window; null/omit = any assigned site. */
     locationId: z.string().uuid().nullable().optional(),
     breakStartMins: z.number().int().min(0).max(1439).nullable().optional(),
-    breakDurationMins: z.union([z.literal(30), z.literal(60)]).nullable().optional(),
+    breakDurationMins: z.union([z.literal(30), z.literal(60), z.literal(120)]).nullable().optional(),
   })
   .refine((w) => w.endMins > w.startMins, { message: "endMins must be after startMins" })
   .refine(
@@ -234,7 +234,7 @@ const availabilityWindowSchema = z
     },
     {
       message:
-        "breakStartMins and breakDurationMins (30 or 60) must both be set, and the break must fall inside the window",
+        "breakStartMins and breakDurationMins (30, 60, or 120) must both be set, and the break must fall inside the window",
     },
   );
 
