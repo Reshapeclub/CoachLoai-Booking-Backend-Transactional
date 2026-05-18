@@ -1,6 +1,13 @@
 import { DateTime } from "luxon";
 import { supabaseAdmin } from "../db/supabase.js";
 import { HttpError } from "../lib/http-error.js";
+import {
+  assertBookableStartNotPast,
+  isStartInPast,
+  maxIso,
+  ukBookingNowIso,
+  ukDayBoundsUtcIso,
+} from "../lib/uk-booking-time.js";
 
 function toLondonRotaParts(iso: string): { dayOfWeek: number; minutesFromMidnight: number; weekStartDate: string } {
   const dt = DateTime.fromISO(iso, { zone: "utc" }).setZone("Europe/London");
@@ -129,10 +136,10 @@ export class MeetingService {
     if (typeError) throw new HttpError(500, "Failed to fetch meeting type", typeError);
     if (!meetingType) throw new HttpError(404, "Meeting type not found");
 
-    const dayStart = new Date(`${input.date}T00:00:00.000Z`);
-    if (Number.isNaN(dayStart.getTime())) throw new HttpError(400, "Invalid date, expected YYYY-MM-DD");
-    const dayEnd = new Date(dayStart);
-    dayEnd.setUTCDate(dayEnd.getUTCDate() + 1);
+    const dayBounds = ukDayBoundsUtcIso(input.date);
+    if (!dayBounds) throw new HttpError(400, "Invalid date, expected YYYY-MM-DD");
+    const nowIso = ukBookingNowIso();
+    const queryFrom = maxIso(dayBounds.from, nowIso);
 
     const { data: slots, error: slotError } = await supabaseAdmin
       .from("meeting_slots")
@@ -140,8 +147,8 @@ export class MeetingService {
       .eq("meeting_type_id", input.meetingTypeId)
       .eq("location_id", effectiveLocationId)
       .eq("is_active", true)
-      .gte("slot_start", dayStart.toISOString())
-      .lt("slot_start", dayEnd.toISOString())
+      .gte("slot_start", queryFrom)
+      .lt("slot_start", dayBounds.to)
       .order("slot_start", { ascending: true });
     if (slotError) throw new HttpError(500, "Failed to fetch meeting slots", slotError);
 
@@ -170,15 +177,17 @@ export class MeetingService {
       meetingType,
       locationId: effectiveLocationId,
       date: input.date,
-      slots: slotList.map((slot) => {
-        const bookedCount = bookedCountByStart.get(slot.slot_start) ?? 0;
-        const isOpen = bookedCount < slot.capacity;
-        return {
-          ...slot,
-          bookedCount,
-          status: isOpen ? "open" : "booked",
-        };
-      }),
+      slots: slotList
+        .filter((slot) => !isStartInPast(String(slot.slot_start), nowIso))
+        .map((slot) => {
+          const bookedCount = bookedCountByStart.get(slot.slot_start) ?? 0;
+          const isOpen = bookedCount < slot.capacity;
+          return {
+            ...slot,
+            bookedCount,
+            status: isOpen ? "open" : "booked",
+          };
+        }),
     };
   }
 
@@ -460,7 +469,7 @@ export class MeetingService {
 
     const { data: meetingType, error: typeError } = await supabaseAdmin
       .from("meeting_types")
-      .select("id, duration_mins")
+      .select("id, duration_mins, name")
       .eq("id", input.meetingTypeId)
       .eq("is_active", true)
       .maybeSingle();
@@ -470,6 +479,7 @@ export class MeetingService {
 
     const meetingStartDate = new Date(input.meetingStart);
     if (Number.isNaN(meetingStartDate.getTime())) throw new HttpError(400, "Invalid meetingStart");
+    assertBookableStartNotPast(meetingStartDate.toISOString());
     const meetingEndDate = new Date(
       meetingStartDate.getTime() + (meetingType.duration_mins as number) * 60 * 1000
     );
@@ -508,6 +518,53 @@ export class MeetingService {
       .select()
       .single();
     if (error) throw new HttpError(500, "Failed to create meeting", error);
+
+    const { data: locationRow } = await supabaseAdmin
+      .from("locations")
+      .select("name")
+      .eq("id", effectiveLocationId)
+      .maybeSingle();
+
+    const notificationPayload = {
+      meetingId: data.id,
+      meetingTypeId: input.meetingTypeId,
+      meetingTypeName: (meetingType.name as string) ?? "Meeting",
+      locationId: effectiveLocationId,
+      locationName: (locationRow?.name as string) ?? "",
+      meetingStart: meetingStartDate.toISOString(),
+      meetingEnd: meetingEndDate.toISOString(),
+    };
+
+    const { error: notifyError } = await supabaseAdmin.from("notifications").insert([
+      {
+        member_id: input.memberId,
+        channel: "in_app",
+        type: "meeting_confirmed",
+        payload: notificationPayload,
+      },
+      {
+        member_id: input.memberId,
+        channel: "email",
+        type: "meeting_confirmed",
+        payload: notificationPayload,
+      },
+    ]);
+    if (notifyError) {
+      console.error("[meeting-service] Failed to queue meeting confirmation notifications:", notifyError);
+    }
+
+    await supabaseAdmin.from("audit_logs").insert({
+      actor_type: "member",
+      actor_id: input.memberId,
+      action: "meeting.create",
+      meta: {
+        meetingId: data.id,
+        meetingTypeId: input.meetingTypeId,
+        locationId: effectiveLocationId,
+        meetingStart: meetingStartDate.toISOString(),
+      },
+    });
+
     return data;
   }
 }

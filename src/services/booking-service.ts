@@ -1,5 +1,12 @@
 import { supabaseAdmin } from "../db/supabase.js";
 import { HttpError } from "../lib/http-error.js";
+import {
+  assertBookableStartNotPast,
+  isStartInPast,
+  maxIso,
+  ukBookingNowIso,
+  ukDayBoundsUtcIso,
+} from "../lib/uk-booking-time.js";
 
 export class BookingService {
   private readonly knownSessionAccessCodes = new Set([
@@ -233,17 +240,29 @@ export class BookingService {
     );
 
     const isDateOnly = (v: string) => /^\d{4}-\d{2}-\d{2}$/.test(v);
-    const toStartOfDayUtc = (v: string) => `${v}T00:00:00.000Z`;
-    const toEndOfDayUtc = (v: string) => `${v}T23:59:59.999Z`;
+    const toEndOfDayUtc = (v: string) => {
+      const bounds = ukDayBoundsUtcIso(v);
+      if (bounds) {
+        const end = new Date(bounds.to);
+        end.setMilliseconds(end.getMilliseconds() - 1);
+        return end.toISOString();
+      }
+      return `${v}T23:59:59.999Z`;
+    };
 
-    let effectiveFrom = from ?? new Date().toISOString();
+    const nowIso = ukBookingNowIso();
+    let effectiveFrom = from ?? nowIso;
     let effectiveTo = to;
 
-    if (from && isDateOnly(from)) effectiveFrom = toStartOfDayUtc(from);
+    if (from && isDateOnly(from)) {
+      const bounds = ukDayBoundsUtcIso(from);
+      effectiveFrom = bounds?.from ?? `${from}T00:00:00.000Z`;
+    }
     if (to && isDateOnly(to)) effectiveTo = toEndOfDayUtc(to);
+    effectiveFrom = maxIso(effectiveFrom, nowIso);
     console.log("[getAvailableSessions] window", {
       memberId,
-      now: new Date().toISOString(),
+      now: nowIso,
       from: from ?? null,
       to: to ?? null,
       effectiveFrom,
@@ -340,9 +359,12 @@ export class BookingService {
     if (rejectedDebug.length > 0) {
       console.log("[getAvailableSessions] rejected", rejectedDebug);
     }
-    if (eligibleList.length === 0) return [];
+    const bookableList = eligibleList.filter(
+      (s) => !isStartInPast(String(s.start_at ?? ""), nowIso),
+    );
+    if (bookableList.length === 0) return [];
 
-    const sessionIds = eligibleList.map((s) => s.id);
+    const sessionIds = bookableList.map((s) => s.id);
 
     const [bookedCountsRes, memberBookingsRes, memberCancelledBookingsRes, memberWaitlistRes] = await Promise.all([
       supabaseAdmin.from("bookings").select("session_id").in("session_id", sessionIds).eq("status", "booked"),
@@ -362,7 +384,7 @@ export class BookingService {
     const memberCancelledSessionIds = new Set((memberCancelledBookingsRes.data ?? []).map((r) => (r as { session_id: string }).session_id));
     const memberWaitlistSessionIds = new Set((memberWaitlistRes.data ?? []).map((r) => (r as { session_id: string }).session_id));
 
-    return eligibleList.map((s) => {
+    return bookableList.map((s) => {
       const coachName = s.coaches?.admins?.name ?? null;
       const { coaches, ...rest } = s;
       const bookedCount = bookedBySession.get(s.id) ?? 0;
@@ -463,7 +485,7 @@ export class BookingService {
       this.getMemberAccessProfile(input.memberId),
       supabaseAdmin
         .from("sessions")
-        .select("id, is_online, location_id, training_level, session_types(name, category), locations(name, slug)")
+        .select("id, start_at, is_online, location_id, training_level, session_types(name, category), locations(name, slug)")
         .eq("id", input.sessionId)
         .is("deleted_at", null)
         .single(),
@@ -475,11 +497,15 @@ export class BookingService {
       throw new HttpError(403, "Member is not allowed to book this session");
     }
 
+    const sessionRow = sessionRes.data as { start_at: string };
+    assertBookableStartNotPast(String(sessionRow.start_at ?? ""));
+
+    const nowIso = ukBookingNowIso();
     const { data, error } = await supabaseAdmin.rpc("clm_create_booking", {
       p_member_id: input.memberId,
       p_membership_id: input.membershipId,
       p_session_id: input.sessionId,
-      p_now: new Date().toISOString(),
+      p_now: nowIso,
     });
     if (error) throw new HttpError(422, "Booking failed", error);
     return data;
@@ -500,7 +526,7 @@ export class BookingService {
       this.getMemberAccessProfile(input.memberId),
       supabaseAdmin
         .from("sessions")
-        .select("id, is_online, location_id, training_level, session_types(name, category), locations(name, slug)")
+        .select("id, start_at, is_online, location_id, training_level, session_types(name, category), locations(name, slug)")
         .eq("id", input.sessionId)
         .is("deleted_at", null)
         .single(),
@@ -512,11 +538,15 @@ export class BookingService {
       throw new HttpError(403, "Member is not allowed to join waitlist for this session");
     }
 
+    const sessionRow = sessionRes.data as { start_at: string };
+    assertBookableStartNotPast(String(sessionRow.start_at ?? ""));
+
+    const nowIso = ukBookingNowIso();
     const { data, error } = await supabaseAdmin.rpc("clm_join_waitlist", {
       p_member_id: input.memberId,
       p_membership_id: input.membershipId,
       p_session_id: input.sessionId,
-      p_now: new Date().toISOString(),
+      p_now: nowIso,
     });
     if (error) throw new HttpError(422, "Failed to join waiting list", error);
     return data;
@@ -552,6 +582,7 @@ export class BookingService {
         sessions!inner(id, start_at, end_at, session_type_id, session_types(id, name, color))
       `)
       .eq("member_id", memberId)
+      .neq("status", "cancelled")
       .gte("sessions.start_at", rangeStart.toISOString())
       .lte("sessions.start_at", rangeEnd.toISOString());
     if (bookingsErr) throw new HttpError(500, "Failed to fetch session usage", bookingsErr);

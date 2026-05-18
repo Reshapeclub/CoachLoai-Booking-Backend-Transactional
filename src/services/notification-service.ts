@@ -1,3 +1,4 @@
+import { DateTime } from "luxon";
 import { supabaseAdmin } from "../db/supabase.js";
 import { sendEmail, isEmailConfigured } from "./email-provider.js";
 import { env } from "../config/env.js";
@@ -5,7 +6,25 @@ import { env } from "../config/env.js";
 type NotificationType =
   | "booking_confirmed"
   | "booking_cancelled"
-  | "waitlist_space_available";
+  | "waitlist_space_available"
+  | "meeting_confirmed";
+
+/** Display stored UTC instants in UK local time (GMT/BST), same zone as admin meeting slots. */
+function formatMeetingWhenLondon(startIso: unknown, endIso?: unknown): string {
+  if (typeof startIso !== "string" || !startIso.trim()) return "—";
+  const start = DateTime.fromISO(startIso, { setZone: true }).setZone("Europe/London");
+  if (!start.isValid) return "—";
+  const tzLabel = start.offsetNameShort || "UK";
+  const datePart = start.toFormat("EEE d MMM yyyy");
+  const timePart = start.toFormat("HH:mm");
+  if (typeof endIso === "string" && endIso.trim()) {
+    const end = DateTime.fromISO(endIso, { setZone: true }).setZone("Europe/London");
+    if (end.isValid) {
+      return `${datePart} · ${timePart}–${end.toFormat("HH:mm")} (${tzLabel})`;
+    }
+  }
+  return `${datePart} · ${timePart} (${tzLabel})`;
+}
 
 function buildEmailContent(
   type: NotificationType,
@@ -36,11 +55,32 @@ function buildEmailContent(
     case "waitlist_space_available":
       body = `A space has opened up for a session you were waiting for.\n\nSession ID: ${payload.sessionId ?? "—"}\n\nLog in to book your spot.`;
       break;
+    case "meeting_confirmed": {
+      const meetingName =
+        typeof payload.meetingTypeName === "string" && payload.meetingTypeName.trim()
+          ? payload.meetingTypeName.trim()
+          : "Meeting";
+      const when = formatMeetingWhenLondon(payload.meetingStart, payload.meetingEnd);
+      const locationName =
+        typeof payload.locationName === "string" && payload.locationName.trim()
+          ? payload.locationName.trim()
+          : "";
+      body = `Your ${meetingName} has been booked.\n\nWhen: ${when}${
+        locationName ? `\nLocation: ${locationName}` : ""
+      }\n\nReference: ${payload.meetingId ?? "—"}`;
+      break;
+    }
     default:
       body = JSON.stringify(payload);
   }
+  const subjectByType: Record<NotificationType, string> = {
+    booking_confirmed: "Booking confirmed",
+    booking_cancelled: "Booking cancelled",
+    waitlist_space_available: "Space available on waitlist",
+    meeting_confirmed: "Meeting booked",
+  };
   return {
-    subject: type === "booking_confirmed" ? "Booking confirmed" : type === "booking_cancelled" ? "Booking cancelled" : type === "waitlist_space_available" ? "Space available on waitlist" : "Notification",
+    subject: subjectByType[type as NotificationType] ?? "Notification",
     text: greeting + body,
   };
 }
