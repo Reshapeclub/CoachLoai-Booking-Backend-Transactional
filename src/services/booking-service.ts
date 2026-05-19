@@ -2,8 +2,6 @@ import { supabaseAdmin } from "../db/supabase.js";
 import { HttpError } from "../lib/http-error.js";
 import {
   assertBookableStartNotPast,
-  isStartInPast,
-  maxIso,
   ukBookingNowIso,
   ukDayBoundsUtcIso,
 } from "../lib/uk-booking-time.js";
@@ -259,7 +257,6 @@ export class BookingService {
       effectiveFrom = bounds?.from ?? `${from}T00:00:00.000Z`;
     }
     if (to && isDateOnly(to)) effectiveTo = toEndOfDayUtc(to);
-    effectiveFrom = maxIso(effectiveFrom, nowIso);
     console.log("[getAvailableSessions] window", {
       memberId,
       now: nowIso,
@@ -359,12 +356,9 @@ export class BookingService {
     if (rejectedDebug.length > 0) {
       console.log("[getAvailableSessions] rejected", rejectedDebug);
     }
-    const bookableList = eligibleList.filter(
-      (s) => !isStartInPast(String(s.start_at ?? ""), nowIso),
-    );
-    if (bookableList.length === 0) return [];
+    if (eligibleList.length === 0) return [];
 
-    const sessionIds = bookableList.map((s) => s.id);
+    const sessionIds = eligibleList.map((s) => s.id);
 
     const [bookedCountsRes, memberBookingsRes, memberCancelledBookingsRes, memberWaitlistRes] = await Promise.all([
       supabaseAdmin.from("bookings").select("session_id").in("session_id", sessionIds).eq("status", "booked"),
@@ -384,7 +378,7 @@ export class BookingService {
     const memberCancelledSessionIds = new Set((memberCancelledBookingsRes.data ?? []).map((r) => (r as { session_id: string }).session_id));
     const memberWaitlistSessionIds = new Set((memberWaitlistRes.data ?? []).map((r) => (r as { session_id: string }).session_id));
 
-    return bookableList.map((s) => {
+    return eligibleList.map((s) => {
       const coachName = s.coaches?.admins?.name ?? null;
       const { coaches, ...rest } = s;
       const bookedCount = bookedBySession.get(s.id) ?? 0;

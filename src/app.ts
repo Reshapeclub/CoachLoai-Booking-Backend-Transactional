@@ -34,7 +34,7 @@ cron.schedule("0 2 * * 1", async () => {
 // Notification send: every 30 seconds (email queue)
 cron.schedule("*/30 * * * * *", async () => {
   try {
-    //await runNotificationSend();
+    await runNotificationSend();
     //console.log("[cron] Notification send completed");
   } catch (err) {
     console.error("[cron] Notification send failed:", err);
