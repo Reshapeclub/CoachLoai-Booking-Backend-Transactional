@@ -19,6 +19,75 @@ function toLondonRotaParts(iso: string): { dayOfWeek: number; minutesFromMidnigh
   return { dayOfWeek, minutesFromMidnight, weekStartDate };
 }
 
+type MeetingSlotCoachRow = {
+  meeting_type_id: string;
+  location_id: string;
+  slot_start: string;
+  coach_id: string | null;
+  coaches?: { id?: string; admins?: { name?: string | null; photo_url?: string | null } | null } | null;
+};
+
+function meetingSlotLookupKey(meetingTypeId: string, locationId: string, slotStart: string): string {
+  return `${meetingTypeId}|${locationId}|${slotStart}`;
+}
+
+function coachFieldsFromMeetingSlot(
+  slot: { coach_id?: string | null; coaches?: unknown } | null | undefined,
+): { coach_id: string | null; coach_name: string | null; coach_photo_url: string | null } {
+  if (!slot) {
+    return { coach_id: null, coach_name: null, coach_photo_url: null };
+  }
+  const coaches = slot.coaches as { id?: string; admins?: { name?: string | null; photo_url?: string | null } | Array<{ name?: string | null; photo_url?: string | null }> } | null;
+  const adminsRaw = coaches?.admins;
+  const admin = Array.isArray(adminsRaw) ? adminsRaw[0] : adminsRaw;
+  const coachId = slot.coach_id ? String(slot.coach_id) : coaches?.id ? String(coaches.id) : null;
+  return {
+    coach_id: coachId,
+    coach_name: admin?.name ?? null,
+    coach_photo_url: admin?.photo_url ?? null,
+  };
+}
+
+async function enrichMemberMeetingsWithSlotCoach(
+  rows: Array<Record<string, unknown>>,
+): Promise<Array<Record<string, unknown>>> {
+  if (rows.length === 0) return [];
+
+  const typeIds = [...new Set(rows.map((r) => String(r.meeting_type_id ?? "")).filter(Boolean))];
+  const locIds = [...new Set(rows.map((r) => String(r.location_id ?? "")).filter(Boolean))];
+  const starts = [...new Set(rows.map((r) => String(r.meeting_start ?? "")).filter(Boolean))];
+  if (typeIds.length === 0 || locIds.length === 0 || starts.length === 0) {
+    return rows.map((r) => ({ ...r, coach_id: null, coach_name: null, coach_photo_url: null }));
+  }
+
+  const { data: slots, error } = await supabaseAdmin
+    .from("meeting_slots")
+    .select(
+      "meeting_type_id, location_id, slot_start, coach_id, coaches!meeting_slots_coach_id_fkey(id, admins(name, photo_url))",
+    )
+    .in("meeting_type_id", typeIds)
+    .in("location_id", locIds)
+    .in("slot_start", starts);
+  if (error) throw new HttpError(500, "Failed to fetch meeting slot coaches", error);
+
+  const slotByKey = new Map<string, MeetingSlotCoachRow>();
+  for (const slot of (slots ?? []) as MeetingSlotCoachRow[]) {
+    slotByKey.set(
+      meetingSlotLookupKey(String(slot.meeting_type_id), String(slot.location_id), String(slot.slot_start)),
+      slot,
+    );
+  }
+
+  return rows.map((row) => {
+    const key = meetingSlotLookupKey(
+      String(row.meeting_type_id ?? ""),
+      String(row.location_id ?? ""),
+      String(row.meeting_start ?? ""),
+    );
+    return { ...row, ...coachFieldsFromMeetingSlot(slotByKey.get(key)) };
+  });
+}
+
 type CoachDayAvailabilityRow = {
   start_mins: number;
   end_mins: number;
@@ -631,18 +700,50 @@ export class MeetingService {
     return data ?? [];
   }
 
-  async getEligibility(memberId: string) {
-    const { data, error } = await supabaseAdmin
+  async listMemberMeetings(
+    memberId: string,
+    filters?: {
+      status?: "booked" | "cancelled" | "no_show" | "all";
+      view?: "upcoming" | "past" | "all";
+      from?: string;
+      to?: string;
+    },
+  ) {
+    const view = filters?.view ?? "all";
+    const ascending = view === "past" ? false : true;
+    let query = supabaseAdmin
       .from("track_meetings")
       .select("*, meeting_types(*), locations(*)")
       .eq("member_id", memberId)
-      .order("meeting_start", { ascending: false });
-    if (error) throw new HttpError(500, "Failed to fetch meetings", error);
+      .order("meeting_start", { ascending });
+
+    const status = filters?.status;
+    if (status && status !== "all") {
+      query = query.eq("status", status);
+    }
+
+    const nowIso = new Date().toISOString();
+    if (view === "upcoming") {
+      query = query.eq("status", "booked").gte("meeting_start", nowIso);
+    } else if (view === "past") {
+      query = query.lt("meeting_end", nowIso);
+    }
+
+    if (filters?.from) query = query.gte("meeting_start", filters.from);
+    if (filters?.to) query = query.lte("meeting_start", filters.to);
+
+    const { data, error } = await query;
+    if (error) throw new HttpError(500, "Failed to fetch member meetings", error);
+    return enrichMemberMeetingsWithSlotCoach((data ?? []) as Array<Record<string, unknown>>);
+  }
+
+  async getEligibility(memberId: string) {
+    const history = await this.listMemberMeetings(memberId, { view: "all" });
     return {
       performance: { eligible: true, nextEligibleDate: null },
       pace: { eligible: true, nextEligibleDate: null },
       structure: { eligible: true, nextEligibleDate: null },
-      history: data ?? [],
+      history,
     };
   }
 
@@ -683,7 +784,9 @@ export class MeetingService {
 
     const { data: slot, error: slotError } = await supabaseAdmin
       .from("meeting_slots")
-      .select("id, capacity")
+      .select(
+        "id, capacity, coach_id, coaches!meeting_slots_coach_id_fkey(id, admins(name, photo_url))",
+      )
       .eq("meeting_type_id", input.meetingTypeId)
       .eq("location_id", effectiveLocationId)
       .eq("slot_start", meetingStartDate.toISOString())
@@ -762,6 +865,9 @@ export class MeetingService {
       },
     });
 
-    return data;
+    return {
+      ...data,
+      ...coachFieldsFromMeetingSlot(slot),
+    };
   }
 }

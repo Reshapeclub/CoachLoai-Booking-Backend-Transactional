@@ -271,7 +271,7 @@ begin
   select * into v_session from sessions where id = p_session_id for update;
   if not found then return jsonb_build_object('ok', false, 'message', 'Session not found'); end if;
 
-  if (extract(epoch from (v_session.start_at - p_now)) / 3600.0) <= 12 then
+  if (extract(epoch from (v_session.start_at - p_now)) / 3600.0) <= 24 then
     insert into notifications(member_id, channel, type, payload)
     select w.member_id, 'in_app', 'waitlist_space_available', jsonb_build_object('sessionId', p_session_id)
     from waiting_list_entries w where w.session_id = p_session_id;
@@ -313,7 +313,7 @@ begin
   select * into v_session from sessions where id = v_booking.session_id;
   if not found then raise exception 'Session not found'; end if;
 
-  v_refund := (extract(epoch from (v_session.start_at - p_now)) / 3600.0) >= 12;
+  v_refund := (extract(epoch from (v_session.start_at - p_now)) / 3600.0) >= 24;
   update bookings set status='cancelled', cancelled_at=p_now where id=v_booking.id;
 
   if v_refund then

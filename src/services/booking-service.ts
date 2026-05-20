@@ -6,6 +6,27 @@ import {
   ukDayBoundsUtcIso,
 } from "../lib/uk-booking-time.js";
 
+/** Must match `clm_cancel_booking` refund window (hours before session start). */
+const BOOKING_REFUND_WINDOW_HOURS = 24;
+
+function isLateCancellationBooking(
+  status: string,
+  cancelledAt: string | null | undefined,
+  sessionStartAt: string,
+): boolean {
+  if (status !== "cancelled") return false;
+  const sessionStartMs = new Date(sessionStartAt).getTime();
+  if (!Number.isFinite(sessionStartMs)) return false;
+  if (!cancelledAt) {
+    // Legacy rows without cancelled_at: treat past sessions as lost.
+    return sessionStartMs <= Date.now();
+  }
+  const cancelledMs = new Date(cancelledAt).getTime();
+  if (!Number.isFinite(cancelledMs)) return sessionStartMs <= Date.now();
+  const hoursUntilStart = (sessionStartMs - cancelledMs) / 3_600_000;
+  return hoursUntilStart < BOOKING_REFUND_WINDOW_HOURS;
+}
+
 export class BookingService {
   private readonly knownSessionAccessCodes = new Set([
     "reshape30",
@@ -709,7 +730,7 @@ export class BookingService {
     const [bookingsRes, waitlistRes, tokensRes, membershipRes] = await Promise.all([
       supabaseAdmin
         .from("bookings")
-        .select("id, status, booked_at, session_id, sessions(id, start_at, end_at, session_type_id, session_types(id, name, color)), booking_token_deductions(token_id, token_week_start, tokens(*))")
+        .select("id, status, booked_at, cancelled_at, session_id, sessions(id, start_at, end_at, session_type_id, session_types(id, name, color)), booking_token_deductions(token_id, token_week_start, tokens(*))")
         .eq("member_id", memberId)
         .gte("sessions.start_at", firstMonday.toISOString())
         .lte("sessions.start_at", new Date(lastMonday.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString()),
@@ -769,12 +790,14 @@ export class BookingService {
         const tokenWeekStart = deduction?.token_week_start;
         const sessionDate = s.start_at.split('T')[0];
         let status: any = "attended";
-        if (b.status === "no_show" || (b.status === "cancelled" && !deduction?.tokens)) {
+        if (b.status === "no_show") {
           status = "lost";
         } else if (b.status === "cancelled") {
-          continue;
-        } else if (b.status === "no_show") {
-          status = "lost";
+          if (isLateCancellationBooking(b.status, b.cancelled_at, s.start_at)) {
+            status = "lost";
+          } else {
+            continue;
+          }
         } else if (tokenWeekStart) {
           const tokenWeekStartMs = new Date(String(tokenWeekStart)).getTime();
           if (Number.isFinite(tokenWeekStartMs) && tokenWeekStartMs < wStartMs) status = "rollover_used";

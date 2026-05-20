@@ -7,3 +7,10 @@ export const createMeetingSchema = z.object({
   locationId: z.string().uuid().optional(),
   meetingStart: z.string().datetime(),
 });
+
+export const memberMeetingsQuerySchema = z.object({
+  status: z.enum(["booked", "cancelled", "no_show", "all"]).optional(),
+  view: z.enum(["upcoming", "past", "all"]).optional(),
+  from: z.string().optional(),
+  to: z.string().optional(),
+});

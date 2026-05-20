@@ -2,7 +2,13 @@ import { Router } from "express";
 import { requireAuth } from "../middleware/auth.js";
 import { requireProfileRole } from "../middleware/roles.js";
 import { validate } from "../utils/validate.js";
-import { createBookingSchema, joinWaitlistSchema, purchaseTokensCheckoutSchema, createMeetingSchema } from "../validators/member.schemas.js";
+import {
+  createBookingSchema,
+  joinWaitlistSchema,
+  purchaseTokensCheckoutSchema,
+  createMeetingSchema,
+  memberMeetingsQuerySchema,
+} from "../validators/member.schemas.js";
 import { BookingService } from "../services/booking-service.js";
 import { TokenService } from "../services/token-service.js";
 import { StripeService } from "../services/stripe-service.js";
@@ -55,6 +61,14 @@ router.get('/meetings/availability', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 router.get('/meetings/eligibility', async (req, res, next) => { try { res.json({ ok: true, data: await meetingService.getEligibility(req.user!.id) }); } catch (e) { next(e); } });
+router.get('/meetings', async (req, res, next) => {
+  try {
+    const q = validate(memberMeetingsQuerySchema, req.query);
+    res.json({ ok: true, data: await meetingService.listMemberMeetings(req.user!.id, q) });
+  } catch (e) {
+    next(e);
+  }
+});
 router.post('/meetings', async (req, res, next) => { try { const body = validate(createMeetingSchema, req.body); res.json({ ok: true, data: await meetingService.createMeeting({ memberId: req.user!.id, meetingTypeId: body.meetingTypeId, locationId: body.locationId, meetingStart: body.meetingStart }) }); } catch (e) { next(e); } });
 
 export default router;
