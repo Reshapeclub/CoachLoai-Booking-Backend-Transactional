@@ -3,9 +3,6 @@ import { supabaseAdmin } from "../db/supabase.js";
 import { HttpError } from "../lib/http-error.js";
 import {
   assertBookableStartNotPast,
-  isStartInPast,
-  maxIso,
-  ukBookingNowIso,
   ukDayBoundsUtcIso,
 } from "../lib/uk-booking-time.js";
 
@@ -231,8 +228,6 @@ export class MeetingService {
 
     const dayBounds = ukDayBoundsUtcIso(input.date);
     if (!dayBounds) throw new HttpError(400, "Invalid date, expected YYYY-MM-DD");
-    const nowIso = ukBookingNowIso();
-    const queryFrom = maxIso(dayBounds.from, nowIso);
 
     const { data: slots, error: slotError } = await supabaseAdmin
       .from("meeting_slots")
@@ -240,7 +235,7 @@ export class MeetingService {
       .eq("meeting_type_id", input.meetingTypeId)
       .eq("location_id", effectiveLocationId)
       .eq("is_active", true)
-      .gte("slot_start", queryFrom)
+      .gte("slot_start", dayBounds.from)
       .lt("slot_start", dayBounds.to)
       .order("slot_start", { ascending: true });
     if (slotError) throw new HttpError(500, "Failed to fetch meeting slots", slotError);
@@ -270,9 +265,7 @@ export class MeetingService {
       meetingType,
       locationId: effectiveLocationId,
       date: input.date,
-      slots: slotList
-        .filter((slot) => !isStartInPast(String(slot.slot_start), nowIso))
-        .map((slot) => {
+      slots: slotList.map((slot) => {
           const bookedCount = bookedCountByStart.get(slot.slot_start) ?? 0;
           const isOpen = bookedCount < slot.capacity;
           return {
