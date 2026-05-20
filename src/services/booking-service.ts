@@ -234,30 +234,6 @@ export class BookingService {
     locationId?: string,
     isOnline?: boolean
   ) {
-    const { data: user, error: userError } = await supabaseAdmin.from("profiles").select("*").eq("id", memberId).single();
-    if (userError || !user) throw new HttpError(404, "Member not found");
-
-    // Membership eligibility gating via allowance token types.
-    const { data: activeMembershipId, error: membershipErr } = await supabaseAdmin.rpc(
-      "clm_find_active_membership",
-      { p_member_id: memberId, p_now: new Date().toISOString() }
-    );
-    if (membershipErr) throw new HttpError(500, "Failed to resolve active membership", membershipErr);
-    if (!activeMembershipId) return [];
-
-    const { data: allowanceRows, error: allowanceErr } = await supabaseAdmin
-      .from("membership_session_allowances")
-      .select("token_type_id, weekly_allowance")
-      .eq("membership_id", activeMembershipId)
-      .gt("weekly_allowance", 0);
-    if (allowanceErr) throw new HttpError(500, "Failed to fetch membership allowances", allowanceErr);
-
-    const allowedTokenTypeIds = new Set(
-      (allowanceRows ?? [])
-        .map((r) => (r as { token_type_id?: string }).token_type_id)
-        .filter((v): v is string => Boolean(v))
-    );
-
     const isDateOnly = (v: string) => /^\d{4}-\d{2}-\d{2}$/.test(v);
     const toEndOfDayUtc = (v: string) => {
       const bounds = ukDayBoundsUtcIso(v);
@@ -272,22 +248,64 @@ export class BookingService {
     const nowIso = ukBookingNowIso();
     let effectiveFrom = from ?? nowIso;
     let effectiveTo = to;
-
     if (from && isDateOnly(from)) {
       const bounds = ukDayBoundsUtcIso(from);
       effectiveFrom = bounds?.from ?? `${from}T00:00:00.000Z`;
     }
     if (to && isDateOnly(to)) effectiveTo = toEndOfDayUtc(to);
-    console.log("[getAvailableSessions] window", {
-      memberId,
-      now: nowIso,
-      from: from ?? null,
-      to: to ?? null,
-      effectiveFrom,
-      effectiveTo: effectiveTo ?? null,
-      isOnline: isOnline ?? null,
-      locationId: locationId ?? null,
-    });
+
+    const sessionTypesSelect =
+      "session_types(id, name, category, token_type_id, audience, default_capacity, default_duration_mins, max_per_day, color, category_icon, icon, display_order, is_active)";
+    const sessionsSelect = `*, ${sessionTypesSelect}, locations(name, slug), coaches!sessions_coach_id_fkey(admins(name, photo_url))`;
+
+    const [{ data: user, error: userError }, { data: activeMembershipId, error: membershipErr }, memberAccess] =
+      await Promise.all([
+        supabaseAdmin.from("profiles").select("sex, location_id").eq("id", memberId).single(),
+        supabaseAdmin.rpc("clm_find_active_membership", {
+          p_member_id: memberId,
+          p_now: new Date().toISOString(),
+        }),
+        this.getMemberAccessProfile(memberId),
+      ]);
+
+    if (userError || !user) throw new HttpError(404, "Member not found");
+    if (membershipErr) throw new HttpError(500, "Failed to resolve active membership", membershipErr);
+    if (!activeMembershipId) return [];
+
+    let sessionsQuery = supabaseAdmin
+      .from("sessions")
+      .select(sessionsSelect)
+      .gte("start_at", effectiveFrom)
+      .eq("is_cancelled", false)
+      .is("deleted_at", null)
+      .order("start_at", { ascending: true });
+    if (effectiveTo) sessionsQuery = sessionsQuery.lte("start_at", effectiveTo);
+    if (sessionTypeId) sessionsQuery = sessionsQuery.eq("session_type_id", sessionTypeId);
+    if (isOnline === true) {
+      sessionsQuery = sessionsQuery.eq("is_online", true);
+    } else {
+      sessionsQuery = sessionsQuery.eq("is_online", false);
+      const effectiveLocationId = locationId ?? (user as { location_id?: string | null }).location_id;
+      if (effectiveLocationId) sessionsQuery = sessionsQuery.eq("location_id", effectiveLocationId);
+    }
+
+    const [{ data: allowanceRows, error: allowanceErr }, { data: sessions, error }] = await Promise.all([
+      supabaseAdmin
+        .from("membership_session_allowances")
+        .select("token_type_id, weekly_allowance")
+        .eq("membership_id", activeMembershipId)
+        .gt("weekly_allowance", 0),
+      sessionsQuery,
+    ]);
+
+    if (allowanceErr) throw new HttpError(500, "Failed to fetch membership allowances", allowanceErr);
+    if (error) throw new HttpError(500, "Failed to fetch available sessions", error);
+
+    const allowedTokenTypeIds = new Set(
+      (allowanceRows ?? [])
+        .map((r) => (r as { token_type_id?: string }).token_type_id)
+        .filter((v): v is string => Boolean(v)),
+    );
 
     const normalizedSex = String((user as { sex?: string | null }).sex ?? "")
       .trim()
@@ -297,33 +315,12 @@ export class BookingService {
       allowedAudiences.add(normalizedSex);
     }
 
-    let query = supabaseAdmin
-      .from("sessions")
-      .select("*, session_types(*), locations(name, slug), coaches!sessions_coach_id_fkey(admins(name))")
-      .gte("start_at", effectiveFrom)
-      .eq("is_cancelled", false)
-      .is("deleted_at", null)
-      .order("start_at", { ascending: true });
-    if (effectiveTo) query = query.lte("start_at", effectiveTo);
-    if (sessionTypeId) query = query.eq("session_type_id", sessionTypeId);
-
-    if (isOnline === true) {
-      query = query.eq("is_online", true);
-    } else {
-      query = query.eq("is_online", false);
-      const effectiveLocationId = locationId ?? user.location_id;
-      if (effectiveLocationId) query = query.eq("location_id", effectiveLocationId);
-    }
-
-    const { data: sessions, error } = await query;
-    if (error) throw new HttpError(500, "Failed to fetch available sessions", error);
-    const memberAccess = await this.getMemberAccessProfile(memberId);
-    console.log(memberAccess, "memberAccess");
+    type CoachAdmin = { name?: string | null; photo_url?: string | null };
     const list = (sessions ?? []) as Array<
       Record<string, unknown> & {
         id: string;
         capacity: number;
-        coaches?: { admins?: { name?: string } };
+        coaches?: { admins?: CoachAdmin | CoachAdmin[] };
         session_types?: { token_type_id?: string; audience?: string | null; name?: string | null; category?: string | null } | null;
         locations?: { name?: string | null; slug?: string | null } | null;
         is_online?: boolean | null;
@@ -345,62 +342,80 @@ export class BookingService {
     }> = [];
     const eligibleList = allowedTokenTypeIds.size
       ? list.filter((s) => {
-        const tokenTypeId = s.session_types?.token_type_id;
-        const audience = String(s.session_types?.audience ?? "mixed")
-          .trim()
-          .toLowerCase();
-        const audienceAllowed = allowedAudiences.has(audience || "mixed");
-        const accessDebug = this.getSessionAccessDebug(memberAccess, s);
-        if (!tokenTypeId || !allowedTokenTypeIds.has(String(tokenTypeId))) {
-          rejectedDebug.push({ sessionId: String(s.id), reason: "token" });
-          return false;
-        }
-        if (!audienceAllowed) {
-          rejectedDebug.push({ sessionId: String(s.id), reason: "audience" });
-          return false;
-        }
-        if (accessDebug.reason) {
-          rejectedDebug.push({
-            sessionId: String(s.id),
-            reason: accessDebug.reason,
-            sessionTypeCode: accessDebug.normalized.sessionTypeCode,
-            sessionCategoryCode: accessDebug.normalized.sessionCategoryCode,
-            trainingLevelCode: accessDebug.normalized.trainingLevelCode,
-            locationNameCode: accessDebug.normalized.locationNameCode,
-            locationSlugCode: accessDebug.normalized.locationSlugCode,
-          });
-          return false;
-        }
-        return true;
-      })
+          const tokenTypeId = s.session_types?.token_type_id;
+          const audience = String(s.session_types?.audience ?? "mixed")
+            .trim()
+            .toLowerCase();
+          const audienceAllowed = allowedAudiences.has(audience || "mixed");
+          const accessDebug = this.getSessionAccessDebug(memberAccess, s);
+          if (!tokenTypeId || !allowedTokenTypeIds.has(String(tokenTypeId))) {
+            rejectedDebug.push({ sessionId: String(s.id), reason: "token" });
+            return false;
+          }
+          if (!audienceAllowed) {
+            rejectedDebug.push({ sessionId: String(s.id), reason: "audience" });
+            return false;
+          }
+          if (accessDebug.reason) {
+            rejectedDebug.push({
+              sessionId: String(s.id),
+              reason: accessDebug.reason,
+              sessionTypeCode: accessDebug.normalized.sessionTypeCode,
+              sessionCategoryCode: accessDebug.normalized.sessionCategoryCode,
+              trainingLevelCode: accessDebug.normalized.trainingLevelCode,
+              locationNameCode: accessDebug.normalized.locationNameCode,
+              locationSlugCode: accessDebug.normalized.locationSlugCode,
+            });
+            return false;
+          }
+          return true;
+        })
       : [];
-    if (rejectedDebug.length > 0) {
+    if (rejectedDebug.length > 0 && process.env.NODE_ENV !== "production") {
       console.log("[getAvailableSessions] rejected", rejectedDebug);
     }
     if (eligibleList.length === 0) return [];
 
     const sessionIds = eligibleList.map((s) => s.id);
 
-    const [bookedCountsRes, memberBookingsRes, memberCancelledBookingsRes, memberWaitlistRes] = await Promise.all([
+    const [{ data: bookedRows }, { data: memberBkRows }, { data: wlRows }] = await Promise.all([
       supabaseAdmin.from("bookings").select("session_id").in("session_id", sessionIds).eq("status", "booked"),
-      supabaseAdmin.from("bookings").select("id, session_id").eq("member_id", memberId).eq("status", "booked").in("session_id", sessionIds),
-      supabaseAdmin.from("bookings").select("session_id").eq("member_id", memberId).eq("status", "cancelled").in("session_id", sessionIds),
+      supabaseAdmin
+        .from("bookings")
+        .select("id, session_id, status")
+        .eq("member_id", memberId)
+        .in("session_id", sessionIds)
+        .in("status", ["booked", "cancelled"]),
       supabaseAdmin.from("waiting_list_entries").select("session_id").eq("member_id", memberId).in("session_id", sessionIds),
     ]);
 
     const bookedBySession = new Map<string, number>();
-    for (const row of bookedCountsRes.data ?? []) {
+    for (const row of bookedRows ?? []) {
       const sid = (row as { session_id: string }).session_id;
       bookedBySession.set(sid, (bookedBySession.get(sid) ?? 0) + 1);
     }
-    const memberBookings = (memberBookingsRes.data ?? []) as Array<{ id: string; session_id: string }>;
+    const memberBookings: Array<{ id: string; session_id: string }> = [];
+    const memberCancelledSessionIds = new Set<string>();
+    for (const row of memberBkRows ?? []) {
+      const r = row as { id: string; session_id: string; status: string };
+      if (r.status === "booked") memberBookings.push({ id: r.id, session_id: r.session_id });
+      else if (r.status === "cancelled") memberCancelledSessionIds.add(r.session_id);
+    }
     const memberBookedSessionIds = new Set(memberBookings.map((r) => r.session_id));
     const bookingIdBySession = new Map(memberBookings.map((r) => [r.session_id, r.id]));
-    const memberCancelledSessionIds = new Set((memberCancelledBookingsRes.data ?? []).map((r) => (r as { session_id: string }).session_id));
-    const memberWaitlistSessionIds = new Set((memberWaitlistRes.data ?? []).map((r) => (r as { session_id: string }).session_id));
+    const memberWaitlistSessionIds = new Set((wlRows ?? []).map((r) => (r as { session_id: string }).session_id));
+
+    const coachAdminFromSession = (s: (typeof list)[number]): CoachAdmin | null => {
+      const raw = s.coaches?.admins;
+      if (raw == null) return null;
+      return Array.isArray(raw) ? raw[0] ?? null : raw;
+    };
 
     return eligibleList.map((s) => {
-      const coachName = s.coaches?.admins?.name ?? null;
+      const admin = coachAdminFromSession(s);
+      const coachName = admin?.name != null ? String(admin.name) : null;
+      const photo = admin?.photo_url != null ? String(admin.photo_url).trim() : "";
+      const profileImgUrl = photo.length > 0 ? photo : null;
       const { coaches, ...rest } = s;
       const bookedCount = bookedBySession.get(s.id) ?? 0;
       const isFull = bookedCount >= s.capacity;
@@ -413,6 +428,7 @@ export class BookingService {
         ...rest,
         coach_user_id: s.coach_id,
         coach_name: coachName,
+        profile_img_url: profileImgUrl,
         booked_count: bookedCount,
         status,
         isBookedByMe,
@@ -478,20 +494,28 @@ export class BookingService {
   }
 
   async getSessionDetail(sessionId: string) {
+    const sessionTypesSelect =
+      "session_types(id, name, category, token_type_id, audience, default_capacity, default_duration_mins, max_per_day, color, category_icon, icon, display_order, is_active)";
     const { data, error } = await supabaseAdmin
       .from("sessions")
-      .select("*, session_types(*), coaches!sessions_coach_id_fkey(admins(name))")
+      .select(`*, ${sessionTypesSelect}, coaches!sessions_coach_id_fkey(admins(name, photo_url))`)
       .eq("id", sessionId)
       .is("deleted_at", null)
       .single();
     if (error) throw new HttpError(404, "Session not found", error);
-    const s = data as Record<string, unknown> & { coaches?: { admins?: { name?: string } } };
-    const coachName = s?.coaches?.admins?.name ?? null;
+    type CoachAdmin = { name?: string | null; photo_url?: string | null };
+    const s = data as Record<string, unknown> & { coaches?: { admins?: CoachAdmin | CoachAdmin[] } };
+    const adminsRaw = s?.coaches?.admins;
+    const admin = adminsRaw == null ? null : Array.isArray(adminsRaw) ? adminsRaw[0] ?? null : adminsRaw;
+    const coachName = admin?.name != null ? String(admin.name) : null;
+    const photo = admin?.photo_url != null ? String(admin.photo_url).trim() : "";
+    const profileImgUrl = photo.length > 0 ? photo : null;
     const { coaches, ...rest } = s ?? {};
     return {
       ...rest,
       coach_user_id: (s as { coach_id?: string }).coach_id ?? null,
       coach_name: coachName,
+      profile_img_url: profileImgUrl,
     };
   }
 
