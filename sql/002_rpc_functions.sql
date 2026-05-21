@@ -334,6 +334,118 @@ begin
 end;
 $$;
 
+create or replace function clm_rebook_booking(
+  p_member_id uuid,
+  p_booking_id uuid,
+  p_membership_id uuid,
+  p_now timestamptz default now()
+)
+returns jsonb
+language plpgsql
+as $$
+declare
+  v_booking bookings%rowtype;
+  v_membership member_memberships%rowtype;
+  v_session sessions%rowtype;
+  v_member profiles%rowtype;
+  v_booked_count int;
+  v_current_week timestamptz;
+  v_session_week timestamptz;
+  v_duplicate_count int;
+  v_token_id uuid;
+  v_token_week_start timestamptz;
+  v_horizon timestamptz;
+begin
+  select * into v_booking from bookings where id = p_booking_id and member_id = p_member_id and status = 'cancelled' for update;
+  if not found then raise exception 'Cancelled booking not found'; end if;
+
+  select * into v_membership from member_memberships where id = p_membership_id and member_id = p_member_id for update;
+  if not found then raise exception 'Membership not found'; end if;
+
+  select * into v_session from sessions where id = v_booking.session_id for update;
+  if not found then raise exception 'Session not found'; end if;
+
+  select * into v_member from profiles where id = p_member_id;
+  if not found then raise exception 'Member not found'; end if;
+
+  if exists (
+    select 1 from bookings b
+    where b.member_id = p_member_id and b.session_id = v_session.id and b.status = 'booked' and b.id <> v_booking.id
+  ) then
+    raise exception 'Already booked for this session';
+  end if;
+
+  v_current_week := clm_current_week_start(p_now);
+  v_session_week := clm_current_week_start(v_session.start_at);
+  v_horizon := p_now + interval '28 days';
+
+  if not (p_now >= v_membership.start_date and p_now < v_membership.end_date) then raise exception 'Membership not active'; end if;
+  if v_membership.termination_date is not null and p_now >= v_membership.termination_date then raise exception 'Membership terminated'; end if;
+  if exists (select 1 from membership_pause_weeks mpw where mpw.membership_id = v_membership.id and clm_current_week_start(mpw.week_start) = v_current_week) then raise exception 'Membership paused'; end if;
+  if v_session.start_at >= v_membership.end_date then raise exception 'Cannot book beyond membership end date'; end if;
+  if v_membership.termination_date is not null and v_session.start_at >= v_membership.termination_date then raise exception 'Cannot book beyond termination date'; end if;
+  if exists (select 1 from membership_pause_weeks mpw where mpw.membership_id = v_membership.id and clm_current_week_start(mpw.week_start) = v_session_week) then raise exception 'Cannot book in paused week'; end if;
+  if v_session.start_at > v_horizon then raise exception 'Session beyond booking horizon'; end if;
+  if v_session.start_at <= p_now then raise exception 'Session has already started/completed'; end if;
+  if coalesce(v_session.is_cancelled, false) then raise exception 'Session has been cancelled'; end if;
+
+  if not coalesce(v_session.is_online, false) and v_session.location_id is not null then
+    if not exists (
+      select 1
+      from member_location_access mla
+      where mla.member_id = p_member_id
+        and (
+          lower(regexp_replace(coalesce(mla.location_code, ''), '[^a-z0-9]+', '', 'g'))
+          =
+          lower(regexp_replace(coalesce((select l.slug from locations l where l.id = v_session.location_id), ''), '[^a-z0-9]+', '', 'g'))
+          or
+          lower(regexp_replace(coalesce(mla.location_code, ''), '[^a-z0-9]+', '', 'g'))
+          =
+          lower(regexp_replace(coalesce((select l.name from locations l where l.id = v_session.location_id), ''), '[^a-z0-9]+', '', 'g'))
+        )
+    ) and v_member.location_id is distinct from v_session.location_id then
+      raise exception 'Location mismatch';
+    end if;
+  end if;
+  if not exists (select 1 from membership_session_allowances msa where msa.membership_id = v_membership.id and msa.token_type_id = v_session.token_type_id) then raise exception 'Session not covered by membership allowance'; end if;
+
+  select count(*) into v_duplicate_count
+  from bookings b join sessions s on s.id = b.session_id
+  where b.member_id = p_member_id and b.status = 'booked' and s.start_at = v_session.start_at and b.id <> v_booking.id;
+  if v_duplicate_count > 0 then raise exception 'Duplicate booking at same time'; end if;
+
+  select count(*) into v_booked_count from bookings where session_id = v_session.id and status = 'booked';
+  if v_booked_count >= v_session.capacity then raise exception 'Session full'; end if;
+
+  perform clm_ensure_weekly_tokens_for_membership_week(v_membership.id, v_session_week, p_now);
+  v_token_id := clm_pick_token_id(p_member_id, v_session.token_type_id, p_now, v_session_week);
+  if v_token_id is null then raise exception 'No valid token available'; end if;
+
+  update tokens set quantity = quantity - 1 where id = v_token_id and quantity > 0;
+  if not found then raise exception 'Token deduction failed'; end if;
+
+  update bookings
+  set status = 'booked', cancelled_at = null, booked_at = p_now
+  where id = v_booking.id;
+
+  select week_start into v_token_week_start from tokens where id = v_token_id;
+  insert into booking_token_deductions(booking_id, token_id, token_type_id, quantity, token_week_start)
+  values (v_booking.id, v_token_id, v_session.token_type_id, 1, v_token_week_start);
+
+  delete from waiting_list_entries where session_id = v_session.id and member_id = p_member_id;
+
+  insert into audit_logs(actor_type, actor_id, action, meta)
+  values ('member', p_member_id, 'booking.rebook', jsonb_build_object('bookingId', v_booking.id, 'sessionId', v_session.id));
+
+  insert into notifications(member_id, channel, type, payload)
+  values
+    (p_member_id, 'in_app', 'booking_confirmed', jsonb_build_object('bookingId', v_booking.id, 'sessionId', v_session.id)),
+    (p_member_id, 'email', 'booking_confirmed', jsonb_build_object('bookingId', v_booking.id, 'sessionId', v_session.id));
+
+  return jsonb_build_object('ok', true, 'bookingId', v_booking.id, 'sessionId', v_session.id, 'tokenId', v_token_id, 'tokenWeekStart', v_token_week_start);
+end;
+$$;
+
 create or replace function clm_join_waitlist(p_member_id uuid, p_membership_id uuid, p_session_id uuid, p_now timestamptz default now())
 returns jsonb
 language plpgsql

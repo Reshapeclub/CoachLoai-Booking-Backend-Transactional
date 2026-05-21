@@ -565,46 +565,8 @@ export class BookingService {
     return data;
   }
 
-  /** Rebook the same session after the member cancelled (new booking + token deduction). */
+  /** Rebook the same session after cancel — re-activates the cancelled row (avoids member+session unique constraint). */
   async rebookBooking(input: { bookingId: string; memberId: string; membershipId?: string }) {
-    const { data: booking, error: bookingErr } = await supabaseAdmin
-      .from("bookings")
-      .select("id, status, session_id, sessions(id, start_at, is_cancelled, deleted_at)")
-      .eq("id", input.bookingId)
-      .eq("member_id", input.memberId)
-      .maybeSingle();
-
-    if (bookingErr) throw new HttpError(500, "Failed to load booking", bookingErr);
-    if (!booking) throw new HttpError(404, "Booking not found");
-    if (booking.status !== "cancelled") {
-      throw new HttpError(409, "Only cancelled bookings can be rebooked");
-    }
-
-    const sessionId = String(booking.session_id ?? "");
-    if (!sessionId) throw new HttpError(404, "Session not found");
-
-    const session = booking.sessions as {
-      start_at?: string;
-      is_cancelled?: boolean | null;
-      deleted_at?: string | null;
-    } | null;
-    if (!session) throw new HttpError(404, "Session not found");
-    if (session.deleted_at) throw new HttpError(410, "Session is no longer available");
-    if (session.is_cancelled) throw new HttpError(410, "Session has been cancelled");
-    assertBookableStartNotPast(String(session.start_at ?? ""));
-
-    const { data: activeBooking, error: activeErr } = await supabaseAdmin
-      .from("bookings")
-      .select("id")
-      .eq("member_id", input.memberId)
-      .eq("session_id", sessionId)
-      .eq("status", "booked")
-      .maybeSingle();
-    if (activeErr) throw new HttpError(500, "Failed to check existing booking", activeErr);
-    if (activeBooking) {
-      throw new HttpError(409, "You already have an active booking for this session");
-    }
-
     let membershipId = input.membershipId?.trim();
     if (!membershipId) {
       const nowIso = ukBookingNowIso();
@@ -617,16 +579,18 @@ export class BookingService {
       membershipId = String(activeMembershipId);
     }
 
-    const result = await this.createBooking({
-      memberId: input.memberId,
-      membershipId,
-      sessionId,
+    const { data, error } = await supabaseAdmin.rpc("clm_rebook_booking", {
+      p_member_id: input.memberId,
+      p_booking_id: input.bookingId,
+      p_membership_id: membershipId,
+      p_now: ukBookingNowIso(),
     });
+    if (error) throw new HttpError(422, "Rebook failed", error);
 
     const payload =
-      result && typeof result === "object" && !Array.isArray(result)
-        ? { ...(result as Record<string, unknown>) }
-        : { ok: true, result };
+      data && typeof data === "object" && !Array.isArray(data)
+        ? { ...(data as Record<string, unknown>) }
+        : { ok: true, result: data };
     return { ...payload, rebookedFromBookingId: input.bookingId };
   }
 
