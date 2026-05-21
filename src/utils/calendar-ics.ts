@@ -1,15 +1,20 @@
-function pad(n: number): string {
-  return String(n).padStart(2, "0");
+import { DateTime } from "luxon";
+import { UK_BOOKING_TIMEZONE } from "../lib/uk-booking-time.js";
+
+/** Parse DB timestamptz (UTC instant) the same way as booking emails / admin schedule. */
+function parseStoredInstant(iso: string): DateTime {
+  const dt = DateTime.fromISO(iso, { setZone: true });
+  if (!dt.isValid) throw new Error(`Invalid datetime: ${iso}`);
+  return dt.toUTC();
 }
 
-function toUtcIcsDate(input: string): string {
-  const d = new Date(input);
-  return (
-    `${d.getUTCFullYear()}` +
-    `${pad(d.getUTCMonth() + 1)}` +
-    `${pad(d.getUTCDate())}` +
-    `T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`
-  );
+function toUtcIcsStamp(dt: DateTime): string {
+  return `${dt.toUTC().toFormat("yyyyMMdd'T'HHmmss")}Z`;
+}
+
+/** Wall-clock date/time in Europe/London for DTSTART/DTEND;TZID=… */
+function toLondonIcsLocal(dt: DateTime): string {
+  return dt.setZone(UK_BOOKING_TIMEZONE).toFormat("yyyyMMdd'T'HHmmss");
 }
 
 function escapeIcsText(value: string): string {
@@ -27,9 +32,11 @@ export function buildBookingIcs(params: {
   title: string;
   description?: string;
 }): string {
-  const stamp = toUtcIcsDate(new Date().toISOString());
-  const start = toUtcIcsDate(params.startAt);
-  const end = toUtcIcsDate(params.endAt);
+  const startDt = parseStoredInstant(params.startAt);
+  const endDt = parseStoredInstant(params.endAt);
+  const stamp = toUtcIcsStamp(DateTime.utc());
+  const start = toLondonIcsLocal(startDt);
+  const end = toLondonIcsLocal(endDt);
   const uid = `booking-${params.bookingId}@clm.local`;
   const lines = [
     "BEGIN:VCALENDAR",
@@ -37,11 +44,12 @@ export function buildBookingIcs(params: {
     "PRODID:-//CLM//Booking Calendar//EN",
     "CALSCALE:GREGORIAN",
     "METHOD:PUBLISH",
+    `X-WR-TIMEZONE:${UK_BOOKING_TIMEZONE}`,
     "BEGIN:VEVENT",
     `UID:${uid}`,
     `DTSTAMP:${stamp}`,
-    `DTSTART:${start}`,
-    `DTEND:${end}`,
+    `DTSTART;TZID=${UK_BOOKING_TIMEZONE}:${start}`,
+    `DTEND;TZID=${UK_BOOKING_TIMEZONE}:${end}`,
     `SUMMARY:${escapeIcsText(params.title)}`,
     `DESCRIPTION:${escapeIcsText(params.description ?? "")}`,
     "STATUS:CONFIRMED",

@@ -4,6 +4,7 @@ import { requireProfileRole } from "../middleware/roles.js";
 import { validate } from "../utils/validate.js";
 import {
   createBookingSchema,
+  rebookBookingSchema,
   joinWaitlistSchema,
   purchaseTokensCheckoutSchema,
   createMeetingSchema,
@@ -33,6 +34,20 @@ router.get('/bookings', async (req, res, next) => { try { const status = typeof 
 router.get('/session-usage', async (req, res, next) => { try { const view = req.query.view === 'past' ? 'past' : 'upcoming'; res.json({ ok: true, data: await bookingService.getSessionUsage(req.user!.id, view) }); } catch (e) { next(e); } });
 router.post('/bookings', async (req, res, next) => { try { const body = validate(createBookingSchema, req.body); res.json(await bookingService.createBooking({ memberId: req.user!.id, membershipId: body.membershipId, sessionId: body.sessionId })); } catch (e) { next(e); } });
 router.post('/bookings/:bookingId/cancel', async (req, res, next) => { try { res.json(await bookingService.cancelBooking({ bookingId: req.params.bookingId, memberId: req.user!.id })); } catch (e) { next(e); } });
+router.post('/bookings/:bookingId/rebook', async (req, res, next) => {
+  try {
+    const body = validate(rebookBookingSchema, req.body);
+    res.json(
+      await bookingService.rebookBooking({
+        bookingId: req.params.bookingId,
+        memberId: req.user!.id,
+        membershipId: body.membershipId,
+      }),
+    );
+  } catch (e) {
+    next(e);
+  }
+});
 router.get('/waitlist', async (req, res, next) => { try { res.json({ ok: true, data: await bookingService.getMemberWaitlistEntries(req.user!.id) }); } catch (e) { next(e); } });
 router.post('/waitlist', async (req, res, next) => { try { const body = validate(joinWaitlistSchema, req.body); res.json(await bookingService.joinWaitlist({ memberId: req.user!.id, membershipId: body.membershipId, sessionId: body.sessionId })); } catch (e) { next(e); } });
 router.get('/tokens', async (req, res, next) => { try { res.json({ ok: true, data: await tokenService.getWallet(req.user!.id) }); } catch (e) { next(e); } });
