@@ -25,8 +25,9 @@ function escapeIcsText(value: string): string {
     .replace(/;/g, "\\;");
 }
 
-export function buildBookingIcs(params: {
-  bookingId: string;
+function buildIcsEvent(params: {
+  uid: string;
+  prodId: string;
   startAt: string;
   endAt: string;
   title: string;
@@ -37,11 +38,11 @@ export function buildBookingIcs(params: {
   const stamp = toUtcIcsStamp(DateTime.utc());
   const start = toLondonIcsLocal(startDt);
   const end = toLondonIcsLocal(endDt);
-  const uid = `booking-${params.bookingId}@clm.local`;
+  const uid = params.uid;
   const lines = [
     "BEGIN:VCALENDAR",
     "VERSION:2.0",
-    "PRODID:-//CLM//Booking Calendar//EN",
+    `PRODID:${params.prodId}`,
     "CALSCALE:GREGORIAN",
     "METHOD:PUBLISH",
     `X-WR-TIMEZONE:${UK_BOOKING_TIMEZONE}`,
@@ -58,4 +59,38 @@ export function buildBookingIcs(params: {
     "",
   ].filter(Boolean);
   return lines.join("\r\n");
+}
+
+export function buildBookingIcs(params: {
+  bookingId: string;
+  startAt: string;
+  endAt: string;
+  title: string;
+  description?: string;
+}): string {
+  return buildIcsEvent({
+    uid: `booking-${params.bookingId}@clm.local`,
+    prodId: "-//CLM//Booking Calendar//EN",
+    startAt: params.startAt,
+    endAt: params.endAt,
+    title: params.title,
+    description: params.description,
+  });
+}
+
+export function buildMeetingIcs(params: {
+  meetingId: string;
+  startAt: string;
+  endAt: string;
+  title: string;
+  description?: string;
+}): string {
+  return buildIcsEvent({
+    uid: `meeting-${params.meetingId}@clm.local`,
+    prodId: "-//CLM//Meeting Calendar//EN",
+    startAt: params.startAt,
+    endAt: params.endAt,
+    title: params.title,
+    description: params.description,
+  });
 }

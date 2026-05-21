@@ -26,6 +26,24 @@ function formatMeetingWhenLondon(startIso: unknown, endIso?: unknown): string {
   return `${datePart} · ${timePart} (${tzLabel})`;
 }
 
+function calendarIcsUrl(kind: "booking" | "meeting", id: string): string {
+  const base = env.APP_BASE_URL.replace(/\/$/, "");
+  return `${base}/calendar/${kind}/${encodeURIComponent(id)}.ics`;
+}
+
+function resolveAddToCalendarUrl(
+  payload: Record<string, unknown>,
+  fallback?: { kind: "booking" | "meeting"; id: string },
+): string {
+  const explicit =
+    typeof payload.addToCalendarUrl === "string" && payload.addToCalendarUrl.trim()
+      ? payload.addToCalendarUrl.trim()
+      : "";
+  if (explicit) return explicit;
+  if (!fallback?.id) return "";
+  return calendarIcsUrl(fallback.kind, fallback.id);
+}
+
 function buildEmailContent(
   type: NotificationType,
   payload: Record<string, unknown>,
@@ -34,12 +52,11 @@ function buildEmailContent(
   const name = typeof fullName === "string" && fullName.trim() ? fullName.trim() : "there";
   const greeting = `Hi ${name},\n\n`;
   const bookingId = typeof payload.bookingId === "string" && payload.bookingId.trim() ? payload.bookingId.trim() : "";
-  const addToCalendarUrl =
-    typeof payload.addToCalendarUrl === "string" && payload.addToCalendarUrl.trim()
-      ? payload.addToCalendarUrl.trim()
-      : bookingId
-        ? `${env.APP_BASE_URL.replace(/\/$/, "")}/calendar/booking/${encodeURIComponent(bookingId)}.ics`
-        : "";
+  const meetingId = typeof payload.meetingId === "string" && payload.meetingId.trim() ? payload.meetingId.trim() : "";
+  const addToCalendarUrl = resolveAddToCalendarUrl(
+    payload,
+    bookingId ? { kind: "booking", id: bookingId } : undefined,
+  );
   let body: string;
   switch (type) {
     case "booking_confirmed":
@@ -65,9 +82,15 @@ function buildEmailContent(
         typeof payload.locationName === "string" && payload.locationName.trim()
           ? payload.locationName.trim()
           : "";
+      const meetingCalendarUrl = resolveAddToCalendarUrl(
+        payload,
+        meetingId ? { kind: "meeting", id: meetingId } : undefined,
+      );
       body = `Your ${meetingName} has been booked.\n\nWhen: ${when}${
         locationName ? `\nLocation: ${locationName}` : ""
-      }\n\nReference: ${payload.meetingId ?? "—"}`;
+      }\n\nReference: ${payload.meetingId ?? "—"}${
+        meetingCalendarUrl ? `\n\nAdd to calendar: ${meetingCalendarUrl}` : ""
+      }`;
       break;
     }
     default:
