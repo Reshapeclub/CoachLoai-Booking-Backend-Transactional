@@ -385,7 +385,8 @@ export class BookingService {
         .select("id, session_id, status")
         .eq("member_id", memberId)
         .in("session_id", sessionIds)
-        .in("status", ["booked", "cancelled"]),
+        .in("status", ["booked", "cancelled"])
+        .order("booked_at", { ascending: false }),
       supabaseAdmin.from("waiting_list_entries").select("session_id").eq("member_id", memberId).in("session_id", sessionIds),
     ]);
 
@@ -394,15 +395,18 @@ export class BookingService {
       const sid = (row as { session_id: string }).session_id;
       bookedBySession.set(sid, (bookedBySession.get(sid) ?? 0) + 1);
     }
-    const memberBookings: Array<{ id: string; session_id: string }> = [];
+    const memberBookedSessionIds = new Set<string>();
     const memberCancelledSessionIds = new Set<string>();
+    /** Latest booking id per session (booked_at desc): active or cancelled. */
+    const memberBookingIdBySession = new Map<string, string>();
     for (const row of memberBkRows ?? []) {
       const r = row as { id: string; session_id: string; status: string };
-      if (r.status === "booked") memberBookings.push({ id: r.id, session_id: r.session_id });
+      if (r.status === "booked") memberBookedSessionIds.add(r.session_id);
       else if (r.status === "cancelled") memberCancelledSessionIds.add(r.session_id);
+      if (!memberBookingIdBySession.has(r.session_id)) {
+        memberBookingIdBySession.set(r.session_id, r.id);
+      }
     }
-    const memberBookedSessionIds = new Set(memberBookings.map((r) => r.session_id));
-    const bookingIdBySession = new Map(memberBookings.map((r) => [r.session_id, r.id]));
     const memberWaitlistSessionIds = new Set((wlRows ?? []).map((r) => (r as { session_id: string }).session_id));
 
     const coachAdminFromSession = (s: (typeof list)[number]): CoachAdmin | null => {
@@ -422,7 +426,8 @@ export class BookingService {
       const isBookedByMe = memberBookedSessionIds.has(s.id);
       const isCancelledByMe = memberCancelledSessionIds.has(s.id);
       const isOnWaitlist = memberWaitlistSessionIds.has(s.id);
-      const bookingId = isBookedByMe ? (bookingIdBySession.get(s.id) ?? null) : null;
+      const hasBookedThisSession = memberBookingIdBySession.has(s.id);
+      const bookingId = hasBookedThisSession ? (memberBookingIdBySession.get(s.id) ?? null) : null;
       let status: "open" | "full" | "booked" = isBookedByMe ? "booked" : isFull ? "full" : "open";
       return {
         ...rest,
