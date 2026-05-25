@@ -556,6 +556,49 @@ export class SessionService {
     return { ok: true as const };
   }
 
+  /** Soft-delete future sessions in [from, to] that have not started yet (start_at > now). */
+  async adminBulkDeleteFutureSessions(input: { from: string; to: string; nowIso?: string }) {
+    const nowIso = input.nowIso ?? new Date().toISOString();
+    const nowMs = new Date(nowIso).getTime();
+    const fromMs = new Date(input.from).getTime();
+    const toMs = new Date(input.to).getTime();
+    if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || toMs < fromMs) {
+      throw new HttpError(400, "Invalid from/to range for bulk delete");
+    }
+    const futureFromIso = nowMs >= fromMs ? nowIso : input.from;
+
+    const { data: sessions, error } = await supabaseAdmin
+      .from("sessions")
+      .select("id")
+      .gte("start_at", futureFromIso)
+      .lte("start_at", input.to)
+      .is("deleted_at", null)
+      .order("start_at", { ascending: true });
+    if (error) throw new HttpError(500, "Failed to list sessions for bulk delete", error);
+
+    const deletedIds: string[] = [];
+    const skipped: Array<{ sessionId: string; reason: string }> = [];
+    for (const row of sessions ?? []) {
+      const sessionId = String((row as { id: string }).id ?? "").trim();
+      if (!sessionId) continue;
+      try {
+        await this.adminDeleteSession(sessionId);
+        deletedIds.push(sessionId);
+      } catch (e) {
+        const reason =
+          e instanceof HttpError ? e.message : e instanceof Error ? e.message : "Delete failed";
+        skipped.push({ sessionId, reason });
+      }
+    }
+    return {
+      ok: true as const,
+      deletedCount: deletedIds.length,
+      deletedIds,
+      skippedCount: skipped.length,
+      skipped,
+    };
+  }
+
   /** Clear soft-delete so the session appears on schedules again. */
   async adminRestoreSession(sessionId: string) {
     const { data: row, error: selErr } = await supabaseAdmin

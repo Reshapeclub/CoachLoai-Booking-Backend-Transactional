@@ -55,6 +55,38 @@ begin
 end;
 $$;
 
+create or replace function clm_find_membership_overlapping_window(
+  p_member_id uuid,
+  p_window_start timestamptz,
+  p_window_end timestamptz
+)
+returns uuid
+language plpgsql
+as $$
+declare
+  v_membership_id uuid;
+  v_end timestamptz;
+begin
+  v_end := p_window_end;
+  if v_end is null or v_end <= p_window_start then
+    v_end := p_window_start + interval '28 days';
+  end if;
+
+  select mm.id into v_membership_id
+  from member_memberships mm
+  where mm.member_id = p_member_id
+    and mm.status = 'active'
+    and mm.mode = 'inperson'
+    and mm.start_date < v_end
+    and mm.end_date > p_window_start
+    and (mm.termination_date is null or mm.termination_date > p_window_start)
+  order by mm.created_at desc
+  limit 1;
+
+  return v_membership_id;
+end;
+$$;
+
 create or replace function clm_ensure_weekly_tokens_for_membership_week(
   p_membership_id uuid,
   p_week_start timestamptz,
@@ -71,8 +103,9 @@ begin
   if not found then return; end if;
 
   if v_mm.status <> 'active' then return; end if;
-  if not (p_now >= v_mm.start_date and p_now < v_mm.end_date) then return; end if;
-  if v_mm.termination_date is not null and p_now >= v_mm.termination_date then return; end if;
+  -- Issue tokens for weeks that overlap the membership (not only when p_now is already inside).
+  if not (p_week_start < v_mm.end_date and p_week_start + interval '7 days' > v_mm.start_date) then return; end if;
+  if v_mm.termination_date is not null and p_week_start >= v_mm.termination_date then return; end if;
   if exists (
     select 1 from membership_pause_weeks mpw
     where mpw.membership_id = v_mm.id and clm_current_week_start(mpw.week_start) = clm_current_week_start(p_week_start)
@@ -194,12 +227,11 @@ begin
   v_session_week := clm_current_week_start(v_session.start_at);
   v_horizon := p_now + interval '28 days';
 
-  if not (p_now >= v_membership.start_date and p_now < v_membership.end_date) then raise exception 'Membership not active'; end if;
-  if v_membership.termination_date is not null and p_now >= v_membership.termination_date then raise exception 'Membership terminated'; end if;
-  if exists (select 1 from membership_pause_weeks mpw where mpw.membership_id = v_membership.id and clm_current_week_start(mpw.week_start) = v_current_week) then raise exception 'Membership paused'; end if;
+  if v_session.start_at < v_membership.start_date then raise exception 'Membership not active yet for this session'; end if;
   if v_session.start_at >= v_membership.end_date then raise exception 'Cannot book beyond membership end date'; end if;
   if v_membership.termination_date is not null and v_session.start_at >= v_membership.termination_date then raise exception 'Cannot book beyond termination date'; end if;
   if exists (select 1 from membership_pause_weeks mpw where mpw.membership_id = v_membership.id and clm_current_week_start(mpw.week_start) = v_session_week) then raise exception 'Cannot book in paused week'; end if;
+  if exists (select 1 from membership_pause_weeks mpw where mpw.membership_id = v_membership.id and clm_current_week_start(mpw.week_start) = v_current_week) then raise exception 'Membership paused'; end if;
   if v_session.start_at > v_horizon then raise exception 'Session beyond booking horizon'; end if;
   if v_session.start_at <= p_now then raise exception 'Session has already started/completed'; end if;
   if not coalesce(v_session.is_online, false) and v_session.location_id is not null then
@@ -251,8 +283,8 @@ begin
 
   insert into notifications(member_id, channel, type, payload)
   values
-    (p_member_id, 'in_app', 'booking_confirmed', jsonb_build_object('bookingId', v_booking_id, 'sessionId', v_session.id)),
-    (p_member_id, 'email', 'booking_confirmed', jsonb_build_object('bookingId', v_booking_id, 'sessionId', v_session.id));
+    (p_member_id, 'in_app', 'booking_confirmed', jsonb_build_object('bookingId', v_booking_id, 'sessionId', v_session.id, 'sessionStartAt', v_session.start_at, 'sessionEndAt', v_session.end_at, 'locationName', (select l.name from locations l where l.id = v_session.location_id))),
+    (p_member_id, 'email', 'booking_confirmed', jsonb_build_object('bookingId', v_booking_id, 'sessionId', v_session.id, 'sessionStartAt', v_session.start_at, 'sessionEndAt', v_session.end_at, 'locationName', (select l.name from locations l where l.id = v_session.location_id)));
 
   return jsonb_build_object('ok', true, 'bookingId', v_booking_id, 'sessionId', v_session.id, 'tokenId', v_token_id, 'tokenWeekStart', v_token_week_start);
 end;
@@ -379,12 +411,11 @@ begin
   v_session_week := clm_current_week_start(v_session.start_at);
   v_horizon := p_now + interval '28 days';
 
-  if not (p_now >= v_membership.start_date and p_now < v_membership.end_date) then raise exception 'Membership not active'; end if;
-  if v_membership.termination_date is not null and p_now >= v_membership.termination_date then raise exception 'Membership terminated'; end if;
-  if exists (select 1 from membership_pause_weeks mpw where mpw.membership_id = v_membership.id and clm_current_week_start(mpw.week_start) = v_current_week) then raise exception 'Membership paused'; end if;
+  if v_session.start_at < v_membership.start_date then raise exception 'Membership not active yet for this session'; end if;
   if v_session.start_at >= v_membership.end_date then raise exception 'Cannot book beyond membership end date'; end if;
   if v_membership.termination_date is not null and v_session.start_at >= v_membership.termination_date then raise exception 'Cannot book beyond termination date'; end if;
   if exists (select 1 from membership_pause_weeks mpw where mpw.membership_id = v_membership.id and clm_current_week_start(mpw.week_start) = v_session_week) then raise exception 'Cannot book in paused week'; end if;
+  if exists (select 1 from membership_pause_weeks mpw where mpw.membership_id = v_membership.id and clm_current_week_start(mpw.week_start) = v_current_week) then raise exception 'Membership paused'; end if;
   if v_session.start_at > v_horizon then raise exception 'Session beyond booking horizon'; end if;
   if v_session.start_at <= p_now then raise exception 'Session has already started/completed'; end if;
   if coalesce(v_session.is_cancelled, false) then raise exception 'Session has been cancelled'; end if;
@@ -439,8 +470,8 @@ begin
 
   insert into notifications(member_id, channel, type, payload)
   values
-    (p_member_id, 'in_app', 'booking_confirmed', jsonb_build_object('bookingId', v_booking.id, 'sessionId', v_session.id)),
-    (p_member_id, 'email', 'booking_confirmed', jsonb_build_object('bookingId', v_booking.id, 'sessionId', v_session.id));
+    (p_member_id, 'in_app', 'booking_confirmed', jsonb_build_object('bookingId', v_booking.id, 'sessionId', v_session.id, 'sessionStartAt', v_session.start_at, 'sessionEndAt', v_session.end_at, 'locationName', (select l.name from locations l where l.id = v_session.location_id))),
+    (p_member_id, 'email', 'booking_confirmed', jsonb_build_object('bookingId', v_booking.id, 'sessionId', v_session.id, 'sessionStartAt', v_session.start_at, 'sessionEndAt', v_session.end_at, 'locationName', (select l.name from locations l where l.id = v_session.location_id)));
 
   return jsonb_build_object('ok', true, 'bookingId', v_booking.id, 'sessionId', v_session.id, 'tokenId', v_token_id, 'tokenWeekStart', v_token_week_start);
 end;

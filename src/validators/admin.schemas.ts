@@ -76,6 +76,10 @@ export const setCoachSchema = z.object({
 });
 export const setSessionTypeSchema = z.object({ newSessionTypeId: z.string().min(1) });
 export const refundModeSchema = z.object({ refund: z.enum(["refund", "charge"]) });
+export const bulkDeleteFutureSessionsSchema = z.object({
+  from: z.string().datetime(),
+  to: z.string().datetime(),
+});
 export const adminMoveBookingSchema = z.object({
   targetSessionId: z.string().uuid(),
   overrideEligibility: z.boolean().optional(),
@@ -118,11 +122,48 @@ export const pauseMembershipSchema = z.object({
   startWeek: z.string().datetime(),
   endWeekInclusive: z.string().datetime(),
 });
+/** POST /admin/members/:memberId/membership/pause — dashboard date range or week ISO bounds */
+export const pauseAdminMemberMembershipSchema = z
+  .object({
+    mode: z.enum(["inperson", "remote"]).optional(),
+    start_date: z.string().min(1).optional(),
+    startDate: z.string().min(1).optional(),
+    end_date: z.string().min(1).optional(),
+    endDate: z.string().min(1).optional(),
+    startWeek: z.string().datetime().optional(),
+    endWeekInclusive: z.string().datetime().optional(),
+    sessions_paused: z.boolean().optional(),
+    sessionsPaused: z.boolean().optional(),
+    nutrition_paused: z.boolean().optional(),
+    nutritionPaused: z.boolean().optional(),
+  })
+  .refine(
+    (v) =>
+      Boolean(v.startWeek && v.endWeekInclusive) ||
+      Boolean(
+        (v.start_date || v.startDate) && (v.end_date || v.endDate),
+      ),
+    { message: "Provide start/end dates or startWeek/endWeekInclusive" },
+  );
 export const cancelPauseMembershipSchema = z.object({
   pause_id: z.string().uuid().optional(),
   pauseId: z.string().uuid().optional(),
   reverse_extensions: z.boolean().optional(),
   reverseExtensions: z.boolean().optional(),
+});
+/** POST /admin/members/:memberId/membership/pause/cancel */
+export const cancelAdminMemberMembershipPauseSchema = cancelPauseMembershipSchema.extend({
+  mode: z.enum(["inperson", "remote"]).optional(),
+  start_date: z.string().min(1).optional(),
+  startDate: z.string().min(1).optional(),
+  end_date: z.string().min(1).optional(),
+  endDate: z.string().min(1).optional(),
+  reason: z.string().optional(),
+});
+export const resumeAdminMemberMembershipPauseSchema = z.object({
+  mode: z.enum(["inperson", "remote"]).optional(),
+  pause_id: z.string().uuid().optional(),
+  pauseId: z.string().uuid().optional(),
 });
 export const terminateMembershipSchema = z.object({
   terminationDate: z.string().datetime(),

@@ -13,10 +13,14 @@ import {
   setCoachSchema,
   setSessionTypeSchema,
   refundModeSchema,
+  bulkDeleteFutureSessionsSchema,
   createMembershipSchema,
   updateMembershipSchema,
   pauseMembershipSchema,
+  pauseAdminMemberMembershipSchema,
   cancelPauseMembershipSchema,
+  cancelAdminMemberMembershipPauseSchema,
+  resumeAdminMemberMembershipPauseSchema,
   terminateMembershipSchema,
   issueTokensSchema,
   addMemberSessionTagSchema,
@@ -46,6 +50,7 @@ import {
   createLocationSchema,
   updateLocationSchema,
 } from "../validators/admin.schemas.js";
+import { memberMeetingsQuerySchema } from "../validators/member.schemas.js";
 import { SessionService } from "../services/session-service.js";
 import { CoachService } from "../services/coach-service.js";
 import { MembershipService } from "../services/membership-service.js";
@@ -113,6 +118,14 @@ router.get('/waitlist-entries', async (req, res, next) => {
   }
 });
 router.get('/sessions', async (req, res, next) => { try { const from = typeof req.query.from === 'string' ? req.query.from : undefined; const to = typeof req.query.to === 'string' ? req.query.to : undefined; const includeDeleted = req.query.include_deleted === 'true' || req.query.include_deleted === '1'; res.json({ ok: true, data: await sessionService.listSessions(from, to, { includeDeleted }) }); } catch (e) { next(e); } });
+router.post("/sessions/bulk-delete-future", async (req, res, next) => {
+  try {
+    const body = validate(bulkDeleteFutureSessionsSchema, req.body);
+    res.json({ ok: true, data: await sessionService.adminBulkDeleteFutureSessions(body) });
+  } catch (e) {
+    next(e);
+  }
+});
 router.get('/sessions/:sessionId/members', async (req, res, next) => { try { res.json({ ok: true, data: await sessionService.getSessionMembers(req.params.sessionId) }); } catch (e) { next(e); } });
 router.get('/sessions/:sessionId/waitlist', async (req, res, next) => { try { res.json({ ok: true, data: await bookingService.getSessionWaitlist(req.params.sessionId) }); } catch (e) { next(e); } });
 router.post('/sessions', async (req, res, next) => { try { const body = validate(createSessionSchema, req.body); const { data: st, error } = await supabaseAdmin.from('session_types').select('*').eq('id', body.sessionTypeId).single(); if (error || !st) throw new HttpError(404, 'Session type not found'); const start = new Date(body.start); const end = new Date(start.getTime() + (body.durationMins ?? st.default_duration_mins) * 60 * 1000); const trainingLevel = body.trainingLevel; res.json({ ok: true, data: await sessionService.createSession({ sessionTypeId: body.sessionTypeId, tokenTypeId: body.tokenTypeId ?? st.token_type_id, coachId: body.coachId, locationId: body.locationId ?? null, isOnline: body.isOnline ?? false, startAt: start.toISOString(), endAt: end.toISOString(), capacity: body.capacity ?? st.default_capacity, allowOvertime: body.allowOvertime, trainingLevel }) }); } catch (e) { next(e); } });
@@ -339,6 +352,36 @@ router.patch('/members/:memberId/membership', async (req, res, next) => {
     next(e);
   }
 });
+router.post('/members/:memberId/membership/pause', async (req, res, next) => {
+  try {
+    const { memberId } = validate(z.object({ memberId: z.string().uuid() }), req.params);
+    const body = validate(pauseAdminMemberMembershipSchema, req.body);
+    const data = await membershipService.pauseAdminMemberMembership(memberId, body);
+    res.json({ ok: true, data });
+  } catch (e) {
+    next(e);
+  }
+});
+router.post('/members/:memberId/membership/pause/cancel', async (req, res, next) => {
+  try {
+    const { memberId } = validate(z.object({ memberId: z.string().uuid() }), req.params);
+    const body = validate(cancelAdminMemberMembershipPauseSchema, req.body);
+    const data = await membershipService.cancelAdminMemberMembershipPause(memberId, body);
+    res.json({ ok: true, data });
+  } catch (e) {
+    next(e);
+  }
+});
+router.post('/members/:memberId/membership/pause/resume', async (req, res, next) => {
+  try {
+    const { memberId } = validate(z.object({ memberId: z.string().uuid() }), req.params);
+    const body = validate(resumeAdminMemberMembershipPauseSchema, req.body);
+    const data = await membershipService.resumeAdminMemberMembershipPause(memberId, body);
+    res.json({ ok: true, data });
+  } catch (e) {
+    next(e);
+  }
+});
 router.put('/members/:memberId/membership/access', async (req, res, next) => {
   try {
     const { memberId } = validate(z.object({ memberId: z.string().uuid() }), req.params);
@@ -369,6 +412,15 @@ const putMemberTrainingCurrentHandler = async (req: Request, res: Response, next
 router.put('/members/:memberId/membership/training/current', putMemberTrainingCurrentHandler);
 router.patch('/members/:memberId/membership/training/current', putMemberTrainingCurrentHandler);
 router.post('/members/:memberId/membership/training/current', putMemberTrainingCurrentHandler);
+router.get('/members/:memberId/meetings', async (req, res, next) => {
+  try {
+    const { memberId } = validate(z.object({ memberId: z.string().uuid() }), req.params);
+    const q = validate(memberMeetingsQuerySchema, req.query);
+    res.json({ ok: true, data: await meetingService.listMemberMeetings(memberId, q) });
+  } catch (e) {
+    next(e);
+  }
+});
 router.post('/tokens/issue', async (req, res, next) => { try { const body = validate(issueTokensSchema, req.body); res.json({ ok: true, data: await tokenService.issueAdminTokens({ memberId: body.memberId, tokenTypeId: body.tokenTypeId, quantity: body.quantity, expiryAt: body.expiry, coachId: body.coachId }) }); } catch (e) { next(e); } });
 // Admin token generation routes for testing will be removed later
 router.get('/tokens/generate-weekly', async (req, res, next) => { try { const result = await runWeeklyTokenGeneration(); res.json({ ok: true, data: result }); } catch (e) { next(e); } });

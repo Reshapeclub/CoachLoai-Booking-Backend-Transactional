@@ -59,13 +59,21 @@ function buildEmailContent(
   );
   let body: string;
   switch (type) {
-    case "booking_confirmed":
-      body = `Your booking has been confirmed.\n\nBooking ID: ${payload.bookingId ?? "—"}\nSession ID: ${payload.sessionId ?? "—"}${
+    case "booking_confirmed": {
+      const when = formatMeetingWhenLondon(payload.sessionStartAt, payload.sessionEndAt);
+      const locationName =
+        typeof payload.locationName === "string" && payload.locationName.trim()
+          ? payload.locationName.trim()
+          : "";
+      body = `Your booking has been confirmed.\n\nWhen: ${when}${
+        locationName ? `\nLocation: ${locationName}` : ""
+      }\n\nBooking ID: ${payload.bookingId ?? "—"}\nSession ID: ${payload.sessionId ?? "—"}${
         addToCalendarUrl
-          ? `\n\nAdd to calendar: ${addToCalendarUrl}`
+          ? `\n\nClick link to Add to calendar: ${addToCalendarUrl}`
           : ""
       }`;
       break;
+    }
     case "booking_cancelled":
       body = `Your booking has been cancelled.\n\nBooking ID: ${payload.bookingId ?? "—"}\nRefund applied: ${payload.refundApplied === true ? "Yes" : "No"}${payload.reason ? `\nReason: ${payload.reason}` : ""}`;
       break;
@@ -89,7 +97,7 @@ function buildEmailContent(
       body = `Your ${meetingName} has been booked.\n\nWhen: ${when}${
         locationName ? `\nLocation: ${locationName}` : ""
       }\n\nReference: ${payload.meetingId ?? "—"}${
-        meetingCalendarUrl ? `\n\nAdd to calendar: ${meetingCalendarUrl}` : ""
+        meetingCalendarUrl ? `\n\nClick link to Add to calendar: ${meetingCalendarUrl}` : ""
       }`;
       break;
     }
@@ -147,9 +155,38 @@ export async function processUnsentEmailNotifications(): Promise<number> {
       continue;
     }
 
+    let payload = ((n.payload as Record<string, unknown>) ?? {}) as Record<string, unknown>;
+    if (n.type === "booking_confirmed" && typeof payload.sessionId === "string" && payload.sessionId.trim()) {
+      const hasLocation =
+        typeof payload.locationName === "string" && payload.locationName.trim().length > 0;
+      const needsEnrichment = payload.sessionStartAt == null || !hasLocation;
+      if (needsEnrichment) {
+        const { data: session } = await supabaseAdmin
+          .from("sessions")
+          .select("start_at, end_at, locations(name)")
+          .eq("id", payload.sessionId.trim())
+          .maybeSingle();
+        if (session) {
+          const locationsRaw = (session as { locations?: { name?: string } | { name?: string }[] | null })
+            .locations;
+          const locationRow = Array.isArray(locationsRaw) ? locationsRaw[0] : locationsRaw;
+          const resolvedLocationName =
+            typeof locationRow?.name === "string" && locationRow.name.trim()
+              ? locationRow.name.trim()
+              : "";
+          payload = {
+            ...payload,
+            sessionStartAt: payload.sessionStartAt ?? session.start_at,
+            sessionEndAt: payload.sessionEndAt ?? session.end_at,
+            ...(resolvedLocationName ? { locationName: resolvedLocationName } : {}),
+          };
+        }
+      }
+    }
+
     const { subject, text } = buildEmailContent(
       n.type as NotificationType,
-      (n.payload as Record<string, unknown>) ?? {},
+      payload,
       profile?.full_name
     );
 

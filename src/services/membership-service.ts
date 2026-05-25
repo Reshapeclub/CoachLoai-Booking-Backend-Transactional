@@ -16,11 +16,36 @@ function extractTimeFromIso(iso: string | null | undefined): string {
   if (!iso) return "";
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "";
-  const h = d.getHours();
-  const m = d.getMinutes();
-  const hour12 = h % 12 || 12;
-  const ampm = h >= 12 ? "PM" : "AM";
-  return `${hour12}:${String(m).padStart(2, "0")} ${ampm}`;
+  return d.toLocaleTimeString("en-GB", {
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+    timeZone: "Europe/London",
+  });
+}
+
+function unwrapJoinedRow<T extends Record<string, unknown>>(value: T | T[] | null | undefined): T | null {
+  if (!value) return null;
+  return Array.isArray(value) ? (value[0] ?? null) : value;
+}
+
+function coachNameFromSession(session: Record<string, unknown> | null): string {
+  if (!session) return "";
+  const coaches = unwrapJoinedRow(
+    session.coaches as Record<string, unknown> | Record<string, unknown>[] | null | undefined,
+  );
+  if (!coaches) return "";
+  const adminsRaw = coaches.admins;
+  const admin = Array.isArray(adminsRaw) ? adminsRaw[0] : adminsRaw;
+  return String((admin as { name?: string } | undefined)?.name ?? "").trim();
+}
+
+function locationNameFromSession(session: Record<string, unknown> | null): string {
+  if (!session) return "";
+  const location = unwrapJoinedRow(
+    session.locations as Record<string, unknown> | Record<string, unknown>[] | null | undefined,
+  );
+  return String(location?.name ?? "").trim();
 }
 
 function normalizeDashboardMode(value: string | undefined): MembershipMode {
@@ -81,6 +106,23 @@ function parseCalendarDateToStartIso(dateStr: string): string {
   return new Date(
     Date.UTC(t.getUTCFullYear(), t.getUTCMonth(), t.getUTCDate(), 0, 0, 0, 0),
   ).toISOString();
+}
+
+/** Monday 00:00 UTC — matches `clm_current_week_start` in SQL. */
+function currentWeekStartFromInstant(iso: string): string {
+  const t = new Date(iso);
+  if (Number.isNaN(t.getTime())) throw new HttpError(400, "Invalid datetime");
+  const day = new Date(
+    Date.UTC(t.getUTCFullYear(), t.getUTCMonth(), t.getUTCDate(), 0, 0, 0, 0),
+  );
+  const dow = day.getUTCDay();
+  const mondayOffset = dow === 0 ? -6 : 1 - dow;
+  day.setUTCDate(day.getUTCDate() + mondayOffset);
+  return day.toISOString();
+}
+
+function weekStartFromDateYmd(dateYmd: string): string {
+  return currentWeekStartFromInstant(parseCalendarDateToStartIso(dateYmd));
 }
 
 function parseCalendarDateToEndIso(dateStr: string): string {
@@ -300,6 +342,8 @@ export class MembershipService {
     membershipId: string;
     pauseId?: string;
     reverseExtensions?: boolean;
+    startWeek?: string;
+    endWeekInclusive?: string;
   }) {
     const reverseExtensions = input.reverseExtensions !== false;
     const { data: membership, error: membershipErr } = await supabaseAdmin
@@ -311,7 +355,18 @@ export class MembershipService {
     if (!membership) throw new HttpError(404, "Membership not found");
 
     let pauseRowIds: string[] = [];
-    if (input.pauseId) {
+    if (input.startWeek && input.endWeekInclusive) {
+      const startWeek = currentWeekStartFromInstant(input.startWeek);
+      const endWeek = currentWeekStartFromInstant(input.endWeekInclusive);
+      const { data: rangeRows, error: rangeErr } = await supabaseAdmin
+        .from("membership_pause_weeks")
+        .select("id")
+        .eq("membership_id", input.membershipId)
+        .gte("week_start", startWeek)
+        .lte("week_start", endWeek);
+      if (rangeErr) throw new HttpError(500, "Failed to load pauses in date range", rangeErr);
+      pauseRowIds = (rangeRows ?? []).map((row) => String((row as { id: string }).id));
+    } else if (input.pauseId) {
       const { data: pauseRow, error: pauseErr } = await supabaseAdmin
         .from("membership_pause_weeks")
         .select("id")
@@ -390,6 +445,206 @@ export class MembershipService {
       reversedDays,
       isPaused: hasRemainingPause,
       endDate: nextEndDate || currentEndDate || null,
+    };
+  }
+
+  async #resolveDashboardMembership(
+    memberId: string,
+    modeInput?: string,
+  ): Promise<MembershipRow> {
+    const { data: profile, error: profileErr } = await supabaseAdmin
+      .from("profiles")
+      .select("id")
+      .eq("id", memberId)
+      .maybeSingle();
+    if (profileErr) throw new HttpError(500, "Failed to verify member", profileErr);
+    if (!profile) throw new HttpError(404, "Member not found");
+
+    const mode = normalizeDashboardMode(modeInput);
+    const { data: membershipRows, error: mmErr } = await supabaseAdmin
+      .from("member_memberships")
+      .select("*")
+      .eq("member_id", memberId);
+    if (mmErr) throw new HttpError(500, "Failed to load memberships", mmErr);
+    const rows = (membershipRows ?? []) as MembershipRow[];
+    const membership =
+      rows.find((r) => r.mode === mode) ??
+      rows.find((r) => r.status === "active") ??
+      rows[0] ??
+      null;
+    if (!membership) {
+      throw new HttpError(404, "Membership not found for member");
+    }
+    return membership;
+  }
+
+  async pauseAdminMemberMembership(
+    memberId: string,
+    body: Record<string, unknown>,
+  ) {
+    const membership = await this.#resolveDashboardMembership(
+      memberId,
+      typeof body.mode === "string" ? body.mode : undefined,
+    );
+
+    const startWeekRaw =
+      (typeof body.startWeek === "string" && body.startWeek) ||
+      (typeof body.start_week === "string" && body.start_week) ||
+      "";
+    const endWeekRaw =
+      (typeof body.endWeekInclusive === "string" && body.endWeekInclusive) ||
+      (typeof body.end_week_inclusive === "string" && body.end_week_inclusive) ||
+      "";
+
+    const startDateYmd =
+      (typeof body.start_date === "string" && body.start_date) ||
+      (typeof body.startDate === "string" && body.startDate) ||
+      "";
+    const endDateYmd =
+      (typeof body.end_date === "string" && body.end_date) ||
+      (typeof body.endDate === "string" && body.endDate) ||
+      "";
+
+    const startWeek = startWeekRaw
+      ? currentWeekStartFromInstant(startWeekRaw)
+      : startDateYmd
+        ? weekStartFromDateYmd(startDateYmd)
+        : "";
+    const endWeekInclusive = endWeekRaw
+      ? currentWeekStartFromInstant(endWeekRaw)
+      : endDateYmd
+        ? weekStartFromDateYmd(endDateYmd)
+        : "";
+    if (!startWeek || !endWeekInclusive) {
+      throw new HttpError(400, "Pause requires start and end dates");
+    }
+    if (startWeek > endWeekInclusive) {
+      throw new HttpError(400, "Pause start must be on or before pause end");
+    }
+
+    const rpcResult = await this.pauseMembership({
+      membershipId: membership.id,
+      startWeek,
+      endWeekInclusive,
+    });
+
+    const { data: pauseWeeks, error: pauseErr } = await supabaseAdmin
+      .from("membership_pause_weeks")
+      .select("id, week_start")
+      .eq("membership_id", membership.id)
+      .gte("week_start", startWeek)
+      .lte("week_start", endWeekInclusive)
+      .order("week_start", { ascending: true });
+    if (pauseErr) throw new HttpError(500, "Failed to load pause weeks after apply", pauseErr);
+
+    const weekRows = (pauseWeeks ?? []) as Array<{ id: string; week_start: string }>;
+    const pauseIds = weekRows.map((row) => String(row.id));
+    const primaryPauseId = pauseIds[0] ?? "";
+    const rangeStart = toDateOnly(startWeek);
+    const lastWeekStart = weekRows.length
+      ? weekRows[weekRows.length - 1].week_start
+      : endWeekInclusive;
+    const rangeEndMs = new Date(lastWeekStart).getTime() + 6 * 86400000;
+    const rangeEnd = toDateOnly(new Date(rangeEndMs).toISOString());
+    const insertedWeeks = Math.max(
+      0,
+      Number((rpcResult as { insertedWeeks?: number }).insertedWeeks ?? pauseIds.length),
+    );
+
+    return {
+      ok: true,
+      pause: {
+        id: primaryPauseId,
+        pauseId: primaryPauseId,
+        pause_id: primaryPauseId,
+        pauseIds,
+        startDate: rangeStart,
+        start_date: rangeStart,
+        endDate: rangeEnd,
+        end_date: rangeEnd,
+        weeks: insertedWeeks || pauseIds.length || 1,
+        insertedWeeks,
+        cancelledBookings: Number(
+          (rpcResult as { cancelledBookings?: number }).cancelledBookings ?? 0,
+        ),
+        newEndDate: (rpcResult as { newEndDate?: string }).newEndDate ?? null,
+      },
+      current: {
+        id: primaryPauseId,
+        pauseId: primaryPauseId,
+        pause_id: primaryPauseId,
+        startDate: rangeStart,
+        start_date: rangeStart,
+        endDate: rangeEnd,
+        end_date: rangeEnd,
+      },
+      membership: {
+        id: membership.id,
+        isPaused: true,
+        is_paused: true,
+      },
+    };
+  }
+
+  async cancelAdminMemberMembershipPause(
+    memberId: string,
+    body: Record<string, unknown>,
+  ) {
+    const membership = await this.#resolveDashboardMembership(
+      memberId,
+      typeof body.mode === "string" ? body.mode : undefined,
+    );
+
+    const pauseId =
+      (typeof body.pause_id === "string" && body.pause_id) ||
+      (typeof body.pauseId === "string" && body.pauseId) ||
+      undefined;
+    const startDateYmd =
+      (typeof body.start_date === "string" && body.start_date) ||
+      (typeof body.startDate === "string" && body.startDate) ||
+      "";
+    const endDateYmd =
+      (typeof body.end_date === "string" && body.end_date) ||
+      (typeof body.endDate === "string" && body.endDate) ||
+      "";
+
+    const uuidRe =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const validPauseId = pauseId && uuidRe.test(pauseId) ? pauseId : undefined;
+
+    const result = await this.cancelMembershipPause({
+      membershipId: membership.id,
+      pauseId: validPauseId,
+      reverseExtensions:
+        body.reverse_extensions !== false && body.reverseExtensions !== false,
+      startWeek: startDateYmd ? weekStartFromDateYmd(startDateYmd) : undefined,
+      endWeekInclusive: endDateYmd ? weekStartFromDateYmd(endDateYmd) : undefined,
+    });
+
+    return {
+      ...result,
+      membership: {
+        id: membership.id,
+        isPaused: result.isPaused,
+        is_paused: result.isPaused,
+      },
+    };
+  }
+
+  async resumeAdminMemberMembershipPause(
+    memberId: string,
+    body: Record<string, unknown>,
+  ) {
+    const membership = await this.#resolveDashboardMembership(
+      memberId,
+      typeof body.mode === "string" ? body.mode : undefined,
+    );
+    const data = await this.resumeMembership(membership.id);
+    return {
+      ok: true,
+      membership: data,
+      isPaused: false,
+      is_paused: false,
     };
   }
 
@@ -564,6 +819,7 @@ export class MembershipService {
         : null;
 
     let pauseHistory: Array<Record<string, unknown>> = [];
+    let activePause: Record<string, unknown> | null = null;
     if (membership) {
       const { data: pauseWeeks, error: pErr } = await supabaseAdmin
         .from("membership_pause_weeks")
@@ -571,13 +827,15 @@ export class MembershipService {
         .eq("membership_id", membership.id)
         .order("week_start", { ascending: true });
       if (pErr) throw new HttpError(500, "Failed to load membership pauses", pErr);
-      pauseHistory = (pauseWeeks ?? []).map((pw) => {
-        const p = pw as { id: string; week_start: string };
-        const start = toDateOnly(p.week_start);
-        const endMs = new Date(p.week_start).getTime() + 6 * 86400000;
+      const weekRows = (pauseWeeks ?? []) as Array<{ id: string; week_start: string }>;
+      pauseHistory = weekRows.map((pw) => {
+        const start = toDateOnly(pw.week_start);
+        const endMs = new Date(pw.week_start).getTime() + 6 * 86400000;
         const endStr = toDateOnly(new Date(endMs).toISOString());
         return {
-          id: p.id,
+          id: pw.id,
+          pauseId: pw.id,
+          pause_id: pw.id,
           startDate: start,
           start_date: start,
           endDate: endStr,
@@ -591,14 +849,42 @@ export class MembershipService {
           nutrition_paused: true,
         };
       });
+      if (weekRows.length > 0) {
+        const first = weekRows[0];
+        const last = weekRows[weekRows.length - 1];
+        const rangeEndMs = new Date(last.week_start).getTime() + 6 * 86400000;
+        activePause = {
+          id: first.id,
+          pauseId: first.id,
+          pause_id: first.id,
+          startDate: toDateOnly(first.week_start),
+          start_date: toDateOnly(first.week_start),
+          endDate: toDateOnly(new Date(rangeEndMs).toISOString()),
+          end_date: toDateOnly(new Date(rangeEndMs).toISOString()),
+          weeks: weekRows.length,
+        };
+      }
     }
 
     const now = Date.now();
     const mapBookingRow = (b: Record<string, unknown>) => {
-      const sessions = b.sessions as Record<string, unknown> | null | undefined;
-      const st = sessions?.session_types as { name?: string; category?: string } | undefined;
-      const startAt = sessions?.start_at as string | undefined;
+      const session = unwrapJoinedRow(
+        b.sessions as Record<string, unknown> | Record<string, unknown>[] | null | undefined,
+      );
+      const st = unwrapJoinedRow(
+        session?.session_types as
+          | { name?: string; category?: string }
+          | Array<{ name?: string; category?: string }>
+          | null
+          | undefined,
+      );
+      const category = String(st?.category ?? "").trim();
+      const sessionName = String(st?.name ?? "").trim();
+      const allocKey = categoryToSessionAllocKey(category);
+      const startAt = String(session?.start_at ?? b.booked_at ?? "").trim() || undefined;
       const date = toDateOnly(startAt);
+      const coachName = coachNameFromSession(session);
+      const locationName = locationNameFromSession(session);
       return {
         id: String(b.id ?? ""),
         sessionDate: date,
@@ -607,29 +893,63 @@ export class MembershipService {
         sessionTime: extractTimeFromIso(startAt),
         session_time: extractTimeFromIso(startAt),
         time: extractTimeFromIso(startAt),
-        sessionType: st?.name ?? st?.category ?? "",
-        session_type: st?.name ?? st?.category ?? "",
-        type: st?.name ?? st?.category ?? "",
-        coachName: "",
-        coach_name: "",
-        coach: "",
+        sessionType: sessionName || category || allocKey || "",
+        session_type: sessionName || category || allocKey || "",
+        sessionTypeLabel: sessionName || category || "Session",
+        session_type_label: sessionName || category || "Session",
+        type: allocKey ?? "group",
+        coachName,
+        coach_name: coachName,
+        coach: coachName,
+        location: locationName,
+        locationName,
         status: String(b.status ?? "booked"),
         mood: "",
         intensity: null as number | null,
         notes: "",
+        sortAt: startAt ?? "",
       };
     };
+
+    const sortBySessionStart = (
+      rows: Array<ReturnType<typeof mapBookingRow>>,
+      direction: "asc" | "desc",
+    ) =>
+      [...rows].sort((a, b) => {
+        const aMs = new Date(String(a.sortAt || `${a.date}T00:00:00`)).getTime();
+        const bMs = new Date(String(b.sortAt || `${b.date}T00:00:00`)).getTime();
+        if (!Number.isFinite(aMs) && !Number.isFinite(bMs)) return 0;
+        if (!Number.isFinite(aMs)) return 1;
+        if (!Number.isFinite(bMs)) return -1;
+        return direction === "asc" ? aMs - bMs : bMs - aMs;
+      });
 
     const booked: ReturnType<typeof mapBookingRow>[] = [];
     const historySessions: ReturnType<typeof mapBookingRow>[] = [];
     for (const b of bookingRows) {
+      const session = unwrapJoinedRow(
+        b.sessions as Record<string, unknown> | Record<string, unknown>[] | null | undefined,
+      );
+      if (!session?.start_at) continue;
+
       const row = mapBookingRow(b);
+      if (!row.date) continue;
+
       const status = String((b as { status?: string }).status ?? "");
-      const sessions = (b as { sessions?: { start_at?: string } }).sessions;
-      const startMs = sessions?.start_at ? new Date(sessions.start_at).getTime() : 0;
-      const isPast = startMs > 0 && startMs < now;
-      if (status === "booked" && !isPast) booked.push(row);
-      else historySessions.push(row);
+      const startMs = new Date(String(session.start_at)).getTime();
+      const isPast = Number.isFinite(startMs) && startMs < now;
+
+      if (status === "booked" && !isPast) {
+        booked.push(row);
+        continue;
+      }
+
+      if (status === "booked" && isPast) {
+        historySessions.push({ ...row, status: "completed" });
+        continue;
+      }
+
+      historySessions.push(row);
     }
 
     const { data: locationAccessRows, error: locationAccessErr } = await supabaseAdmin
@@ -681,8 +1001,8 @@ export class MembershipService {
         pauseHistory,
         planPaused: Boolean(membership?.is_paused),
         is_paused: Boolean(membership?.is_paused),
-        current: null,
-        active: null,
+        current: activePause,
+        active: activePause,
       },
       gifts: giftList,
       access: {
@@ -694,8 +1014,8 @@ export class MembershipService {
         session_access: sessionAccess,
       },
       sessions: {
-        booked,
-        history: historySessions,
+        booked: sortBySessionStart(booked, "asc"),
+        history: sortBySessionStart(historySessions, "desc"),
       },
       injuries: [] as unknown[],
       history: syntheticHistory,

@@ -46,7 +46,7 @@ function getTransporter(cfg: SmtpConfig): nodemailer.Transporter {
 }
 
 /** Default From for transactional mail (Gmail requires the authenticated mailbox). */
-export function defaultSmtpFrom(cfg: SmtpConfig, displayName = "CoachLo"): string {
+export function defaultSmtpFrom(cfg: SmtpConfig, displayName = "CoachLoai"): string {
   const customFrom = process.env.EMAIL_FROM?.trim();
   if (customFrom && customFrom !== "noreply@example.com") {
     return customFrom.includes("<") ? customFrom : `"${displayName}" <${customFrom}>`;

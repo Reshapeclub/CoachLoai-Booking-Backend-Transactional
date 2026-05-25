@@ -38,11 +38,46 @@ export class BookingService {
     "abset",
   ]);
 
+  /** Codes saved on `member_training_levels.level_code` (admin Member > Sessions). */
+  private readonly memberTrainingLevelCodes = new Set([
+    "mastery",
+    "beast",
+    "charged",
+    "noncharged",
+    "culture",
+    "skill",
+    "pwr",
+  ]);
+
   private normalizeAccessCode(value: unknown): string {
     return String(value ?? "")
       .trim()
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, "");
+  }
+
+  /** Resolve membership for a browse window (supports future membership start dates). */
+  private async findMembershipForWindow(
+    memberId: string,
+    windowStartIso: string,
+    windowEndIso?: string,
+  ): Promise<string | null> {
+    const startMs = new Date(windowStartIso).getTime();
+    const endMs = windowEndIso ? new Date(windowEndIso).getTime() : NaN;
+    const windowEnd =
+      windowEndIso && Number.isFinite(endMs)
+        ? windowEndIso
+        : new Date(
+            (Number.isFinite(startMs) ? startMs : Date.now()) + 28 * 86400000,
+          ).toISOString();
+
+    const { data, error } = await supabaseAdmin.rpc("clm_find_membership_overlapping_window", {
+      p_member_id: memberId,
+      p_window_start: windowStartIso,
+      p_window_end: windowEnd,
+    });
+    if (error) throw new HttpError(500, "Failed to resolve membership for window", error);
+    return data ? String(data) : null;
   }
 
   private async getMemberAccessProfile(memberId: string): Promise<{
@@ -89,6 +124,48 @@ export class BookingService {
     };
   }
 
+  /**
+   * Map `sessions.training_level` and session type labels to member level codes.
+   * Schedule often stores Elite/Octave levels as session-type titles (e.g. "Mastery"), not ids.
+   */
+  private resolveSessionTrainingLevelCodes(session: {
+    training_level?: string | null;
+    session_types?: { name?: string | null; category?: string | null } | Array<{ name?: string | null; category?: string | null }> | null;
+  }): Set<string> {
+    const sessionType = Array.isArray(session.session_types)
+      ? session.session_types[0]
+      : session.session_types;
+    const rawLevel = this.normalizeAccessCode(session.training_level);
+    const typeName = this.normalizeAccessCode(sessionType?.name);
+    const codes = new Set<string>();
+
+    // Row-level level (e.g. charged / noncharged) is authoritative — avoid substring false positives.
+    if (rawLevel && this.memberTrainingLevelCodes.has(rawLevel)) {
+      codes.add(rawLevel);
+      return codes;
+    }
+
+    const sortedCodes = [...this.memberTrainingLevelCodes].sort((a, b) => b.length - a.length);
+    for (const hay of [rawLevel, typeName].filter(Boolean)) {
+      for (const code of sortedCodes) {
+        if (hay === code) {
+          codes.add(code);
+          break;
+        }
+        if (!hay.includes(code)) continue;
+        const hasLongerMatch = sortedCodes.some(
+          (longer) => longer.length > code.length && hay.includes(longer),
+        );
+        if (!hasLongerMatch) {
+          codes.add(code);
+          break;
+        }
+      }
+    }
+
+    return codes;
+  }
+
   private isSessionAllowedForMember(
     access: { locationCodes: Set<string>; trainingLevels: Set<string>; sessionAccess: Set<string> },
     session: {
@@ -132,11 +209,17 @@ export class BookingService {
       }
     }
 
-    // Training level access: if session has a level and member has allowed list, it must include it.
-    // Exception: 1:1 sessions and Elite category sessions bypass training level gating.
-    const bypassTrainingLevelCheck = sessionTypeCode === "1:1" || sessionCategoryCode === "elite";
-    if (!bypassTrainingLevelCheck && trainingLevelCode && access.trainingLevels.size > 0 && !access.trainingLevels.has(trainingLevelCode)) {
-      return { reason: "training_level", normalized: { sessionTypeCode, sessionCategoryCode, trainingLevelCode, locationNameCode, locationSlugCode } };
+    // Training level: when member has an allow-list in DB, session must map to at least one allowed code.
+    // 1:1 sessions are exempt. Elite/Octave/Group use charged/noncharged or level names on the session row.
+    const bypassTrainingLevelCheck = sessionTypeCode === "11" || sessionCategoryCode === "11";
+    if (!bypassTrainingLevelCheck && access.trainingLevels.size > 0) {
+      const sessionLevelCodes = this.resolveSessionTrainingLevelCodes(session);
+      const levelAllowed =
+        sessionLevelCodes.size > 0 &&
+        [...sessionLevelCodes].some((code) => access.trainingLevels.has(code));
+      if (!levelAllowed) {
+        return { reason: "training_level", normalized: { sessionTypeCode, sessionCategoryCode, trainingLevelCode, locationNameCode, locationSlugCode } };
+      }
     }
 
     // Session access: if member has list, session name/category must map to one of allowed codes.
@@ -254,22 +337,21 @@ export class BookingService {
     }
     if (to && isDateOnly(to)) effectiveTo = toEndOfDayUtc(to);
 
+    const membershipWindowEnd =
+      effectiveTo ??
+      new Date(new Date(effectiveFrom).getTime() + 28 * 86400000).toISOString();
+
     const sessionTypesSelect =
       "session_types(id, name, category, token_type_id, audience, default_capacity, default_duration_mins, max_per_day, color, category_icon, icon, display_order, is_active)";
     const sessionsSelect = `*, ${sessionTypesSelect}, locations(name, slug), coaches!sessions_coach_id_fkey(admins(name, photo_url))`;
 
-    const [{ data: user, error: userError }, { data: activeMembershipId, error: membershipErr }, memberAccess] =
-      await Promise.all([
-        supabaseAdmin.from("profiles").select("sex, location_id").eq("id", memberId).single(),
-        supabaseAdmin.rpc("clm_find_active_membership", {
-          p_member_id: memberId,
-          p_now: new Date().toISOString(),
-        }),
-        this.getMemberAccessProfile(memberId),
-      ]);
+    const [{ data: user, error: userError }, activeMembershipId, memberAccess] = await Promise.all([
+      supabaseAdmin.from("profiles").select("sex, location_id").eq("id", memberId).single(),
+      this.findMembershipForWindow(memberId, effectiveFrom, membershipWindowEnd),
+      this.getMemberAccessProfile(memberId),
+    ]);
 
     if (userError || !user) throw new HttpError(404, "Member not found");
-    if (membershipErr) throw new HttpError(500, "Failed to resolve active membership", membershipErr);
     if (!activeMembershipId) return [];
 
     let sessionsQuery = supabaseAdmin
@@ -289,17 +371,26 @@ export class BookingService {
       if (effectiveLocationId) sessionsQuery = sessionsQuery.eq("location_id", effectiveLocationId);
     }
 
-    const [{ data: allowanceRows, error: allowanceErr }, { data: sessions, error }] = await Promise.all([
-      supabaseAdmin
-        .from("membership_session_allowances")
-        .select("token_type_id, weekly_allowance")
-        .eq("membership_id", activeMembershipId)
-        .gt("weekly_allowance", 0),
-      sessionsQuery,
-    ]);
+    const [{ data: allowanceRows, error: allowanceErr }, { data: sessions, error }, { data: membershipRow, error: membershipRowErr }] =
+      await Promise.all([
+        supabaseAdmin
+          .from("membership_session_allowances")
+          .select("token_type_id, weekly_allowance")
+          .eq("membership_id", activeMembershipId)
+          .gt("weekly_allowance", 0),
+        sessionsQuery,
+        supabaseAdmin
+          .from("member_memberships")
+          .select("start_date, end_date, termination_date")
+          .eq("id", activeMembershipId)
+          .single(),
+      ]);
 
     if (allowanceErr) throw new HttpError(500, "Failed to fetch membership allowances", allowanceErr);
     if (error) throw new HttpError(500, "Failed to fetch available sessions", error);
+    if (membershipRowErr) {
+      throw new HttpError(500, "Failed to load membership dates", membershipRowErr);
+    }
 
     const allowedTokenTypeIds = new Set(
       (allowanceRows ?? [])
@@ -316,18 +407,42 @@ export class BookingService {
     }
 
     type CoachAdmin = { name?: string | null; photo_url?: string | null };
-    const list = (sessions ?? []) as Array<
-      Record<string, unknown> & {
-        id: string;
-        capacity: number;
-        coaches?: { admins?: CoachAdmin | CoachAdmin[] };
-        session_types?: { token_type_id?: string; audience?: string | null; name?: string | null; category?: string | null } | null;
-        locations?: { name?: string | null; slug?: string | null } | null;
-        is_online?: boolean | null;
-        location_id?: string | null;
-        training_level?: string | null;
+    type SessionRow = Record<string, unknown> & {
+      id: string;
+      start_at?: string;
+      capacity: number;
+      coaches?: { admins?: CoachAdmin | CoachAdmin[] };
+      session_types?: { token_type_id?: string; audience?: string | null; name?: string | null; category?: string | null } | null;
+      locations?: { name?: string | null; slug?: string | null } | null;
+      is_online?: boolean | null;
+      location_id?: string | null;
+      training_level?: string | null;
+    };
+
+    const membershipStartMs = membershipRow?.start_date
+      ? new Date(String(membershipRow.start_date)).getTime()
+      : null;
+    const membershipEndMs = membershipRow?.end_date
+      ? new Date(String(membershipRow.end_date)).getTime()
+      : null;
+    const membershipTermMs = membershipRow?.termination_date
+      ? new Date(String(membershipRow.termination_date)).getTime()
+      : null;
+
+    const list = ((sessions ?? []) as SessionRow[]).filter((s) => {
+      const startMs = new Date(String(s.start_at ?? "")).getTime();
+      if (!Number.isFinite(startMs)) return false;
+      if (membershipStartMs != null && Number.isFinite(membershipStartMs) && startMs < membershipStartMs) {
+        return false;
       }
-    >;
+      if (membershipEndMs != null && Number.isFinite(membershipEndMs) && startMs >= membershipEndMs) {
+        return false;
+      }
+      if (membershipTermMs != null && Number.isFinite(membershipTermMs) && startMs >= membershipTermMs) {
+        return false;
+      }
+      return true;
+    });
     if (list.length === 0) return [];
 
     // Enforce allowance gating at token level and audience level.
@@ -448,11 +563,9 @@ export class BookingService {
    * Returns membership session allowance summary for schedule tab:
    */
   async getMembershipSessionAllowanceSummary(memberId: string) {
-    const { data: activeMembershipId, error: membershipErr } = await supabaseAdmin.rpc(
-      "clm_find_active_membership",
-      { p_member_id: memberId, p_now: new Date().toISOString() }
-    );
-    if (membershipErr) throw new HttpError(500, "Failed to resolve active membership", membershipErr);
+    const nowIso = ukBookingNowIso();
+    const windowEnd = new Date(Date.now() + 28 * 86400000).toISOString();
+    const activeMembershipId = await this.findMembershipForWindow(memberId, nowIso, windowEnd);
     if (!activeMembershipId) return [];
 
     const { data: allowanceRows, error: allowanceErr } = await supabaseAdmin
@@ -626,7 +739,13 @@ export class BookingService {
   }
 
   async getBookings(memberId: string, status?: string) {
-    let query = supabaseAdmin.from("bookings").select("*, sessions(*, session_types(*))").eq("member_id", memberId).order("booked_at", { ascending: false });
+    let query = supabaseAdmin
+      .from("bookings")
+      .select(
+        "*, sessions(*, session_types(*), locations(name), coaches!sessions_coach_id_fkey(admins(name)))",
+      )
+      .eq("member_id", memberId)
+      .order("booked_at", { ascending: false });
     if (status === "upcoming") query = query.eq("status", "booked");
     if (status === "past") query = query.neq("status", "booked");
     const { data, error } = await query;
@@ -651,11 +770,10 @@ export class BookingService {
     const { data: bookings, error: bookingsErr } = await supabaseAdmin
       .from("bookings")
       .select(`
-        id, status, booked_at, session_id, 
+        id, status, booked_at, cancelled_at, session_id,
         sessions!inner(id, start_at, end_at, session_type_id, session_types(id, name, color))
       `)
       .eq("member_id", memberId)
-      .neq("status", "cancelled")
       .gte("sessions.start_at", rangeStart.toISOString())
       .lte("sessions.start_at", rangeEnd.toISOString());
     if (bookingsErr) throw new HttpError(500, "Failed to fetch session usage", bookingsErr);
@@ -668,6 +786,7 @@ export class BookingService {
     // Compute counts
     let attended = 0;
     let missed = 0;
+    let lost = 0;
     let cancelled = 0;
     let upcoming = 0;
 
@@ -691,21 +810,35 @@ export class BookingService {
 
       const sessionStart = new Date(session.start_at);
       const isPast = sessionStart < now;
+      const cancelledAt = (booking as { cancelled_at?: string | null }).cancelled_at;
+      let scheduleStatus: string;
 
       if (booking.status === "cancelled") {
-        cancelled++;
+        if (isLateCancellationBooking(booking.status, cancelledAt, session.start_at)) {
+          lost++;
+          scheduleStatus = "lost";
+        } else {
+          cancelled++;
+          scheduleStatus = "cancelled";
+        }
       } else if (booking.status === "no_show") {
         missed++;
+        lost++;
+        scheduleStatus = "lost";
       } else if (booking.status === "booked" && isPast) {
         attended++;
+        scheduleStatus = "attended";
       } else if (booking.status === "booked" && !isPast) {
         upcoming++;
+        scheduleStatus = "booked";
+      } else {
+        scheduleStatus = String(booking.status ?? "booked");
       }
 
       schedule.push({
         date: session.start_at.split("T")[0],
         time: sessionStart.toTimeString().slice(0, 5),
-        status: booking.status === "booked" && isPast ? "attended" : booking.status,
+        status: scheduleStatus,
         sessionTypeName: session.session_types?.name ?? null,
         sessionTypeColor: session.session_types?.color ?? null,
         bookingId: booking.id,
@@ -731,11 +864,12 @@ export class BookingService {
     const allowed = allowedPerWeek * 4;
 
     if (view === "past") {
-      const usedVal = attended + missed;
+      const usedVal = attended + lost;
       return {
         view: "past",
         attended,
         missed,
+        lost,
         cancelled,
         used: usedVal,
         remaining: Math.max(0, allowed - usedVal),
@@ -745,15 +879,17 @@ export class BookingService {
       };
     }
 
+    const usedVal = attended + upcoming + lost;
     return {
       view: "upcoming",
       attended,
       upcoming,
       missed,
+      lost,
       cancelled,
-      used: attended + upcoming + missed,
-      remaining: Math.max(0, allowed - (attended + upcoming + missed)),
-      unused: Math.max(0, allowed - (attended + upcoming + missed)),
+      used: usedVal,
+      remaining: Math.max(0, allowed - usedVal),
+      unused: Math.max(0, allowed - usedVal),
       allowed,
       schedule,
     };
