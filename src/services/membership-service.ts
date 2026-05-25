@@ -1,6 +1,13 @@
 import { supabaseAdmin } from "../db/supabase.js";
 import { HttpError } from "../lib/http-error.js";
 import { TokenService } from "./token-service.js";
+import {
+  cancelAdminNutritionPlan,
+  cancelAdminTrainingPlan,
+  loadMembershipPlanQueues,
+  queueAdminNutritionPlan,
+  queueAdminTrainingPlan,
+} from "./membership-plan-service.js";
 
 type MembershipMode = "inperson" | "remote";
 type PlanTier = "structure" | "pace" | "performance";
@@ -986,15 +993,22 @@ export class MembershipService {
 
     const giftList = await new TokenService().listMemberGiftSessions(memberId);
 
+    const membershipPackage = String(
+      membership?.current_package ?? membershipPayload?.currentPackage ?? "pace",
+    );
+    const planQueues = membership
+      ? await loadMembershipPlanQueues(String(membership.id), membershipPackage)
+      : { trainingQueue: [], nutritionQueue: [] };
+
     return {
       membership: membershipPayload,
       training: {
         current: trainingCurrent,
-        queue: [] as unknown[],
+        queue: planQueues.trainingQueue,
       },
       nutrition: {
         current: null,
-        queue: [] as unknown[],
+        queue: planQueues.nutritionQueue,
       },
       pause: {
         history: pauseHistory,
@@ -1276,5 +1290,21 @@ export class MembershipService {
     }
 
     return this.getMembershipById(membershipId);
+  }
+
+  async queueAdminMemberTrainingPlan(memberId: string, body: Record<string, unknown>) {
+    return queueAdminTrainingPlan(memberId, body);
+  }
+
+  async cancelAdminMemberTrainingPlan(memberId: string, body: Record<string, unknown>) {
+    return cancelAdminTrainingPlan(memberId, body);
+  }
+
+  async queueAdminMemberNutritionPlan(memberId: string, body: Record<string, unknown>) {
+    return queueAdminNutritionPlan(memberId, body);
+  }
+
+  async cancelAdminMemberNutritionPlan(memberId: string, body: Record<string, unknown>) {
+    return cancelAdminNutritionPlan(memberId, body);
   }
 }

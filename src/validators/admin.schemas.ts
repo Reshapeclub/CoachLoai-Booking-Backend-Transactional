@@ -165,6 +165,56 @@ export const resumeAdminMemberMembershipPauseSchema = z.object({
   pause_id: z.string().uuid().optional(),
   pauseId: z.string().uuid().optional(),
 });
+
+const allocationEntrySchema = z.object({
+  allocation_key: z.string().min(1).optional(),
+  allocationKey: z.string().min(1).optional(),
+  allocation_value: z.number().int().min(0).max(7).optional(),
+  allocationValue: z.number().int().min(0).max(7).optional(),
+});
+
+/** POST /admin/members/:memberId/membership/training|nutrition/queue */
+export const queueMembershipPlanSchema = z
+  .object({
+    mode: z.enum(["inperson", "remote"]).optional(),
+    plan_type: z.enum(["fixed", "rolling"]).optional(),
+    planType: z.enum(["fixed", "rolling"]).optional(),
+    allocation_mode: z.enum(["sessions", "location"]).optional(),
+    allocationMode: z.enum(["sessions", "location"]).optional(),
+    start_date: z.string().min(1).optional(),
+    startDate: z.string().min(1).optional(),
+    end_date: z.string().min(1).optional(),
+    endDate: z.string().min(1).optional(),
+    tier: z.enum(["structure", "pace", "performance"]).optional(),
+    pkg: z.enum(["structure", "pace", "performance"]).optional(),
+    package: z.enum(["structure", "pace", "performance"]).optional(),
+    current_package: z.enum(["structure", "pace", "performance"]).optional(),
+    allocations: z.array(allocationEntrySchema).optional(),
+    alloc: z.record(z.union([z.number(), z.string()])).optional(),
+    id: z.string().uuid().optional(),
+    queue_id: z.string().uuid().optional(),
+    queueId: z.string().uuid().optional(),
+    note: z.string().optional(),
+  })
+  .refine((v) => Boolean(v.start_date || v.startDate), {
+    message: "start_date is required",
+    path: ["start_date"],
+  });
+
+/** POST /admin/members/:memberId/membership/training|nutrition/cancel */
+export const cancelMembershipPlanSchema = z.object({
+  mode: z.enum(["inperson", "remote"]).optional(),
+  target_status: z.enum(["active", "queued"]).optional(),
+  targetStatus: z.enum(["active", "queued"]).optional(),
+  cancel_mode: z.enum(["immediate", "end", "scheduled"]).optional(),
+  cancelMode: z.enum(["immediate", "end", "scheduled"]).optional(),
+  effective_date: z.string().min(1).optional(),
+  effectiveDate: z.string().min(1).optional(),
+  reason: z.string().optional(),
+  id: z.string().uuid().optional(),
+  queue_id: z.string().uuid().optional(),
+  queueId: z.string().uuid().optional(),
+});
 export const terminateMembershipSchema = z.object({
   terminationDate: z.string().datetime(),
 });

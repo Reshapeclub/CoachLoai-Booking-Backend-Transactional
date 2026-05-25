@@ -21,6 +21,8 @@ import {
   cancelPauseMembershipSchema,
   cancelAdminMemberMembershipPauseSchema,
   resumeAdminMemberMembershipPauseSchema,
+  queueMembershipPlanSchema,
+  cancelMembershipPlanSchema,
   terminateMembershipSchema,
   issueTokensSchema,
   addMemberSessionTagSchema,
@@ -412,6 +414,58 @@ const putMemberTrainingCurrentHandler = async (req: Request, res: Response, next
 router.put('/members/:memberId/membership/training/current', putMemberTrainingCurrentHandler);
 router.patch('/members/:memberId/membership/training/current', putMemberTrainingCurrentHandler);
 router.post('/members/:memberId/membership/training/current', putMemberTrainingCurrentHandler);
+const postMemberTrainingQueueHandler = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { memberId } = validate(z.object({ memberId: z.string().uuid() }), req.params);
+    const body = validate(queueMembershipPlanSchema, req.body);
+    const data = await membershipService.queueAdminMemberTrainingPlan(memberId, body);
+    res.json({ ok: true, data });
+  } catch (e) {
+    next(e);
+  }
+};
+router.post('/members/:memberId/membership/training/queue', postMemberTrainingQueueHandler);
+router.put('/members/:memberId/membership/training/queue', postMemberTrainingQueueHandler);
+router.patch('/members/:memberId/membership/training/queue', postMemberTrainingQueueHandler);
+const postMemberTrainingCancelHandler = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { memberId } = validate(z.object({ memberId: z.string().uuid() }), req.params);
+    const body = validate(cancelMembershipPlanSchema, req.body);
+    const data = await membershipService.cancelAdminMemberTrainingPlan(memberId, body);
+    res.json({ ok: true, data });
+  } catch (e) {
+    next(e);
+  }
+};
+router.post('/members/:memberId/membership/training/cancel', postMemberTrainingCancelHandler);
+router.put('/members/:memberId/membership/training/cancel', postMemberTrainingCancelHandler);
+router.patch('/members/:memberId/membership/training/cancel', postMemberTrainingCancelHandler);
+const postMemberNutritionQueueHandler = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { memberId } = validate(z.object({ memberId: z.string().uuid() }), req.params);
+    const body = validate(queueMembershipPlanSchema, req.body);
+    const data = await membershipService.queueAdminMemberNutritionPlan(memberId, body);
+    res.json({ ok: true, data });
+  } catch (e) {
+    next(e);
+  }
+};
+router.post('/members/:memberId/membership/nutrition/queue', postMemberNutritionQueueHandler);
+router.put('/members/:memberId/membership/nutrition/queue', postMemberNutritionQueueHandler);
+router.patch('/members/:memberId/membership/nutrition/queue', postMemberNutritionQueueHandler);
+const postMemberNutritionCancelHandler = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { memberId } = validate(z.object({ memberId: z.string().uuid() }), req.params);
+    const body = validate(cancelMembershipPlanSchema, req.body);
+    const data = await membershipService.cancelAdminMemberNutritionPlan(memberId, body);
+    res.json({ ok: true, data });
+  } catch (e) {
+    next(e);
+  }
+};
+router.post('/members/:memberId/membership/nutrition/cancel', postMemberNutritionCancelHandler);
+router.put('/members/:memberId/membership/nutrition/cancel', postMemberNutritionCancelHandler);
+router.patch('/members/:memberId/membership/nutrition/cancel', postMemberNutritionCancelHandler);
 router.get('/members/:memberId/meetings', async (req, res, next) => {
   try {
     const { memberId } = validate(z.object({ memberId: z.string().uuid() }), req.params);

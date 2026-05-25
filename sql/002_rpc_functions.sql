@@ -673,13 +673,7 @@ begin
   )
   select count(*)::int into v_inserted_weeks from inserted;
 
-  -- Zero weekly tokens for paused weeks
-  delete from tokens t
-  where t.member_id = v_membership.member_id
-    and t.source = 'weekly'
-    and t.week_start >= p_start_week
-    and t.week_start <= p_end_week_inclusive;
-
+  -- Cancel bookings in paused weeks before touching tokens (deduction rows keep token_id FK).
   for v_booking in
     select b.id as booking_id, b.member_id, b.session_id
     from bookings b
@@ -700,6 +694,23 @@ begin
       (v_booking.member_id, 'in_app', 'booking_cancelled', jsonb_build_object('bookingId', v_booking.booking_id, 'refundApplied', false, 'reason', 'membership_paused')),
       (v_booking.member_id, 'email', 'booking_cancelled', jsonb_build_object('bookingId', v_booking.booking_id, 'refundApplied', false, 'reason', 'membership_paused'));
   end loop;
+
+  -- Zero weekly tokens for paused weeks; only delete rows not referenced by booking_token_deductions.
+  update tokens t
+  set quantity = 0
+  where t.member_id = v_membership.member_id
+    and t.source = 'weekly'
+    and t.week_start >= p_start_week
+    and t.week_start <= p_end_week_inclusive;
+
+  delete from tokens t
+  where t.member_id = v_membership.member_id
+    and t.source = 'weekly'
+    and t.week_start >= p_start_week
+    and t.week_start <= p_end_week_inclusive
+    and not exists (
+      select 1 from booking_token_deductions d where d.token_id = t.id
+    );
 
   if coalesce(array_length(v_session_ids, 1), 0) > 0 then
     foreach v_sid in array coalesce(

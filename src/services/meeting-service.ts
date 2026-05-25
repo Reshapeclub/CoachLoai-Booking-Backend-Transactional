@@ -28,6 +28,14 @@ function meetingSlotLookupKey(meetingTypeId: string, locationId: string, slotSta
   return `${meetingTypeId}|${locationId}|${slotStart}`;
 }
 
+/** Bullet points shown on member app for Track / performance meetings. */
+export const MEMBER_MEETING_TYPE_COVER = [
+  "Evolt and Styku scans",
+  "Tracking analyses",
+  "Progress photos",
+  "Plan and progress insights",
+] as const;
+
 function coachFieldsFromMeetingSlot(
   slot: { coach_id?: string | null; coaches?: unknown } | null | undefined,
 ): { coach_id: string | null; coach_name: string | null; coach_photo_url: string | null } {
@@ -199,6 +207,17 @@ export class MeetingService {
       .order("display_order", { ascending: true });
     if (error) throw new HttpError(500, "Failed to fetch meeting types", error);
     return data ?? [];
+  }
+
+  async listMeetingTypesForMember() {
+    const meeting_types = (await this.listMeetingTypes()).map((row) => {
+      if (String(row.code ?? "").toUpperCase() !== "TRACK") return row;
+      return { ...row, cover: [...MEMBER_MEETING_TYPE_COVER] };
+    });
+    return {
+      meeting_types,
+      cover: [...MEMBER_MEETING_TYPE_COVER],
+    };
   }
 
   async getAvailability(
