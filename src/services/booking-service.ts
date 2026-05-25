@@ -56,6 +56,34 @@ export class BookingService {
       .replace(/[^a-z0-9]+/g, "");
   }
 
+  private normalizeMemberSex(value: unknown): "male" | "female" | null {
+    const s = String(value ?? "")
+      .trim()
+      .toLowerCase();
+    if (s === "male" || s === "m") return "male";
+    if (s === "female" || s === "f") return "female";
+    return null;
+  }
+
+  /** Schedule stores Elite Men / Elite Women on `sessions.training_level` (not in `member_training_levels`). */
+  private resolveEliteSexSessionKind(session: {
+    training_level?: string | null;
+    session_types?: { name?: string | null; category?: string | null } | Array<{ name?: string | null; category?: string | null }> | null;
+  }): "men" | "women" | null {
+    const sessionType = Array.isArray(session.session_types)
+      ? session.session_types[0]
+      : session.session_types;
+    const haystacks = [
+      this.normalizeAccessCode(session.training_level),
+      this.normalizeAccessCode(sessionType?.name),
+    ].filter(Boolean);
+    for (const hay of haystacks) {
+      if (hay === "elitemen" || (hay.includes("elite") && hay.includes("men"))) return "men";
+      if (hay === "elitewomen" || (hay.includes("elite") && hay.includes("women"))) return "women";
+    }
+    return null;
+  }
+
   /** Resolve membership for a browse window (supports future membership start dates). */
   private async findMembershipForWindow(
     memberId: string,
@@ -175,8 +203,9 @@ export class BookingService {
       session_types?: { name?: string | null; category?: string | null } | Array<{ name?: string | null; category?: string | null }> | null;
       locations?: { name?: string | null; slug?: string | null } | Array<{ name?: string | null; slug?: string | null }> | null;
     },
+    memberSex?: unknown,
   ): boolean {
-    return this.getSessionAccessDebug(access, session).reason === null;
+    return this.getSessionAccessDebug(access, session, memberSex).reason === null;
   }
 
   private getSessionAccessDebug(
@@ -188,6 +217,7 @@ export class BookingService {
       session_types?: { name?: string | null; category?: string | null } | Array<{ name?: string | null; category?: string | null }> | null;
       locations?: { name?: string | null; slug?: string | null } | Array<{ name?: string | null; slug?: string | null }> | null;
     },
+    memberSex?: unknown,
   ): {
     reason: "location" | "training_level" | "session_access" | null;
     normalized: { sessionTypeCode: string; sessionCategoryCode: string; trainingLevelCode: string; locationNameCode: string; locationSlugCode: string };
@@ -209,20 +239,57 @@ export class BookingService {
       }
     }
 
-    // Training level: when member has an allow-list in DB, session must map to at least one allowed code.
-    // 1:1 sessions are exempt. Elite/Octave/Group use charged/noncharged or level names on the session row.
-    const bypassTrainingLevelCheck = sessionTypeCode === "11" || sessionCategoryCode === "11";
-    if (!bypassTrainingLevelCheck && access.trainingLevels.size > 0) {
-      const sessionLevelCodes = this.resolveSessionTrainingLevelCodes(session);
-      if (sessionLevelCodes.size === 0) {
+    const memberSexNorm = this.normalizeMemberSex(memberSex);
+    const eliteSexKind = this.resolveEliteSexSessionKind(session);
+    if (eliteSexKind && memberSexNorm) {
+      if (eliteSexKind === "men" && memberSexNorm !== "male") {
         return {
           reason: "training_level",
           normalized: { sessionTypeCode, sessionCategoryCode, trainingLevelCode, locationNameCode, locationSlugCode },
         };
       }
-      const levelAllowed = [...sessionLevelCodes].some((code) => access.trainingLevels.has(code));
-      if (!levelAllowed) {
-        return { reason: "training_level", normalized: { sessionTypeCode, sessionCategoryCode, trainingLevelCode, locationNameCode, locationSlugCode } };
+      if (eliteSexKind === "women" && memberSexNorm !== "female") {
+        return {
+          reason: "training_level",
+          normalized: { sessionTypeCode, sessionCategoryCode, trainingLevelCode, locationNameCode, locationSlugCode },
+        };
+      }
+    }
+
+    // Training level: when member has an allow-list in DB, session must map to at least one allowed code.
+    // 1:1 sessions are exempt. Elite/Octave/Group use charged/noncharged or level names on the session row.
+    const bypassTrainingLevelCheck = sessionTypeCode === "11" || sessionCategoryCode === "11";
+    if (!bypassTrainingLevelCheck && access.trainingLevels.size > 0) {
+      const sessionLevelCodes = this.resolveSessionTrainingLevelCodes(session);
+      const sexMatchedElite =
+        eliteSexKind &&
+        memberSexNorm &&
+        ((eliteSexKind === "men" && memberSexNorm === "male") ||
+          (eliteSexKind === "women" && memberSexNorm === "female"));
+
+      if (sexMatchedElite) {
+        const subLevelCodes = [...sessionLevelCodes].filter(
+          (code) => code !== "elitemen" && code !== "elitewomen",
+        );
+        if (subLevelCodes.length > 0) {
+          const levelAllowed = subLevelCodes.some((code) => access.trainingLevels.has(code));
+          if (!levelAllowed) {
+            return {
+              reason: "training_level",
+              normalized: { sessionTypeCode, sessionCategoryCode, trainingLevelCode, locationNameCode, locationSlugCode },
+            };
+          }
+        }
+      } else if (sessionLevelCodes.size === 0) {
+        return {
+          reason: "training_level",
+          normalized: { sessionTypeCode, sessionCategoryCode, trainingLevelCode, locationNameCode, locationSlugCode },
+        };
+      } else {
+        const levelAllowed = [...sessionLevelCodes].some((code) => access.trainingLevels.has(code));
+        if (!levelAllowed) {
+          return { reason: "training_level", normalized: { sessionTypeCode, sessionCategoryCode, trainingLevelCode, locationNameCode, locationSlugCode } };
+        }
       }
     }
 
@@ -476,7 +543,7 @@ export class BookingService {
             .trim()
             .toLowerCase();
           const audienceAllowed = allowedAudiences.has(audience || "mixed");
-          const accessDebug = this.getSessionAccessDebug(memberAccess, s);
+          const accessDebug = this.getSessionAccessDebug(memberAccess, s, normalizedSex);
           const sessionCategoryCode = this.normalizeAccessCode(s.session_types?.category);
           const isOneToOne =
             sessionCategoryCode === "11" ||
@@ -665,8 +732,9 @@ export class BookingService {
   }
 
   async createBooking(input: { memberId: string; membershipId: string; sessionId: string }) {
-    const [memberAccess, sessionRes] = await Promise.all([
+    const [memberAccess, profileRes, sessionRes] = await Promise.all([
       this.getMemberAccessProfile(input.memberId),
+      supabaseAdmin.from("profiles").select("sex").eq("id", input.memberId).maybeSingle(),
       supabaseAdmin
         .from("sessions")
         .select("id, start_at, is_online, location_id, training_level, session_types(name, category), locations(name, slug)")
@@ -677,7 +745,7 @@ export class BookingService {
     if (sessionRes.error || !sessionRes.data) {
       throw new HttpError(404, "Session not found", sessionRes.error);
     }
-    if (!this.isSessionAllowedForMember(memberAccess, sessionRes.data as any)) {
+    if (!this.isSessionAllowedForMember(memberAccess, sessionRes.data as any, profileRes.data?.sex)) {
       throw new HttpError(403, "Member is not allowed to book this session");
     }
 
@@ -728,8 +796,9 @@ export class BookingService {
     if (bookingErr) throw new HttpError(500, "Failed to load booking", bookingErr);
     if (!bookingRow?.session_id) throw new HttpError(404, "Booking not found");
 
-    const [memberAccess, sessionRes] = await Promise.all([
+    const [memberAccess, profileRes, sessionRes] = await Promise.all([
       this.getMemberAccessProfile(input.memberId),
+      supabaseAdmin.from("profiles").select("sex").eq("id", input.memberId).maybeSingle(),
       supabaseAdmin
         .from("sessions")
         .select("id, start_at, is_online, location_id, training_level, session_types(name, category), locations(name, slug)")
@@ -740,7 +809,7 @@ export class BookingService {
     if (sessionRes.error || !sessionRes.data) {
       throw new HttpError(404, "Session not found", sessionRes.error);
     }
-    if (!this.isSessionAllowedForMember(memberAccess, sessionRes.data as Record<string, unknown>)) {
+    if (!this.isSessionAllowedForMember(memberAccess, sessionRes.data as Record<string, unknown>, profileRes.data?.sex)) {
       throw new HttpError(403, "Member is not allowed to book this session");
     }
 
@@ -760,8 +829,9 @@ export class BookingService {
   }
 
   async joinWaitlist(input: { memberId: string; membershipId: string; sessionId: string }) {
-    const [memberAccess, sessionRes] = await Promise.all([
+    const [memberAccess, profileRes, sessionRes] = await Promise.all([
       this.getMemberAccessProfile(input.memberId),
+      supabaseAdmin.from("profiles").select("sex").eq("id", input.memberId).maybeSingle(),
       supabaseAdmin
         .from("sessions")
         .select("id, start_at, is_online, location_id, training_level, session_types(name, category), locations(name, slug)")
@@ -772,7 +842,7 @@ export class BookingService {
     if (sessionRes.error || !sessionRes.data) {
       throw new HttpError(404, "Session not found", sessionRes.error);
     }
-    if (!this.isSessionAllowedForMember(memberAccess, sessionRes.data as any)) {
+    if (!this.isSessionAllowedForMember(memberAccess, sessionRes.data as any, profileRes.data?.sex)) {
       throw new HttpError(403, "Member is not allowed to join waitlist for this session");
     }
 
@@ -1234,7 +1304,10 @@ export class BookingService {
       );
     }
 
-    const access = await this.getMemberAccessProfile(memberId);
+    const [access, profileRes] = await Promise.all([
+      this.getMemberAccessProfile(memberId),
+      supabaseAdmin.from("profiles").select("sex").eq("id", memberId).maybeSingle(),
+    ]);
     const sessionForGate = {
       is_online: tgt.is_online,
       location_id: tgt.location_id,
@@ -1242,7 +1315,10 @@ export class BookingService {
       session_types: tgt.session_types,
       locations: tgt.locations,
     };
-    if (!input.overrideEligibility && !this.isSessionAllowedForMember(access, sessionForGate as any)) {
+    if (
+      !input.overrideEligibility &&
+      !this.isSessionAllowedForMember(access, sessionForGate as any, profileRes.data?.sex)
+    ) {
       throw new HttpError(
         403,
         "Member is not eligible for the target session. Confirm override in the admin UI to proceed.",
