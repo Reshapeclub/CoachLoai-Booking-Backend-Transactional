@@ -162,6 +162,52 @@ async function getNutritionPlans(membershipId: string) {
   return (data ?? []) as Array<Record<string, unknown>>;
 }
 
+async function findExistingQueuedTrainingPlan(
+  membershipId: string,
+  startDate: string,
+  planType: PlanType,
+  endDate: string | null,
+) {
+  let query = supabaseAdmin
+    .from("membership_training_plans")
+    .select("*")
+    .eq("membership_id", membershipId)
+    .eq("status", "queued")
+    .eq("start_date", startDate)
+    .eq("plan_type", planType);
+  query = endDate ? query.eq("end_date", endDate) : query.is("end_date", null);
+  const { data, error } = await query
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw new HttpError(500, "Failed to look up queued training plan", error);
+  return data as Record<string, unknown> | null;
+}
+
+async function findExistingQueuedNutritionPlan(
+  membershipId: string,
+  startDate: string,
+  planType: PlanType,
+  endDate: string | null,
+  tier: PlanTier,
+) {
+  let query = supabaseAdmin
+    .from("membership_nutrition_plans")
+    .select("*")
+    .eq("membership_id", membershipId)
+    .eq("status", "queued")
+    .eq("start_date", startDate)
+    .eq("plan_type", planType)
+    .eq("tier", tier);
+  query = endDate ? query.eq("end_date", endDate) : query.is("end_date", null);
+  const { data, error } = await query
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw new HttpError(500, "Failed to look up queued nutrition plan", error);
+  return data as Record<string, unknown> | null;
+}
+
 async function saveTrainingAllocations(planId: string, allocations: AllocationRow[]) {
   const { error: delErr } = await supabaseAdmin
     .from("membership_training_plan_allocations")
@@ -242,6 +288,86 @@ export function mapNutritionPlanForDashboard(plan: Record<string, unknown>) {
   };
 }
 
+export async function getActiveNutritionPlanForMembership(membershipId: string) {
+  const { data, error } = await supabaseAdmin
+    .from("membership_nutrition_plans")
+    .select("*")
+    .eq("membership_id", membershipId)
+    .eq("status", "active")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw new HttpError(500, "Failed to fetch active nutrition plan", error);
+  return data as Record<string, unknown> | null;
+}
+
+/** PUT/PATCH/POST `/admin/members/:memberId/membership/nutrition/current` */
+export async function upsertAdminNutritionCurrent(
+  memberId: string,
+  body: Record<string, unknown>,
+) {
+  const membership = await getMembershipForMember(memberId, body.mode as string | undefined);
+  const membershipId = String(membership.id);
+  const planType = normalizePlanType(body.plan_type ?? body.planType);
+  const tier = normalizeTier(
+    body.tier ?? body.current_package ?? body.package ?? body.pkg ?? membership.current_package,
+  );
+  const startDate = planDateFromBody(body.start_date ?? body.startDate, "start_date");
+  const endDate =
+    planType === "fixed"
+      ? planDateFromBody(body.end_date ?? body.endDate, "end_date")
+      : null;
+  validatePlanDates(planType, startDate, endDate);
+  const now = new Date().toISOString();
+
+  const { data: existingActive, error: exErr } = await supabaseAdmin
+    .from("membership_nutrition_plans")
+    .select("*")
+    .eq("membership_id", membershipId)
+    .eq("status", "active")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (exErr) throw new HttpError(500, "Failed to load active nutrition plan", exErr);
+
+  let plan: Record<string, unknown>;
+  if (existingActive) {
+    const { data: updated, error: updErr } = await supabaseAdmin
+      .from("membership_nutrition_plans")
+      .update({
+        tier,
+        plan_type: planType,
+        start_date: startDate,
+        end_date: endDate,
+        note: body.note != null ? String(body.note) : null,
+        updated_at: now,
+      })
+      .eq("id", String((existingActive as { id: string }).id))
+      .select("*")
+      .single();
+    if (updErr) throw new HttpError(500, "Failed to update nutrition plan", updErr);
+    plan = updated as Record<string, unknown>;
+  } else {
+    const { data: inserted, error: insErr } = await supabaseAdmin
+      .from("membership_nutrition_plans")
+      .insert({
+        membership_id: membershipId,
+        tier,
+        plan_type: planType,
+        status: "active",
+        start_date: startDate,
+        end_date: endDate,
+        note: body.note != null ? String(body.note) : null,
+      })
+      .select("*")
+      .single();
+    if (insErr) throw new HttpError(500, "Failed to create nutrition plan", insErr);
+    plan = inserted as Record<string, unknown>;
+  }
+
+  return mapNutritionPlanForDashboard(plan);
+}
+
 export async function loadMembershipPlanQueues(
   membershipId: string,
   membershipPackage: string,
@@ -282,7 +408,16 @@ export async function queueAdminTrainingPlan(memberId: string, body: Record<stri
   const allocations = parseAllocationsFromBody(body);
   validateAllocationList(allocationMode, allocations, false);
 
-  const planId = String(body.id ?? body.queue_id ?? body.queueId ?? "").trim();
+  let planId = String(body.id ?? body.queue_id ?? body.queueId ?? "").trim();
+  if (!planId) {
+    const duplicate = await findExistingQueuedTrainingPlan(
+      membershipId,
+      startDate,
+      planType,
+      endDate,
+    );
+    if (duplicate?.id) planId = String(duplicate.id);
+  }
   const now = new Date().toISOString();
   let plan: Record<string, unknown>;
 
@@ -462,7 +597,17 @@ export async function queueAdminNutritionPlan(memberId: string, body: Record<str
       : null;
   validatePlanDates(planType, startDate, endDate);
 
-  const planId = String(body.id ?? body.queue_id ?? body.queueId ?? "").trim();
+  let planId = String(body.id ?? body.queue_id ?? body.queueId ?? "").trim();
+  if (!planId) {
+    const duplicate = await findExistingQueuedNutritionPlan(
+      membershipId,
+      startDate,
+      planType,
+      endDate,
+      tier,
+    );
+    if (duplicate?.id) planId = String(duplicate.id);
+  }
   const now = new Date().toISOString();
   let plan: Record<string, unknown>;
 

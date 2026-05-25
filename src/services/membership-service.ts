@@ -4,9 +4,12 @@ import { TokenService } from "./token-service.js";
 import {
   cancelAdminNutritionPlan,
   cancelAdminTrainingPlan,
+  getActiveNutritionPlanForMembership,
   loadMembershipPlanQueues,
+  mapNutritionPlanForDashboard,
   queueAdminNutritionPlan,
   queueAdminTrainingPlan,
+  upsertAdminNutritionCurrent,
 } from "./membership-plan-service.js";
 
 type MembershipMode = "inperson" | "remote";
@@ -1000,6 +1003,14 @@ export class MembershipService {
       ? await loadMembershipPlanQueues(String(membership.id), membershipPackage)
       : { trainingQueue: [], nutritionQueue: [] };
 
+    let nutritionCurrent: Record<string, unknown> | null = null;
+    if (membership) {
+      const activeNutrition = await getActiveNutritionPlanForMembership(String(membership.id));
+      if (activeNutrition) {
+        nutritionCurrent = mapNutritionPlanForDashboard(activeNutrition);
+      }
+    }
+
     return {
       membership: membershipPayload,
       training: {
@@ -1007,7 +1018,7 @@ export class MembershipService {
         queue: planQueues.trainingQueue,
       },
       nutrition: {
-        current: null,
+        current: nutritionCurrent,
         queue: planQueues.nutritionQueue,
       },
       pause: {
@@ -1298,6 +1309,14 @@ export class MembershipService {
 
   async cancelAdminMemberTrainingPlan(memberId: string, body: Record<string, unknown>) {
     return cancelAdminTrainingPlan(memberId, body);
+  }
+
+  /**
+   * Admin dashboard: persist current (active) nutrition plan.
+   * PUT/PATCH/POST `/admin/members/:memberId/membership/nutrition/current`
+   */
+  async putAdminMemberNutritionCurrent(memberId: string, body: Record<string, unknown>) {
+    return upsertAdminNutritionCurrent(memberId, body);
   }
 
   async queueAdminMemberNutritionPlan(memberId: string, body: Record<string, unknown>) {

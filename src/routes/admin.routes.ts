@@ -414,6 +414,22 @@ const putMemberTrainingCurrentHandler = async (req: Request, res: Response, next
 router.put('/members/:memberId/membership/training/current', putMemberTrainingCurrentHandler);
 router.patch('/members/:memberId/membership/training/current', putMemberTrainingCurrentHandler);
 router.post('/members/:memberId/membership/training/current', putMemberTrainingCurrentHandler);
+const putMemberNutritionCurrentHandler = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { memberId } = validate(z.object({ memberId: z.string().uuid() }), req.params);
+    const body =
+      req.body && typeof req.body === "object" && !Array.isArray(req.body)
+        ? (req.body as Record<string, unknown>)
+        : {};
+    const data = await membershipService.putAdminMemberNutritionCurrent(memberId, body);
+    res.json({ ok: true, data });
+  } catch (e) {
+    next(e);
+  }
+};
+router.put('/members/:memberId/membership/nutrition/current', putMemberNutritionCurrentHandler);
+router.patch('/members/:memberId/membership/nutrition/current', putMemberNutritionCurrentHandler);
+router.post('/members/:memberId/membership/nutrition/current', putMemberNutritionCurrentHandler);
 const postMemberTrainingQueueHandler = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { memberId } = validate(z.object({ memberId: z.string().uuid() }), req.params);
