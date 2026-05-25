@@ -3,7 +3,9 @@ import { supabaseAdmin } from "../db/supabase.js";
 import { HttpError } from "../lib/http-error.js";
 import {
   assertBookableStartNotPast,
+  ukBookingNowIso,
   ukDayBoundsUtcIso,
+  ukTodayStartUtcIso,
 } from "../lib/uk-booking-time.js";
 
 function toLondonRotaParts(iso: string): { dayOfWeek: number; minutesFromMidnight: number; weekStartDate: string } {
@@ -730,7 +732,7 @@ export class MeetingService {
       to?: string;
     },
   ) {
-    const view = filters?.view ?? "all";
+    const view = filters?.view;
     const ascending = view === "past" ? false : true;
     let query = supabaseAdmin
       .from("track_meetings")
@@ -743,15 +745,23 @@ export class MeetingService {
       query = query.eq("status", status);
     }
 
-    const nowIso = new Date().toISOString();
+    const nowIso = ukBookingNowIso();
+    const todayStartIso = ukTodayStartUtcIso();
     if (view === "upcoming") {
       query = query.eq("status", "booked").gte("meeting_start", nowIso);
     } else if (view === "past") {
-      query = query.lt("meeting_end", nowIso);
+      query = query.lt("meeting_start", todayStartIso);
+    } else {
+      // Default and view=all: today (UK) and future meetings only.
+      query = query.gte("meeting_start", todayStartIso);
     }
 
-    if (filters?.from) query = query.gte("meeting_start", filters.from);
-    if (filters?.to) query = query.lte("meeting_start", filters.to);
+    if (filters?.from) {
+      query = query.gte("meeting_start", filters.from);
+    }
+    if (filters?.to) {
+      query = query.lte("meeting_start", filters.to);
+    }
 
     const { data, error } = await query;
     if (error) throw new HttpError(500, "Failed to fetch member meetings", error);
@@ -773,7 +783,11 @@ export class MeetingService {
   }
 
   async getEligibility(memberId: string) {
-    const { meetings: history } = await this.listMemberMeetings(memberId, { view: "all" });
+    const [{ meetings: upcoming }, { meetings: past }] = await Promise.all([
+      this.listMemberMeetings(memberId),
+      this.listMemberMeetings(memberId, { view: "past" }),
+    ]);
+    const history = [...past, ...upcoming];
     return {
       performance: { eligible: true, nextEligibleDate: null },
       pace: { eligible: true, nextEligibleDate: null },

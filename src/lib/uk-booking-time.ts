@@ -14,6 +14,13 @@ export function ukBookingNowIso(): string {
   return iso;
 }
 
+/** Start of the current calendar day in UK (London), as UTC ISO for DB queries. */
+export function ukTodayStartUtcIso(): string {
+  const iso = ukBookingNow().startOf("day").toUTC().toISO();
+  if (!iso) throw new HttpError(500, "Failed to resolve UK today start");
+  return iso;
+}
+
 export function parseUkDateYmd(ymd: string): DateTime | null {
   const dt = DateTime.fromISO(ymd, { zone: UK_BOOKING_TIMEZONE }).startOf("day");
   return dt.isValid ? dt : null;
