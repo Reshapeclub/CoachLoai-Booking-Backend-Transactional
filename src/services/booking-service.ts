@@ -214,25 +214,24 @@ export class BookingService {
     const bypassTrainingLevelCheck = sessionTypeCode === "11" || sessionCategoryCode === "11";
     if (!bypassTrainingLevelCheck && access.trainingLevels.size > 0) {
       const sessionLevelCodes = this.resolveSessionTrainingLevelCodes(session);
-      const levelAllowed =
-        sessionLevelCodes.size > 0 &&
-        [...sessionLevelCodes].some((code) => access.trainingLevels.has(code));
+      if (sessionLevelCodes.size === 0) {
+        return {
+          reason: "training_level",
+          normalized: { sessionTypeCode, sessionCategoryCode, trainingLevelCode, locationNameCode, locationSlugCode },
+        };
+      }
+      const levelAllowed = [...sessionLevelCodes].some((code) => access.trainingLevels.has(code));
       if (!levelAllowed) {
         return { reason: "training_level", normalized: { sessionTypeCode, sessionCategoryCode, trainingLevelCode, locationNameCode, locationSlugCode } };
       }
     }
 
-    // Session access: if member has list, session name/category must map to one of allowed codes.
-    if (access.sessionAccess.size > 0) {
-      // Member > Training session-access UI does not include these category-level keys.
-      // Skip category gating for them so name-based access remains the source of truth.
-      if (sessionCategoryCode !== "11" && sessionCategoryCode !== "octave") {
-        const sessionIsInAccessScope =
-          this.knownSessionAccessCodes.has(sessionTypeCode) ||
-          this.knownSessionAccessCodes.has(sessionCategoryCode);
-        if (!sessionIsInAccessScope) {
-          return { reason: null, normalized: { sessionTypeCode, sessionCategoryCode, trainingLevelCode, locationNameCode, locationSlugCode } };
-        }
+    // Session access: named session types (ReShape, Hybrid, etc.) from admin Member > Sessions tab.
+    if (access.sessionAccess.size > 0 && !bypassTrainingLevelCheck) {
+      const sessionIsInAccessScope =
+        this.knownSessionAccessCodes.has(sessionTypeCode) ||
+        this.knownSessionAccessCodes.has(sessionCategoryCode);
+      if (sessionIsInAccessScope) {
         const sessionCodes = new Set([sessionTypeCode, sessionCategoryCode]);
         const sessionAllowed = [...sessionCodes].some((code) => code && access.sessionAccess.has(code));
         if (!sessionAllowed) {
@@ -398,6 +397,21 @@ export class BookingService {
         .filter((v): v is string => Boolean(v)),
     );
 
+    const allowedSessionCategories = new Set<string>();
+    if (allowedTokenTypeIds.size > 0) {
+      const { data: categoryRows, error: categoryErr } = await supabaseAdmin
+        .from("session_types")
+        .select("token_type_id, category")
+        .in("token_type_id", [...allowedTokenTypeIds]);
+      if (categoryErr) {
+        throw new HttpError(500, "Failed to resolve session categories for allowances", categoryErr);
+      }
+      for (const row of categoryRows ?? []) {
+        const cat = this.normalizeAccessCode((row as { category?: string }).category);
+        if (cat) allowedSessionCategories.add(cat);
+      }
+    }
+
     const normalizedSex = String((user as { sex?: string | null }).sex ?? "")
       .trim()
       .toLowerCase();
@@ -463,8 +477,21 @@ export class BookingService {
             .toLowerCase();
           const audienceAllowed = allowedAudiences.has(audience || "mixed");
           const accessDebug = this.getSessionAccessDebug(memberAccess, s);
+          const sessionCategoryCode = this.normalizeAccessCode(s.session_types?.category);
+          const isOneToOne =
+            sessionCategoryCode === "11" ||
+            accessDebug.normalized.sessionTypeCode === "11" ||
+            accessDebug.normalized.sessionCategoryCode === "11";
           if (!tokenTypeId || !allowedTokenTypeIds.has(String(tokenTypeId))) {
             rejectedDebug.push({ sessionId: String(s.id), reason: "token" });
+            return false;
+          }
+          if (
+            !isOneToOne &&
+            allowedSessionCategories.size > 0 &&
+            !allowedSessionCategories.has(sessionCategoryCode)
+          ) {
+            rejectedDebug.push({ sessionId: String(s.id), reason: "allowance_category" });
             return false;
           }
           if (!audienceAllowed) {
@@ -690,6 +717,31 @@ export class BookingService {
       if (memErr) throw new HttpError(500, "Failed to resolve active membership", memErr);
       if (!activeMembershipId) throw new HttpError(422, "No active membership");
       membershipId = String(activeMembershipId);
+    }
+
+    const { data: bookingRow, error: bookingErr } = await supabaseAdmin
+      .from("bookings")
+      .select("session_id")
+      .eq("id", input.bookingId)
+      .eq("member_id", input.memberId)
+      .maybeSingle();
+    if (bookingErr) throw new HttpError(500, "Failed to load booking", bookingErr);
+    if (!bookingRow?.session_id) throw new HttpError(404, "Booking not found");
+
+    const [memberAccess, sessionRes] = await Promise.all([
+      this.getMemberAccessProfile(input.memberId),
+      supabaseAdmin
+        .from("sessions")
+        .select("id, start_at, is_online, location_id, training_level, session_types(name, category), locations(name, slug)")
+        .eq("id", String(bookingRow.session_id))
+        .is("deleted_at", null)
+        .single(),
+    ]);
+    if (sessionRes.error || !sessionRes.data) {
+      throw new HttpError(404, "Session not found", sessionRes.error);
+    }
+    if (!this.isSessionAllowedForMember(memberAccess, sessionRes.data as Record<string, unknown>)) {
+      throw new HttpError(403, "Member is not allowed to book this session");
     }
 
     const { data, error } = await supabaseAdmin.rpc("clm_rebook_booking", {
