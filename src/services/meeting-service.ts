@@ -36,6 +36,16 @@ export const MEMBER_MEETING_TYPE_COVER = [
   "Plan and progress insights",
 ] as const;
 
+function attachCoverToMeetingType(
+  meetingType: Record<string, unknown> | null | undefined,
+): Record<string, unknown> | null {
+  if (!meetingType || typeof meetingType !== "object") return null;
+  if (String(meetingType.code ?? "").toUpperCase() !== "TRACK") {
+    return meetingType;
+  }
+  return { ...meetingType, cover: [...MEMBER_MEETING_TYPE_COVER] };
+}
+
 function coachFieldsFromMeetingSlot(
   slot: { coach_id?: string | null; coaches?: unknown } | null | undefined,
 ): { coach_id: string | null; coach_name: string | null; coach_photo_url: string | null } {
@@ -210,10 +220,9 @@ export class MeetingService {
   }
 
   async listMeetingTypesForMember() {
-    const meeting_types = (await this.listMeetingTypes()).map((row) => {
-      if (String(row.code ?? "").toUpperCase() !== "TRACK") return row;
-      return { ...row, cover: [...MEMBER_MEETING_TYPE_COVER] };
-    });
+    const meeting_types = (await this.listMeetingTypes()).map((row) =>
+      attachCoverToMeetingType(row as Record<string, unknown>),
+    );
     return {
       meeting_types,
       cover: [...MEMBER_MEETING_TYPE_COVER],
@@ -746,11 +755,25 @@ export class MeetingService {
 
     const { data, error } = await query;
     if (error) throw new HttpError(500, "Failed to fetch member meetings", error);
-    return enrichMemberMeetingsWithSlotCoach((data ?? []) as Array<Record<string, unknown>>);
+    const enriched = await enrichMemberMeetingsWithSlotCoach(
+      (data ?? []) as Array<Record<string, unknown>>,
+    );
+    const meetings = enriched.map((row) => {
+      const meetingType = row.meeting_types;
+      if (!meetingType || typeof meetingType !== "object" || Array.isArray(meetingType)) {
+        return row;
+      }
+      return {
+        ...row,
+        meeting_types: attachCoverToMeetingType(meetingType as Record<string, unknown>),
+      };
+    });
+    const { meeting_types, cover } = await this.listMeetingTypesForMember();
+    return { meetings, meeting_types, cover };
   }
 
   async getEligibility(memberId: string) {
-    const history = await this.listMemberMeetings(memberId, { view: "all" });
+    const { meetings: history } = await this.listMemberMeetings(memberId, { view: "all" });
     return {
       performance: { eligible: true, nextEligibleDate: null },
       pace: { eligible: true, nextEligibleDate: null },
