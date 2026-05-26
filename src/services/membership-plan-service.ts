@@ -1,5 +1,16 @@
 import { supabaseAdmin } from "../db/supabase.js";
 import { HttpError } from "../lib/http-error.js";
+import {
+  calendarTodayYmd,
+  shouldPromoteQueuedTrainingPlanToday,
+  shouldSyncQueuedPlanToMembership,
+} from "../lib/membership-plan-sync-rules.js";
+
+export {
+  membershipCoversToday,
+  shouldPromoteQueuedTrainingPlanToday,
+  shouldSyncQueuedPlanToMembership,
+} from "../lib/membership-plan-sync-rules.js";
 
 type PlanType = "fixed" | "rolling";
 type AllocationMode = "sessions" | "location";
@@ -162,6 +173,124 @@ async function getNutritionPlans(membershipId: string) {
   return (data ?? []) as Array<Record<string, unknown>>;
 }
 
+function effectiveDateFromCancelBody(body: Record<string, unknown>, field: string): string {
+  return planDateFromBody(
+    body.effective_date ??
+      body.effectiveDate ??
+      body.scheduled_date ??
+      body.scheduledDate,
+    field,
+  );
+}
+
+async function resolveTrainingPlanForCancel(
+  membershipId: string,
+  body: Record<string, unknown>,
+  targetStatus: string,
+): Promise<Record<string, unknown>> {
+  const planId = String(body.id ?? body.queue_id ?? body.queueId ?? "").trim();
+
+  if (planId) {
+    const { data, error } = await supabaseAdmin
+      .from("membership_training_plans")
+      .select("*")
+      .eq("id", planId)
+      .eq("membership_id", membershipId)
+      .maybeSingle();
+    if (error) throw new HttpError(500, "Failed to load training plan", error);
+    if (!data) throw new HttpError(404, "Training plan not found for id");
+    const status = String((data as Record<string, unknown>).status);
+    if (status === "cancelled" || status === "completed") {
+      throw new HttpError(404, `Training plan is already ${status}`);
+    }
+    return data as Record<string, unknown>;
+  }
+
+  const startRaw = body.start_date ?? body.startDate;
+  if (startRaw) {
+    const planType = normalizePlanType(body.plan_type ?? body.planType);
+    const startDate = planDateFromBody(startRaw, "start_date");
+    const endDate =
+      planType === "fixed" && (body.end_date ?? body.endDate)
+        ? planDateFromBody(body.end_date ?? body.endDate, "end_date")
+        : null;
+    const matched = await findExistingQueuedTrainingPlan(
+      membershipId,
+      startDate,
+      planType,
+      endDate,
+    );
+    if (matched) return matched;
+  }
+
+  const { data, error } = await supabaseAdmin
+    .from("membership_training_plans")
+    .select("*")
+    .eq("membership_id", membershipId)
+    .eq("status", targetStatus)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw new HttpError(500, "Failed to load training plan", error);
+  if (!data) throw new HttpError(404, `No ${targetStatus} training plan found`);
+  return data as Record<string, unknown>;
+}
+
+async function resolveNutritionPlanForCancel(
+  membershipId: string,
+  body: Record<string, unknown>,
+  targetStatus: string,
+): Promise<Record<string, unknown>> {
+  const planId = String(body.id ?? body.queue_id ?? body.queueId ?? "").trim();
+
+  if (planId) {
+    const { data, error } = await supabaseAdmin
+      .from("membership_nutrition_plans")
+      .select("*")
+      .eq("id", planId)
+      .eq("membership_id", membershipId)
+      .maybeSingle();
+    if (error) throw new HttpError(500, "Failed to load nutrition plan", error);
+    if (!data) throw new HttpError(404, "Nutrition plan not found for id");
+    const status = String((data as Record<string, unknown>).status);
+    if (status === "cancelled" || status === "completed") {
+      throw new HttpError(404, `Nutrition plan is already ${status}`);
+    }
+    return data as Record<string, unknown>;
+  }
+
+  const startRaw = body.start_date ?? body.startDate;
+  if (startRaw) {
+    const planType = normalizePlanType(body.plan_type ?? body.planType);
+    const tier = normalizeTier(body.tier ?? body.pkg ?? body.package);
+    const startDate = planDateFromBody(startRaw, "start_date");
+    const endDate =
+      planType === "fixed" && (body.end_date ?? body.endDate)
+        ? planDateFromBody(body.end_date ?? body.endDate, "end_date")
+        : null;
+    const matched = await findExistingQueuedNutritionPlan(
+      membershipId,
+      startDate,
+      planType,
+      endDate,
+      tier,
+    );
+    if (matched) return matched;
+  }
+
+  const { data, error } = await supabaseAdmin
+    .from("membership_nutrition_plans")
+    .select("*")
+    .eq("membership_id", membershipId)
+    .eq("status", targetStatus)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw new HttpError(500, "Failed to load nutrition plan", error);
+  if (!data) throw new HttpError(404, `No ${targetStatus} nutrition plan found`);
+  return data as Record<string, unknown>;
+}
+
 async function findExistingQueuedTrainingPlan(
   membershipId: string,
   startDate: string,
@@ -299,6 +428,567 @@ export async function getActiveNutritionPlanForMembership(membershipId: string) 
     .maybeSingle();
   if (error) throw new HttpError(500, "Failed to fetch active nutrition plan", error);
   return data as Record<string, unknown> | null;
+}
+
+function clampAllocValue(n: number): number {
+  return Math.max(0, Math.min(7, Math.trunc(n)));
+}
+
+function allocRowsToSessionCounts(allocations: AllocationRow[]): Record<string, number> {
+  const out: Record<string, number> = { oneToOne: 0, elite: 0, octave: 0, group: 0 };
+  for (const row of allocations) {
+    const key = String(row.allocation_key ?? "").trim();
+    if (SESSION_ALLOCATION_KEYS.has(key)) {
+      out[key] = clampAllocValue(row.allocation_value);
+    }
+  }
+  return out;
+}
+
+function membershipDatesMatchQueuedPlan(
+  membership: Record<string, unknown>,
+  plan: Record<string, unknown>,
+): boolean {
+  const planStart = String(plan.start_date ?? "").slice(0, 10);
+  const planEnd = plan.end_date ? String(plan.end_date).slice(0, 10) : "";
+  const mmStart = membership.start_date ? String(membership.start_date).slice(0, 10) : "";
+  const mmEnd = membership.end_date ? String(membership.end_date).slice(0, 10) : "";
+  return planStart === mmStart && planEnd === mmEnd && String(membership.status ?? "") === "active";
+}
+
+async function getTokenTypeIdByCategory(): Promise<Map<string, string>> {
+  const { data, error } = await supabaseAdmin
+    .from("session_types")
+    .select("category, token_type_id, created_at")
+    .order("category", { ascending: true })
+    .order("created_at", { ascending: true });
+  if (error) throw new HttpError(500, "Failed to load session types for allowances", error);
+  const m = new Map<string, string>();
+  for (const row of data ?? []) {
+    const cat = String((row as { category: string }).category || "");
+    const tid = String((row as { token_type_id: string }).token_type_id || "");
+    if (cat && tid && !m.has(cat)) m.set(cat, tid);
+  }
+  return m;
+}
+
+const ALLOC_KEY_TO_CATEGORY: Record<string, string> = {
+  oneToOne: "1:1",
+  elite: "Elite",
+  octave: "Octave",
+  group: "Group",
+};
+
+async function syncMembershipSessionAllowancesFromPlan(
+  membershipId: string,
+  allocations: AllocationRow[],
+) {
+  const alloc = allocRowsToSessionCounts(allocations);
+  const tokenByCat = await getTokenTypeIdByCategory();
+  for (const key of ["oneToOne", "elite", "octave", "group"] as const) {
+    const cat = ALLOC_KEY_TO_CATEGORY[key];
+    const tokenTypeId = tokenByCat.get(cat);
+    const weeklyAllowance = clampAllocValue(alloc[key] ?? 0);
+    if (!tokenTypeId) {
+      if (weeklyAllowance > 0) {
+        throw new HttpError(
+          500,
+          `Cannot save session counts: no session_types row for category "${cat}".`,
+        );
+      }
+      continue;
+    }
+    const { error } = await supabaseAdmin.from("membership_session_allowances").upsert(
+      {
+        membership_id: membershipId,
+        token_type_id: tokenTypeId,
+        weekly_allowance: weeklyAllowance,
+      },
+      { onConflict: "membership_id,token_type_id" },
+    );
+    if (error) throw new HttpError(500, "Failed to sync session allowances", error);
+  }
+}
+
+async function markQueuedTrainingPlanActive(membershipId: string, planId: string): Promise<void> {
+  const now = new Date().toISOString();
+  // Complete other active rows first — unique index allows only one active per membership.
+  const { error: completeErr } = await supabaseAdmin
+    .from("membership_training_plans")
+    .update({ status: "completed", updated_at: now })
+    .eq("membership_id", membershipId)
+    .eq("status", "active")
+    .neq("id", planId);
+  if (completeErr) {
+    throw new HttpError(500, "Failed to complete prior active training plan", completeErr);
+  }
+
+  const { error: planErr } = await supabaseAdmin
+    .from("membership_training_plans")
+    .update({ status: "active", updated_at: now })
+    .eq("id", planId);
+  if (planErr) throw new HttpError(500, "Failed to mark training plan active", planErr);
+}
+
+async function markQueuedNutritionPlanActive(membershipId: string, planId: string): Promise<void> {
+  const now = new Date().toISOString();
+  const { error: completeErr } = await supabaseAdmin
+    .from("membership_nutrition_plans")
+    .update({ status: "completed", updated_at: now })
+    .eq("membership_id", membershipId)
+    .eq("status", "active")
+    .neq("id", planId);
+  if (completeErr) {
+    throw new HttpError(500, "Failed to complete prior active nutrition plan", completeErr);
+  }
+
+  const { error: planErr } = await supabaseAdmin
+    .from("membership_nutrition_plans")
+    .update({ status: "active", updated_at: now })
+    .eq("id", planId);
+  if (planErr) throw new HttpError(500, "Failed to mark nutrition plan active", planErr);
+}
+
+/** Mirrors `clm_find_membership_overlapping_window` for a membership row. */
+function membershipOverlapsBookingWindow(
+  membership: Record<string, unknown>,
+  windowStartIso: string,
+  windowEndIso: string,
+): boolean {
+  const status = String(membership.status ?? "active").trim().toLowerCase();
+  if (status !== "active") return false;
+
+  const windowStartMs = new Date(windowStartIso).getTime();
+  const windowEndMs = new Date(windowEndIso).getTime();
+  const mmStartMs = new Date(String(membership.start_date ?? "")).getTime();
+  const mmEndMs = new Date(String(membership.end_date ?? "")).getTime();
+  if (
+    !Number.isFinite(windowStartMs) ||
+    !Number.isFinite(windowEndMs) ||
+    !Number.isFinite(mmStartMs) ||
+    !Number.isFinite(mmEndMs)
+  ) {
+    return false;
+  }
+  if (mmStartMs >= windowEndMs) return false;
+  if (mmEndMs <= windowStartMs) return false;
+
+  const termMs = membership.termination_date
+    ? new Date(String(membership.termination_date)).getTime()
+    : NaN;
+  if (Number.isFinite(termMs) && termMs <= windowStartMs) return false;
+  return true;
+}
+
+function queuedPlanOverlapsBookingWindow(
+  plan: Record<string, unknown>,
+  windowStartYmd: string,
+  windowEndYmd: string,
+): boolean {
+  if (String(plan.status ?? "") !== "queued") return false;
+  const planStart = String(plan.start_date ?? "").slice(0, 10);
+  const planEnd = plan.end_date ? String(plan.end_date).slice(0, 10) : null;
+  if (!planStart || planStart >= windowEndYmd) return false;
+  if (planEnd && planEnd <= windowStartYmd) return false;
+  return true;
+}
+
+/** True when `member_memberships` spans the entire browse/booking window (not just intersects it). */
+function membershipFullyCoversBookingWindow(
+  membership: Record<string, unknown>,
+  windowStartIso: string,
+  windowEndIso: string,
+): boolean {
+  if (!membershipOverlapsBookingWindow(membership, windowStartIso, windowEndIso)) {
+    return false;
+  }
+  const windowStartMs = new Date(windowStartIso).getTime();
+  const windowEndMs = new Date(windowEndIso).getTime();
+  const mmStartMs = new Date(String(membership.start_date ?? "")).getTime();
+  const mmEndMs = new Date(String(membership.end_date ?? "")).getTime();
+  if (
+    !Number.isFinite(windowStartMs) ||
+    !Number.isFinite(windowEndMs) ||
+    !Number.isFinite(mmStartMs) ||
+    !Number.isFinite(mmEndMs)
+  ) {
+    return false;
+  }
+  if (mmStartMs > windowStartMs) return false;
+  if (mmEndMs < windowEndMs) return false;
+  return true;
+}
+
+function trainingPlanStartMs(plan: Record<string, unknown>): number {
+  return new Date(`${String(plan.start_date ?? "").slice(0, 10)}T00:00:00.000Z`).getTime();
+}
+
+function trainingPlanEndMs(plan: Record<string, unknown>): number {
+  const planType = normalizePlanType(plan.plan_type);
+  if (planType === "fixed" && plan.end_date) {
+    return new Date(`${String(plan.end_date).slice(0, 10)}T23:59:59.999Z`).getTime();
+  }
+  const startMs = trainingPlanStartMs(plan);
+  return startMs + 365 * 24 * 60 * 60 * 1000;
+}
+
+export type MembershipBrowseContext = {
+  membershipId: string;
+  filterStartMs: number;
+  filterEndMs: number;
+  allowedTokenTypeIds: Set<string>;
+};
+
+/**
+ * Browse/schedule context without mutating `member_memberships`.
+ * Unions the live membership window with overlapping queued training plans.
+ */
+export async function resolveMembershipBrowseContext(
+  memberId: string,
+  windowStartIso: string,
+  windowEndIso: string,
+): Promise<MembershipBrowseContext | null> {
+  const windowStartMs = new Date(windowStartIso).getTime();
+  const windowEndMs = new Date(windowEndIso).getTime();
+  if (!Number.isFinite(windowStartMs) || !Number.isFinite(windowEndMs)) return null;
+
+  const { data: mm, error: mmErr } = await supabaseAdmin
+    .from("member_memberships")
+    .select("*")
+    .eq("member_id", memberId)
+    .eq("mode", "inperson")
+    .maybeSingle();
+  if (mmErr) throw new HttpError(500, "Failed to load membership for browse", mmErr);
+  if (!mm) return null;
+
+  const membership = mm as Record<string, unknown>;
+  const membershipId = String(membership.id ?? "");
+  if (!membershipId) return null;
+
+  let filterStartMs: number | null = null;
+  let filterEndMs: number | null = null;
+
+  const includeInterval = (startMs: number, endMs: number) => {
+    const segStart = Math.max(startMs, windowStartMs);
+    const segEnd = Math.min(endMs, windowEndMs);
+    if (!Number.isFinite(segStart) || !Number.isFinite(segEnd) || segEnd <= segStart) return;
+    filterStartMs = filterStartMs == null ? segStart : Math.min(filterStartMs, segStart);
+    filterEndMs = filterEndMs == null ? segEnd : Math.max(filterEndMs, segEnd);
+  };
+
+  if (membershipOverlapsBookingWindow(membership, windowStartIso, windowEndIso)) {
+    const mmStartMs = new Date(String(membership.start_date ?? "")).getTime();
+    const mmEndMs = new Date(String(membership.end_date ?? "")).getTime();
+    if (Number.isFinite(mmStartMs) && Number.isFinite(mmEndMs)) {
+      includeInterval(mmStartMs, mmEndMs);
+    }
+  }
+
+  const windowStartYmd = windowStartIso.slice(0, 10);
+  const windowEndYmd = windowEndIso.slice(0, 10);
+  const plans = await getTrainingPlansWithAllocations(membershipId);
+  const overlappingQueued = plans
+    .filter((p) =>
+      queuedPlanOverlapsBookingWindow(p as Record<string, unknown>, windowStartYmd, windowEndYmd),
+    )
+    .sort((a, b) =>
+      String((a as Record<string, unknown>).start_date ?? "").localeCompare(
+        String((b as Record<string, unknown>).start_date ?? ""),
+      ),
+    );
+
+  const allowedTokenTypeIds = new Set<string>();
+  const { data: allowanceRows, error: allowanceErr } = await supabaseAdmin
+    .from("membership_session_allowances")
+    .select("token_type_id, weekly_allowance")
+    .eq("membership_id", membershipId)
+    .gt("weekly_allowance", 0);
+  if (allowanceErr) {
+    throw new HttpError(500, "Failed to fetch membership allowances for browse", allowanceErr);
+  }
+  for (const row of allowanceRows ?? []) {
+    const tokenTypeId = String((row as { token_type_id?: string }).token_type_id ?? "");
+    if (tokenTypeId) allowedTokenTypeIds.add(tokenTypeId);
+  }
+
+  const tokenByCat = await getTokenTypeIdByCategory();
+  for (const plan of overlappingQueued) {
+    const row = plan as Record<string, unknown>;
+    includeInterval(trainingPlanStartMs(row), trainingPlanEndMs(row));
+    const alloc = allocRowsToSessionCounts((row.allocations as AllocationRow[] | undefined) ?? []);
+    for (const key of ["oneToOne", "elite", "octave", "group"] as const) {
+      if ((alloc[key] ?? 0) <= 0) continue;
+      const tokenTypeId = tokenByCat.get(ALLOC_KEY_TO_CATEGORY[key]);
+      if (tokenTypeId) allowedTokenTypeIds.add(tokenTypeId);
+    }
+  }
+
+  if (filterStartMs == null || filterEndMs == null) return null;
+
+  return {
+    membershipId,
+    filterStartMs,
+    filterEndMs,
+    allowedTokenTypeIds,
+  };
+}
+
+async function writeQueuedTrainingPlanToMembership(
+  membershipId: string,
+  plan: Record<string, unknown>,
+  allocations: AllocationRow[],
+): Promise<void> {
+  const { startIso, endIso } = planWindowToIso(plan);
+  const now = new Date().toISOString();
+  const allocationMode = String(plan.allocation_mode ?? "sessions");
+  const planId = String(plan.id ?? "");
+  const queuedStart = String(plan.start_date ?? "").slice(0, 10);
+
+  const { error: mmErr } = await supabaseAdmin
+    .from("member_memberships")
+    .update({
+      status: "active",
+      termination_date: null,
+      start_date: startIso,
+      end_date: endIso,
+      updated_at: now,
+    })
+    .eq("id", membershipId);
+  if (mmErr) {
+    throw new HttpError(500, "Failed to apply queued plan dates for booking", mmErr);
+  }
+
+  if (allocationMode !== "location" && allocations.length > 0) {
+    await syncMembershipSessionAllowancesFromPlan(membershipId, allocations);
+  }
+
+  if (planId && shouldPromoteQueuedTrainingPlanToday(queuedStart)) {
+    await markQueuedTrainingPlanActive(membershipId, planId);
+  }
+}
+
+/** Apply queued plan onto member_memberships even when admin sync rules would skip (browse window only). */
+async function forceApplyQueuedTrainingPlanToMembershipForBooking(
+  membership: Record<string, unknown>,
+  plan: Record<string, unknown>,
+  allocations: AllocationRow[],
+): Promise<void> {
+  const membershipId = String(membership.id ?? "");
+  if (!membershipId) return;
+  await writeQueuedTrainingPlanToMembership(membershipId, plan, allocations);
+}
+
+/** Copy queued plan dates onto member_memberships so booking can use future start dates. */
+export async function applyQueuedTrainingPlanToMembershipForBooking(
+  membership: Record<string, unknown>,
+  plan: Record<string, unknown>,
+  allocations: AllocationRow[],
+): Promise<boolean> {
+  const membershipId = String(membership.id ?? "");
+  const queuedStart = String(plan.start_date ?? "").slice(0, 10);
+  if (!membershipId || !queuedStart) return false;
+  if (!shouldSyncQueuedPlanToMembership(membership, queuedStart)) return false;
+
+  await writeQueuedTrainingPlanToMembership(membershipId, plan, allocations);
+  return true;
+}
+
+/**
+ * Resolve membership for session browse/booking window.
+ * Falls back to queued `membership_training_plans` when `member_memberships` does not overlap.
+ */
+export async function resolveMembershipIdForBookingWindow(
+  memberId: string,
+  windowStartIso: string,
+  windowEndIso: string,
+): Promise<string | null> {
+  const { data, error } = await supabaseAdmin.rpc("clm_find_membership_overlapping_window", {
+    p_member_id: memberId,
+    p_window_start: windowStartIso,
+    p_window_end: windowEndIso,
+  });
+  if (error) throw new HttpError(500, "Failed to resolve membership for window", error);
+
+  const { data: mm, error: mmErr } = await supabaseAdmin
+    .from("member_memberships")
+    .select("*")
+    .eq("member_id", memberId)
+    .eq("mode", "inperson")
+    .maybeSingle();
+  if (mmErr) throw new HttpError(500, "Failed to load membership for booking window", mmErr);
+  if (!mm) return null;
+
+  const membership = mm as Record<string, unknown>;
+  const membershipId = String(membership.id ?? "");
+  if (!membershipId) return null;
+
+  if (
+    data &&
+    membershipFullyCoversBookingWindow(membership, windowStartIso, windowEndIso)
+  ) {
+    return String(data);
+  }
+
+  const windowStartYmd = windowStartIso.slice(0, 10);
+  const windowEndYmd = windowEndIso.slice(0, 10);
+  const plans = await getTrainingPlansWithAllocations(membershipId);
+  const overlappingQueued = plans
+    .filter((p) =>
+      queuedPlanOverlapsBookingWindow(
+        p as Record<string, unknown>,
+        windowStartYmd,
+        windowEndYmd,
+      ),
+    )
+    .sort((a, b) =>
+      String((a as Record<string, unknown>).start_date ?? "").localeCompare(
+        String((b as Record<string, unknown>).start_date ?? ""),
+      ),
+    );
+
+  if (!overlappingQueued.length) return null;
+
+  const plan = overlappingQueued[0] as Record<string, unknown>;
+  const planAllocations = (plan.allocations as AllocationRow[] | undefined) ?? [];
+
+  const applied = await applyQueuedTrainingPlanToMembershipForBooking(
+    membership,
+    plan,
+    planAllocations,
+  );
+  if (!applied) {
+    await forceApplyQueuedTrainingPlanToMembershipForBooking(
+      membership,
+      plan,
+      planAllocations,
+    );
+  }
+
+  const { data: retry, error: retryErr } = await supabaseAdmin.rpc(
+    "clm_find_membership_overlapping_window",
+    {
+      p_member_id: memberId,
+      p_window_start: windowStartIso,
+      p_window_end: windowEndIso,
+    },
+  );
+  if (retryErr) {
+    throw new HttpError(500, "Failed to resolve membership after queued plan apply", retryErr);
+  }
+  return retry ? String(retry) : membershipId;
+}
+
+function membershipRowHasActivePlanWindow(membership: Record<string, unknown>): boolean {
+  const status = String(membership.status ?? "active").trim().toLowerCase();
+  if (status === "terminated" || status === "ended") return false;
+  const termMs = membership.termination_date
+    ? new Date(String(membership.termination_date)).getTime()
+    : NaN;
+  if (Number.isFinite(termMs) && termMs <= Date.now()) return false;
+  const today = calendarTodayYmd();
+  const endYmd = membership.end_date ? String(membership.end_date).slice(0, 10) : "";
+  if (endYmd && endYmd < today) return false;
+  const startYmd = membership.start_date ? String(membership.start_date).slice(0, 10) : "";
+  if (startYmd && startYmd > today) return false;
+  return true;
+}
+
+function planWindowToIso(plan: Record<string, unknown>): { startIso: string; endIso: string } {
+  const planType = normalizePlanType(plan.plan_type);
+  const startDate = String(plan.start_date ?? "").slice(0, 10);
+  const startIso = `${startDate}T00:00:00.000Z`;
+  let endIso: string;
+  if (planType === "fixed" && plan.end_date) {
+    endIso = `${String(plan.end_date).slice(0, 10)}T23:59:59.999Z`;
+  } else {
+    endIso = new Date(new Date(startIso).getTime() + 365 * 24 * 60 * 60 * 1000).toISOString();
+  }
+  return { startIso, endIso };
+}
+
+/**
+ * When the membership window has ended (cancelled, terminated, or past end_date) and a
+ * queued training plan's start_date is today or earlier, copy it onto `member_memberships`.
+ */
+export async function activateDueQueuedTrainingPlansIfNeeded(
+  membership: Record<string, unknown>,
+): Promise<{
+  allocationMode: string;
+  allocations: AllocationRow[];
+} | null> {
+  const membershipId = String(membership.id ?? "");
+  if (!membershipId) return null;
+
+  const today = calendarTodayYmd();
+  const plans = await getTrainingPlansWithAllocations(membershipId);
+  const dueQueued = plans
+    .filter((p) => {
+      const row = p as Record<string, unknown>;
+      if (String(row.status) !== "queued") return false;
+      const start = String(row.start_date ?? "").slice(0, 10);
+      return start && start <= today;
+    })
+    .sort((a, b) =>
+      String((a as Record<string, unknown>).start_date ?? "").localeCompare(
+        String((b as Record<string, unknown>).start_date ?? ""),
+      ),
+    );
+  if (!dueQueued.length) return null;
+
+  const plan = dueQueued[0] as Record<string, unknown>;
+  const planId = String(plan.id ?? "");
+  const planAllocations = (plan.allocations as AllocationRow[] | undefined) ?? [];
+  const now = new Date().toISOString();
+  const alreadyOnMembership = membershipDatesMatchQueuedPlan(membership, plan);
+
+  if (!alreadyOnMembership) {
+    if (membershipRowHasActivePlanWindow(membership)) return null;
+    await applyQueuedTrainingPlanToMembershipForBooking(membership, plan, planAllocations);
+  } else if (planAllocations.length > 0) {
+    const allocationMode = String(plan.allocation_mode ?? "sessions");
+    if (allocationMode !== "location") {
+      await syncMembershipSessionAllowancesFromPlan(membershipId, planAllocations);
+    }
+  }
+
+  await markQueuedTrainingPlanActive(membershipId, planId);
+
+  return {
+    allocationMode: String(plan.allocation_mode ?? "sessions"),
+    allocations: planAllocations,
+  };
+}
+
+/** Promote the earliest due queued nutrition plan when none is active. */
+export async function activateDueQueuedNutritionPlansIfNeeded(membershipId: string): Promise<boolean> {
+  const active = await getActiveNutritionPlanForMembership(membershipId);
+  if (active) return false;
+
+  const today = calendarTodayYmd();
+  const plans = await getNutritionPlans(membershipId);
+  const dueQueued = plans
+    .filter((p) => {
+      if (String(p.status) !== "queued") return false;
+      const start = String(p.start_date ?? "").slice(0, 10);
+      return start && start <= today;
+    })
+    .sort((a, b) => String(a.start_date ?? "").localeCompare(String(b.start_date ?? "")));
+  if (!dueQueued.length) return false;
+
+  const plan = dueQueued[0];
+  const planId = String(plan.id ?? "");
+  const now = new Date().toISOString();
+  const tier = normalizeTier(plan.tier);
+
+  await markQueuedNutritionPlanActive(membershipId, planId);
+
+  const { error: pkgErr } = await supabaseAdmin
+    .from("member_memberships")
+    .update({ current_package: tier, updated_at: now })
+    .eq("id", membershipId);
+  if (pkgErr) throw new HttpError(500, "Failed to sync nutrition tier on membership", pkgErr);
+
+  return true;
 }
 
 /** PUT/PATCH/POST `/admin/members/:memberId/membership/nutrition/current` */
@@ -479,6 +1169,25 @@ export async function queueAdminTrainingPlan(memberId: string, body: Record<stri
         allocation_value: Number((row as { allocation_value: number }).allocation_value),
       })) ?? [];
 
+  const planWithAlloc = { ...plan, allocations: allocationsSaved };
+  await applyQueuedTrainingPlanToMembershipForBooking(
+    membership,
+    planWithAlloc,
+    allocationsSaved.map((row) => ({
+      allocation_key: row.allocation_key,
+      allocation_value: row.allocation_value,
+    })),
+  );
+
+  const { data: refreshedPlan } = await supabaseAdmin
+    .from("membership_training_plans")
+    .select("*")
+    .eq("id", String(plan.id))
+    .maybeSingle();
+  const planForResponse = refreshedPlan
+    ? { ...(refreshedPlan as Record<string, unknown>), allocations: allocationsSaved }
+    : planWithAlloc;
+
   const queued = (await getTrainingPlansWithAllocations(membershipId))
     .filter((p) => String((p as Record<string, unknown>).status) === "queued")
     .map((p) =>
@@ -489,62 +1198,129 @@ export async function queueAdminTrainingPlan(memberId: string, body: Record<stri
     );
 
   const mapped = mapTrainingPlanForDashboard(
-    { ...plan, allocations: allocationsSaved },
+    planForResponse,
     String(membership.current_package ?? "pace"),
   );
 
   return { ...mapped, created: mapped, queued };
 }
 
-export async function cancelAdminTrainingPlan(memberId: string, body: Record<string, unknown>) {
+/** Admin dashboard: cancel current plan stored on `member_memberships` (via training/current). */
+export async function cancelAdminActiveTrainingMembership(
+  memberId: string,
+  body: Record<string, unknown>,
+) {
   const membership = await getMembershipForMember(memberId, body.mode as string | undefined);
   const membershipId = String(membership.id);
-  const targetStatus = String(body.target_status ?? body.targetStatus ?? "queued").toLowerCase();
-  if (targetStatus !== "active" && targetStatus !== "queued") {
-    throw new HttpError(400, "target_status must be active or queued");
+  const status = String(membership.status ?? "active").toLowerCase();
+  if (status === "terminated" || status === "ended") {
+    throw new HttpError(404, "No active membership plan found");
   }
+  const existingTermMs = membership.termination_date
+    ? new Date(String(membership.termination_date)).getTime()
+    : NaN;
+  if (Number.isFinite(existingTermMs) && existingTermMs <= Date.now()) {
+    throw new HttpError(404, "Membership is already terminated");
+  }
+
   const cancelMode = String(body.cancel_mode ?? body.cancelMode ?? "immediate").toLowerCase();
   if (!["immediate", "end", "scheduled"].includes(cancelMode)) {
     throw new HttpError(400, "cancel_mode must be immediate, end, or scheduled");
   }
 
-  const planId = String(body.id ?? body.queue_id ?? body.queueId ?? "").trim();
-  let plan: Record<string, unknown> | null = null;
-
-  if (planId) {
-    const { data, error } = await supabaseAdmin
-      .from("membership_training_plans")
-      .select("*")
-      .eq("id", planId)
-      .eq("membership_id", membershipId)
-      .maybeSingle();
-    if (error) throw new HttpError(500, "Failed to load training plan", error);
-    plan = data as Record<string, unknown> | null;
-    if (!plan || String(plan.status) !== targetStatus) {
-      throw new HttpError(404, `No ${targetStatus} training plan found for id`);
-    }
+  const endYmd = membership.end_date
+    ? String(membership.end_date).slice(0, 10)
+    : "";
+  let effectiveYmd: string;
+  if (cancelMode === "scheduled") {
+    effectiveYmd = effectiveDateFromCancelBody(body, "effective_date");
+  } else if (cancelMode === "end") {
+    if (!endYmd) throw new HttpError(400, "end cancellation requires membership end_date");
+    effectiveYmd = endYmd;
   } else {
-    const { data, error } = await supabaseAdmin
-      .from("membership_training_plans")
-      .select("*")
-      .eq("membership_id", membershipId)
-      .eq("status", targetStatus)
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    if (error) throw new HttpError(500, "Failed to load training plan", error);
-    plan = data as Record<string, unknown> | null;
-    if (!plan) throw new HttpError(404, `No ${targetStatus} training plan found`);
+    effectiveYmd = new Date().toISOString().slice(0, 10);
   }
+
+  const terminationIso =
+    cancelMode === "immediate" ? new Date().toISOString() : `${effectiveYmd}T23:59:59.999Z`;
+
+  const now = new Date().toISOString();
+  const { data: updated, error: updErr } = await supabaseAdmin
+    .from("member_memberships")
+    .update({
+      status: "terminated",
+      termination_date: terminationIso,
+      updated_at: now,
+    })
+    .eq("id", membershipId)
+    .select("*")
+    .single();
+  if (updErr) throw new HttpError(500, "Failed to cancel membership plan", updErr);
+
+  await supabaseAdmin
+    .from("membership_training_plans")
+    .update({
+      status: "cancelled",
+      cancel_mode: cancelMode,
+      cancel_effective_date: effectiveYmd,
+      cancel_reason: body.reason != null ? String(body.reason) : null,
+      cancelled_at: now,
+      updated_at: now,
+    })
+    .eq("membership_id", membershipId)
+    .eq("status", "active");
+
+  const membershipPackage = String(membership.current_package ?? "pace");
+  const queued = (await getTrainingPlansWithAllocations(membershipId))
+    .filter((p) => String((p as Record<string, unknown>).status) === "queued")
+    .map((p) =>
+      mapTrainingPlanForDashboard(p as Record<string, unknown>, membershipPackage),
+    );
+
+  const cancelled = mapTrainingPlanForDashboard(
+    {
+      id: membershipId,
+      status: "cancelled",
+      plan_type: "fixed",
+      start_date: String((updated as { start_date?: string }).start_date ?? "").slice(0, 10),
+      end_date: endYmd || null,
+      cancel_mode: cancelMode,
+      cancel_effective_date: effectiveYmd,
+      allocations: [],
+    },
+    membershipPackage,
+  );
+
+  return {
+    cancelled,
+    membership: updated,
+    queued,
+  };
+}
+
+export async function cancelAdminTrainingPlan(memberId: string, body: Record<string, unknown>) {
+  const targetStatus = String(body.target_status ?? body.targetStatus ?? "active").toLowerCase();
+  if (targetStatus !== "active" && targetStatus !== "queued") {
+    throw new HttpError(400, "target_status must be active or queued");
+  }
+  if (targetStatus === "active") {
+    return cancelAdminActiveTrainingMembership(memberId, body);
+  }
+
+  const membership = await getMembershipForMember(memberId, body.mode as string | undefined);
+  const membershipId = String(membership.id);
+  const cancelMode = String(body.cancel_mode ?? body.cancelMode ?? "immediate").toLowerCase();
+  if (!["immediate", "end", "scheduled"].includes(cancelMode)) {
+    throw new HttpError(400, "cancel_mode must be immediate, end, or scheduled");
+  }
+
+  const plan = await resolveTrainingPlanForCancel(membershipId, body, targetStatus);
 
   const startDate = String(plan.start_date ?? "");
   const endDate = plan.end_date ? String(plan.end_date) : null;
   let effectiveDate = startDate;
   if (cancelMode === "scheduled") {
-    effectiveDate = planDateFromBody(
-      body.effective_date ?? body.effectiveDate,
-      "effective_date",
-    );
+    effectiveDate = effectiveDateFromCancelBody(body, "effective_date");
   } else if (cancelMode === "end") {
     if (!endDate) throw new HttpError(400, "end cancellation requires plan end_date");
     effectiveDate = endDate;
@@ -655,6 +1431,15 @@ export async function queueAdminNutritionPlan(memberId: string, body: Record<str
     plan = inserted as Record<string, unknown>;
   }
 
+  const savedNutritionPlanId = String(plan.id ?? "");
+  if (savedNutritionPlanId && startDate <= calendarTodayYmd()) {
+    await markQueuedNutritionPlanActive(membershipId, savedNutritionPlanId);
+    await supabaseAdmin
+      .from("member_memberships")
+      .update({ current_package: tier, updated_at: now })
+      .eq("id", membershipId);
+  }
+
   const queued = (await getNutritionPlans(membershipId))
     .filter((p) => String(p.status) === "queued")
     .map((p) => mapNutritionPlanForDashboard(p));
@@ -675,42 +1460,12 @@ export async function cancelAdminNutritionPlan(memberId: string, body: Record<st
     throw new HttpError(400, "cancel_mode must be immediate, end, or scheduled");
   }
 
-  const planId = String(body.id ?? body.queue_id ?? body.queueId ?? "").trim();
-  let plan: Record<string, unknown> | null = null;
-
-  if (planId) {
-    const { data, error } = await supabaseAdmin
-      .from("membership_nutrition_plans")
-      .select("*")
-      .eq("id", planId)
-      .eq("membership_id", membershipId)
-      .maybeSingle();
-    if (error) throw new HttpError(500, "Failed to load nutrition plan", error);
-    plan = data as Record<string, unknown> | null;
-    if (!plan || String(plan.status) !== targetStatus) {
-      throw new HttpError(404, `No ${targetStatus} nutrition plan found for id`);
-    }
-  } else {
-    const { data, error } = await supabaseAdmin
-      .from("membership_nutrition_plans")
-      .select("*")
-      .eq("membership_id", membershipId)
-      .eq("status", targetStatus)
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    if (error) throw new HttpError(500, "Failed to load nutrition plan", error);
-    plan = data as Record<string, unknown> | null;
-    if (!plan) throw new HttpError(404, `No ${targetStatus} nutrition plan found`);
-  }
+  const plan = await resolveNutritionPlanForCancel(membershipId, body, targetStatus);
 
   const endDate = plan.end_date ? String(plan.end_date) : null;
   let effectiveDate = String(plan.start_date ?? "");
   if (cancelMode === "scheduled") {
-    effectiveDate = planDateFromBody(
-      body.effective_date ?? body.effectiveDate,
-      "effective_date",
-    );
+    effectiveDate = effectiveDateFromCancelBody(body, "effective_date");
   } else if (cancelMode === "end") {
     if (!endDate) throw new HttpError(400, "end cancellation requires plan end_date");
     effectiveDate = endDate;

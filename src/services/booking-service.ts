@@ -5,6 +5,10 @@ import {
   ukBookingNowIso,
   ukDayBoundsUtcIso,
 } from "../lib/uk-booking-time.js";
+import {
+  resolveMembershipBrowseContext,
+  resolveMembershipIdForBookingWindow,
+} from "./membership-plan-service.js";
 
 /** Must match `clm_cancel_booking` refund window (hours before session start). */
 const BOOKING_REFUND_WINDOW_HOURS = 24;
@@ -84,7 +88,7 @@ export class BookingService {
     return null;
   }
 
-  /** Resolve membership for a browse window (supports future membership start dates). */
+  /** Resolve membership for a browse window (member_memberships + queued plan fallback). */
   private async findMembershipForWindow(
     memberId: string,
     windowStartIso: string,
@@ -99,13 +103,28 @@ export class BookingService {
             (Number.isFinite(startMs) ? startMs : Date.now()) + 28 * 86400000,
           ).toISOString();
 
-    const { data, error } = await supabaseAdmin.rpc("clm_find_membership_overlapping_window", {
-      p_member_id: memberId,
-      p_window_start: windowStartIso,
-      p_window_end: windowEnd,
-    });
-    if (error) throw new HttpError(500, "Failed to resolve membership for window", error);
-    return data ? String(data) : null;
+    return resolveMembershipIdForBookingWindow(memberId, windowStartIso, windowEnd);
+  }
+
+  /** Same window rules as `clm_create_booking` (session week + 28-day horizon). */
+  private async resolveMembershipIdForSession(
+    memberId: string,
+    sessionStartAt: string,
+  ): Promise<string> {
+    const startMs = new Date(sessionStartAt).getTime();
+    if (!Number.isFinite(startMs)) {
+      throw new HttpError(400, "Invalid session start time");
+    }
+    const windowEnd = new Date(startMs + 28 * 86400000).toISOString();
+    const membershipId = await resolveMembershipIdForBookingWindow(
+      memberId,
+      sessionStartAt,
+      windowEnd,
+    );
+    if (!membershipId) {
+      throw new HttpError(422, "No membership covers this session");
+    }
+    return membershipId;
   }
 
   private async getMemberAccessProfile(memberId: string): Promise<{
@@ -150,6 +169,39 @@ export class BookingService {
       trainingLevels: toCodeSet(trainingRowsRes.data, "level_code"),
       sessionAccess: toCodeSet(sessionRowsRes.data, "session_code"),
     };
+  }
+
+  /** In-person sessions: all locations the member can access (not only profile default). */
+  private async resolveInPersonLocationIds(
+    memberAccess: { locationCodes: Set<string> },
+    options: { explicitLocationId?: string; profileLocationId?: string | null },
+  ): Promise<string[] | null> {
+    if (options.explicitLocationId) return [options.explicitLocationId];
+
+    if (memberAccess.locationCodes.size > 0) {
+      const { data: locations, error } = await supabaseAdmin
+        .from("locations")
+        .select("id, name, slug");
+      if (error) throw new HttpError(500, "Failed to load locations", error);
+      const ids = (locations ?? [])
+        .filter((row) => {
+          const loc = row as { id: string; name?: string | null; slug?: string | null };
+          const slug = this.normalizeAccessCode(loc.slug);
+          const name = this.normalizeAccessCode(loc.name);
+          return (
+            (slug && memberAccess.locationCodes.has(slug)) ||
+            (name && memberAccess.locationCodes.has(name))
+          );
+        })
+        .map((row) => String((row as { id: string }).id));
+      if (ids.length > 0) return ids;
+    }
+
+    return options.profileLocationId ? [options.profileLocationId] : null;
+  }
+
+  private isNamedSessionProgramCode(code: string): boolean {
+    return this.knownSessionAccessCodes.has(code);
   }
 
   /**
@@ -256,10 +308,25 @@ export class BookingService {
       }
     }
 
-    // Training level: when member has an allow-list in DB, session must map to at least one allowed code.
-    // 1:1 sessions are exempt. Elite/Octave/Group use charged/noncharged or level names on the session row.
-    const bypassTrainingLevelCheck = sessionTypeCode === "11" || sessionCategoryCode === "11";
-    if (!bypassTrainingLevelCheck && access.trainingLevels.size > 0) {
+    const isOneToOne = sessionTypeCode === "11" || sessionCategoryCode === "11";
+    const isNamedProgram =
+      this.isNamedSessionProgramCode(sessionTypeCode) ||
+      this.isNamedSessionProgramCode(sessionCategoryCode);
+
+    // Charged / non-charged on the session row always requires that toggle (all session types except 1:1).
+    if (
+      !isOneToOne &&
+      (trainingLevelCode === "charged" || trainingLevelCode === "noncharged") &&
+      !access.trainingLevels.has(trainingLevelCode)
+    ) {
+      return {
+        reason: "training_level",
+        normalized: { sessionTypeCode, sessionCategoryCode, trainingLevelCode, locationNameCode, locationSlugCode },
+      };
+    }
+
+    // Mastery / beast / etc. on Elite & Octave rows (not named programs — those use member_session_access).
+    if (!isOneToOne && !isNamedProgram && access.trainingLevels.size > 0) {
       const sessionLevelCodes = this.resolveSessionTrainingLevelCodes(session);
       const sexMatchedElite =
         eliteSexKind &&
@@ -279,6 +346,15 @@ export class BookingService {
               normalized: { sessionTypeCode, sessionCategoryCode, trainingLevelCode, locationNameCode, locationSlugCode },
             };
           }
+        } else if (
+          trainingLevelCode &&
+          this.memberTrainingLevelCodes.has(trainingLevelCode) &&
+          !access.trainingLevels.has(trainingLevelCode)
+        ) {
+          return {
+            reason: "training_level",
+            normalized: { sessionTypeCode, sessionCategoryCode, trainingLevelCode, locationNameCode, locationSlugCode },
+          };
         }
       } else if (sessionLevelCodes.size === 0) {
         return {
@@ -294,7 +370,7 @@ export class BookingService {
     }
 
     // Session access: named session types (ReShape, Hybrid, etc.) from admin Member > Sessions tab.
-    if (access.sessionAccess.size > 0 && !bypassTrainingLevelCheck) {
+    if (access.sessionAccess.size > 0 && !isOneToOne) {
       const sessionIsInAccessScope =
         this.knownSessionAccessCodes.has(sessionTypeCode) ||
         this.knownSessionAccessCodes.has(sessionCategoryCode);
@@ -346,10 +422,9 @@ export class BookingService {
   }
 
   async getBookingContext(memberId: string) {
-    const { data: activeMembershipId } = await supabaseAdmin.rpc("clm_find_active_membership", {
-      p_member_id: memberId,
-      p_now: new Date().toISOString(),
-    });
+    const nowIso = ukBookingNowIso();
+    const windowEnd = new Date(Date.now() + 28 * 86400000).toISOString();
+    const activeMembershipId = await this.findMembershipForWindow(memberId, nowIso, windowEnd);
     const [{ data: membership }, { data: bookings }, { data: tokens }, { data: profile }] =
       await Promise.all([
         activeMembershipId
@@ -411,14 +486,27 @@ export class BookingService {
       "session_types(id, name, category, token_type_id, audience, default_capacity, default_duration_mins, max_per_day, color, category_icon, icon, display_order, is_active)";
     const sessionsSelect = `*, ${sessionTypesSelect}, locations(name, slug), coaches!sessions_coach_id_fkey(admins(name, photo_url))`;
 
-    const [{ data: user, error: userError }, activeMembershipId, memberAccess] = await Promise.all([
+    const [{ data: user, error: userError }, browseContext, memberAccess] = await Promise.all([
       supabaseAdmin.from("profiles").select("sex, location_id").eq("id", memberId).single(),
-      this.findMembershipForWindow(memberId, effectiveFrom, membershipWindowEnd),
+      resolveMembershipBrowseContext(memberId, effectiveFrom, membershipWindowEnd),
       this.getMemberAccessProfile(memberId),
     ]);
 
     if (userError || !user) throw new HttpError(404, "Member not found");
-    if (!activeMembershipId) return [];
+    if (!browseContext) return [];
+
+    const activeMembershipId = browseContext.membershipId;
+    const membershipFilterStartMs = browseContext.filterStartMs;
+    const membershipFilterEndMs = browseContext.filterEndMs;
+    const allowedTokenTypeIds = browseContext.allowedTokenTypeIds;
+
+    const inPersonLocationIds =
+      isOnline === true
+        ? null
+        : await this.resolveInPersonLocationIds(memberAccess, {
+            explicitLocationId: locationId,
+            profileLocationId: (user as { location_id?: string | null }).location_id ?? null,
+          });
 
     let sessionsQuery = supabaseAdmin
       .from("sessions")
@@ -433,51 +521,29 @@ export class BookingService {
       sessionsQuery = sessionsQuery.eq("is_online", true);
     } else {
       sessionsQuery = sessionsQuery.eq("is_online", false);
-      const effectiveLocationId = locationId ?? (user as { location_id?: string | null }).location_id;
-      if (effectiveLocationId) sessionsQuery = sessionsQuery.eq("location_id", effectiveLocationId);
+      if (inPersonLocationIds?.length === 1) {
+        sessionsQuery = sessionsQuery.eq("location_id", inPersonLocationIds[0]);
+      } else if (inPersonLocationIds && inPersonLocationIds.length > 1) {
+        sessionsQuery = sessionsQuery.in("location_id", inPersonLocationIds);
+      }
     }
 
-    const [{ data: allowanceRows, error: allowanceErr }, { data: sessions, error }, { data: membershipRow, error: membershipRowErr }] =
+    const [{ data: sessions, error }, { data: membershipRow, error: membershipRowErr }] =
       await Promise.all([
-        supabaseAdmin
-          .from("membership_session_allowances")
-          .select("token_type_id, weekly_allowance")
-          .eq("membership_id", activeMembershipId)
-          .gt("weekly_allowance", 0),
         sessionsQuery,
         supabaseAdmin
           .from("member_memberships")
-          .select("start_date, end_date, termination_date")
+          .select("termination_date")
           .eq("id", activeMembershipId)
           .single(),
       ]);
 
-    if (allowanceErr) throw new HttpError(500, "Failed to fetch membership allowances", allowanceErr);
     if (error) throw new HttpError(500, "Failed to fetch available sessions", error);
     if (membershipRowErr) {
       throw new HttpError(500, "Failed to load membership dates", membershipRowErr);
     }
 
-    const allowedTokenTypeIds = new Set(
-      (allowanceRows ?? [])
-        .map((r) => (r as { token_type_id?: string }).token_type_id)
-        .filter((v): v is string => Boolean(v)),
-    );
-
-    const allowedSessionCategories = new Set<string>();
-    if (allowedTokenTypeIds.size > 0) {
-      const { data: categoryRows, error: categoryErr } = await supabaseAdmin
-        .from("session_types")
-        .select("token_type_id, category")
-        .in("token_type_id", [...allowedTokenTypeIds]);
-      if (categoryErr) {
-        throw new HttpError(500, "Failed to resolve session categories for allowances", categoryErr);
-      }
-      for (const row of categoryRows ?? []) {
-        const cat = this.normalizeAccessCode((row as { category?: string }).category);
-        if (cat) allowedSessionCategories.add(cat);
-      }
-    }
+    if (allowedTokenTypeIds.size === 0) return [];
 
     const normalizedSex = String((user as { sex?: string | null }).sex ?? "")
       .trim()
@@ -500,12 +566,6 @@ export class BookingService {
       training_level?: string | null;
     };
 
-    const membershipStartMs = membershipRow?.start_date
-      ? new Date(String(membershipRow.start_date)).getTime()
-      : null;
-    const membershipEndMs = membershipRow?.end_date
-      ? new Date(String(membershipRow.end_date)).getTime()
-      : null;
     const membershipTermMs = membershipRow?.termination_date
       ? new Date(String(membershipRow.termination_date)).getTime()
       : null;
@@ -513,10 +573,7 @@ export class BookingService {
     const list = ((sessions ?? []) as SessionRow[]).filter((s) => {
       const startMs = new Date(String(s.start_at ?? "")).getTime();
       if (!Number.isFinite(startMs)) return false;
-      if (membershipStartMs != null && Number.isFinite(membershipStartMs) && startMs < membershipStartMs) {
-        return false;
-      }
-      if (membershipEndMs != null && Number.isFinite(membershipEndMs) && startMs >= membershipEndMs) {
+      if (startMs < membershipFilterStartMs || startMs >= membershipFilterEndMs) {
         return false;
       }
       if (membershipTermMs != null && Number.isFinite(membershipTermMs) && startMs >= membershipTermMs) {
@@ -544,21 +601,8 @@ export class BookingService {
             .toLowerCase();
           const audienceAllowed = allowedAudiences.has(audience || "mixed");
           const accessDebug = this.getSessionAccessDebug(memberAccess, s, normalizedSex);
-          const sessionCategoryCode = this.normalizeAccessCode(s.session_types?.category);
-          const isOneToOne =
-            sessionCategoryCode === "11" ||
-            accessDebug.normalized.sessionTypeCode === "11" ||
-            accessDebug.normalized.sessionCategoryCode === "11";
           if (!tokenTypeId || !allowedTokenTypeIds.has(String(tokenTypeId))) {
             rejectedDebug.push({ sessionId: String(s.id), reason: "token" });
-            return false;
-          }
-          if (
-            !isOneToOne &&
-            allowedSessionCategories.size > 0 &&
-            !allowedSessionCategories.has(sessionCategoryCode)
-          ) {
-            rejectedDebug.push({ sessionId: String(s.id), reason: "allowance_category" });
             return false;
           }
           if (!audienceAllowed) {
@@ -750,12 +794,18 @@ export class BookingService {
     }
 
     const sessionRow = sessionRes.data as { start_at: string };
-    assertBookableStartNotPast(String(sessionRow.start_at ?? ""));
+    const sessionStartAt = String(sessionRow.start_at ?? "");
+    assertBookableStartNotPast(sessionStartAt);
+
+    const membershipId = await this.resolveMembershipIdForSession(
+      input.memberId,
+      sessionStartAt,
+    );
 
     const nowIso = ukBookingNowIso();
     const { data, error } = await supabaseAdmin.rpc("clm_create_booking", {
       p_member_id: input.memberId,
-      p_membership_id: input.membershipId,
+      p_membership_id: membershipId,
       p_session_id: input.sessionId,
       p_now: nowIso,
     });
@@ -775,18 +825,6 @@ export class BookingService {
 
   /** Rebook the same session after cancel — re-activates the cancelled row (avoids member+session unique constraint). */
   async rebookBooking(input: { bookingId: string; memberId: string; membershipId?: string }) {
-    let membershipId = input.membershipId?.trim();
-    if (!membershipId) {
-      const nowIso = ukBookingNowIso();
-      const { data: activeMembershipId, error: memErr } = await supabaseAdmin.rpc(
-        "clm_find_active_membership",
-        { p_member_id: input.memberId, p_now: nowIso },
-      );
-      if (memErr) throw new HttpError(500, "Failed to resolve active membership", memErr);
-      if (!activeMembershipId) throw new HttpError(422, "No active membership");
-      membershipId = String(activeMembershipId);
-    }
-
     const { data: bookingRow, error: bookingErr } = await supabaseAdmin
       .from("bookings")
       .select("session_id")
@@ -812,6 +850,12 @@ export class BookingService {
     if (!this.isSessionAllowedForMember(memberAccess, sessionRes.data as Record<string, unknown>, profileRes.data?.sex)) {
       throw new HttpError(403, "Member is not allowed to book this session");
     }
+
+    const sessionStartAt = String((sessionRes.data as { start_at: string }).start_at ?? "");
+    const membershipId = await this.resolveMembershipIdForSession(
+      input.memberId,
+      sessionStartAt,
+    );
 
     const { data, error } = await supabaseAdmin.rpc("clm_rebook_booking", {
       p_member_id: input.memberId,
@@ -847,12 +891,18 @@ export class BookingService {
     }
 
     const sessionRow = sessionRes.data as { start_at: string };
-    assertBookableStartNotPast(String(sessionRow.start_at ?? ""));
+    const sessionStartAt = String(sessionRow.start_at ?? "");
+    assertBookableStartNotPast(sessionStartAt);
+
+    const membershipId = await this.resolveMembershipIdForSession(
+      input.memberId,
+      sessionStartAt,
+    );
 
     const nowIso = ukBookingNowIso();
     const { data, error } = await supabaseAdmin.rpc("clm_join_waitlist", {
       p_member_id: input.memberId,
-      p_membership_id: input.membershipId,
+      p_membership_id: membershipId,
       p_session_id: input.sessionId,
       p_now: nowIso,
     });

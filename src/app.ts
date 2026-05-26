@@ -4,6 +4,7 @@ import cors from "cors";
 import routes from "./routes/index.js";
 import { env } from "./config/env.js";
 import { errorHandler } from "./middleware/error-handler.js";
+import { runActivateDueQueuedPlans } from "./jobs/activate-due-queued-plans.js";
 import { runWeeklyTokenGeneration } from "./jobs/weekly-token-generation.js";
 import { runNotificationSend } from "./jobs/notification-send.js";
 
@@ -28,6 +29,18 @@ cron.schedule("0 2 * * 1", async () => {
     console.log("[cron] Weekly token generation completed");
   } catch (err) {
     console.error("[cron] Weekly token generation failed:", err);
+  }
+}, { timezone: "Europe/London" });
+
+// Queued membership plans: daily at 01:05 UK time
+cron.schedule("5 1 * * *", async () => {
+  try {
+    const result = await runActivateDueQueuedPlans();
+    console.log(
+      `[cron] Queued plan activation: scanned=${result.scanned} training=${result.trainingActivated} nutrition=${result.nutritionActivated}`,
+    );
+  } catch (err) {
+    console.error("[cron] Queued plan activation failed:", err);
   }
 }, { timezone: "Europe/London" });
 

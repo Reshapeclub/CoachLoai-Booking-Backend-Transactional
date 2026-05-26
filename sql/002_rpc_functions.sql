@@ -733,3 +733,91 @@ begin
   );
 end;
 $$;
+
+-- Mirror pause apply: shift member_memberships.end_date by N weeks (negative to reverse a pause).
+create or replace function clm_adjust_membership_end_by_weeks(
+  p_membership_id uuid,
+  p_weeks int
+)
+returns jsonb
+language plpgsql
+as $$
+declare
+  v_new_end timestamptz;
+begin
+  update member_memberships
+  set
+    end_date = end_date + (p_weeks * interval '7 days'),
+    updated_at = now()
+  where id = p_membership_id
+  returning end_date into v_new_end;
+
+  if not found then raise exception 'Membership not found'; end if;
+
+  return jsonb_build_object(
+    'ok', true,
+    'endDate', v_new_end,
+    'weeksAdjusted', p_weeks
+  );
+end;
+$$;
+
+-- Cancel pause atomically: delete pause week rows and reverse end_date once (avoids double reversal).
+create or replace function clm_cancel_membership_pause(
+  p_membership_id uuid,
+  p_pause_week_ids uuid[] default null,
+  p_reverse_extensions boolean default true,
+  p_now timestamptz default now()
+)
+returns jsonb
+language plpgsql
+as $$
+declare
+  v_removed_weeks int;
+  v_new_end timestamptz;
+  v_has_remaining boolean;
+begin
+  perform 1 from member_memberships where id = p_membership_id for update;
+  if not found then raise exception 'Membership not found'; end if;
+
+  with deleted as (
+    delete from membership_pause_weeks mpw
+    where mpw.membership_id = p_membership_id
+      and (
+        p_pause_week_ids is null
+        or mpw.id = any(p_pause_week_ids)
+      )
+    returning 1
+  )
+  select count(*)::int into v_removed_weeks from deleted;
+
+  if p_reverse_extensions and v_removed_weeks > 0 then
+    update member_memberships
+    set
+      end_date = end_date - (v_removed_weeks * interval '7 days'),
+      updated_at = p_now
+    where id = p_membership_id
+    returning end_date into v_new_end;
+  else
+    select end_date into v_new_end
+    from member_memberships
+    where id = p_membership_id;
+  end if;
+
+  select exists (
+    select 1 from membership_pause_weeks mpw where mpw.membership_id = p_membership_id
+  ) into v_has_remaining;
+
+  update member_memberships
+  set is_paused = v_has_remaining, updated_at = p_now
+  where id = p_membership_id;
+
+  return jsonb_build_object(
+    'ok', true,
+    'removedWeeks', v_removed_weeks,
+    'reversedDays', case when p_reverse_extensions then v_removed_weeks * 7 else 0 end,
+    'endDate', v_new_end,
+    'isPaused', v_has_remaining
+  );
+end;
+$$;

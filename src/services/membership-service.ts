@@ -66,6 +66,22 @@ function normalizeDashboardMode(value: string | undefined): MembershipMode {
     : "inperson";
 }
 
+function membershipHasActivePlanWindow(membership: MembershipRow | null): boolean {
+  if (!membership) return false;
+  const status = String(membership.status ?? "active").trim().toLowerCase();
+  if (status === "terminated" || status === "ended") return false;
+  const termMs = membership.termination_date
+    ? new Date(String(membership.termination_date)).getTime()
+    : NaN;
+  if (Number.isFinite(termMs) && termMs <= Date.now()) return false;
+  const today = toDateOnly(new Date().toISOString());
+  const endYmd = toDateOnly(membership.end_date);
+  if (endYmd && endYmd < today) return false;
+  const startYmd = toDateOnly(membership.start_date);
+  if (startYmd && startYmd > today) return false;
+  return true;
+}
+
 function categoryToSessionAllocKey(category: string): "oneToOne" | "elite" | "octave" | "group" | null {
   const c = String(category || "").trim();
   if (c === "1:1") return "oneToOne";
@@ -133,6 +149,70 @@ function currentWeekStartFromInstant(iso: string): string {
 
 function weekStartFromDateYmd(dateYmd: string): string {
   return currentWeekStartFromInstant(parseCalendarDateToStartIso(dateYmd));
+}
+
+/** Inclusive calendar days between two YYYY-MM-DD values. */
+function inclusiveCalendarDaysBetween(startYmd: string, endYmd: string): number {
+  const startMs = new Date(parseCalendarDateToStartIso(startYmd)).getTime();
+  const endMs = new Date(parseCalendarDateToStartIso(endYmd)).getTime();
+  if (endMs < startMs) return 0;
+  return Math.floor((endMs - startMs) / 86400000) + 1;
+}
+
+/** Pause weeks from an inclusive calendar span (7 days → 1 week, not 2 Mondays). */
+function pauseWeekCountFromInclusiveDates(startYmd: string, endYmd: string): number {
+  const days = inclusiveCalendarDaysBetween(startYmd, endYmd);
+  return days > 0 ? Math.max(1, Math.ceil(days / 7)) : 1;
+}
+
+function weekStartPlusWeeks(weekStartIso: string, weeksAfter: number): string {
+  const d = new Date(weekStartIso);
+  d.setUTCDate(d.getUTCDate() + weeksAfter * 7);
+  return d.toISOString();
+}
+
+/**
+ * Map admin pause calendar dates to Monday week bounds for `clm_apply_membership_pause`.
+ * Using Monday of both start and end dates can span 2 weeks for a 7-day range (e.g. Tue → next Mon).
+ */
+function resolvePauseWeekRangeFromDates(
+  startDateYmd: string,
+  endDateYmd: string,
+  explicitWeekCount?: number,
+): { startWeek: string; endWeekInclusive: string; pauseWeekCount: number } {
+  const startWeek = weekStartFromDateYmd(startDateYmd);
+  const pauseWeekCount =
+    explicitWeekCount && explicitWeekCount > 0
+      ? explicitWeekCount
+      : pauseWeekCountFromInclusiveDates(startDateYmd, endDateYmd);
+  const endWeekInclusive = weekStartPlusWeeks(startWeek, pauseWeekCount - 1);
+  return { startWeek, endWeekInclusive, pauseWeekCount };
+}
+
+type CancelMembershipPauseRpcResult = {
+  ok?: boolean;
+  removedWeeks?: number;
+  reversedDays?: number;
+  endDate?: string;
+  isPaused?: boolean;
+};
+
+async function cancelMembershipPauseRpc(
+  membershipId: string,
+  opts: {
+    pauseWeekIds?: string[] | null;
+    reverseExtensions?: boolean;
+  },
+): Promise<CancelMembershipPauseRpcResult> {
+  const { data, error } = await supabaseAdmin.rpc("clm_cancel_membership_pause", {
+    p_membership_id: membershipId,
+    p_pause_week_ids: opts.pauseWeekIds ?? null,
+    p_reverse_extensions: opts.reverseExtensions !== false,
+  });
+  if (error) {
+    throw new HttpError(500, "Failed to cancel membership pause", error);
+  }
+  return (data ?? {}) as CancelMembershipPauseRpcResult;
 }
 
 function parseCalendarDateToEndIso(dateStr: string): string {
@@ -338,13 +418,13 @@ export class MembershipService {
   }
 
   async resumeMembership(membershipId: string) {
+    await cancelMembershipPauseRpc(membershipId, { reverseExtensions: true });
     const { data, error } = await supabaseAdmin
       .from("member_memberships")
-      .update({ is_paused: false, updated_at: new Date().toISOString() })
+      .select("*")
       .eq("id", membershipId)
-      .select()
       .single();
-    if (error) throw new HttpError(500, "Failed to resume membership", error);
+    if (error) throw new HttpError(500, "Failed to load membership after resume", error);
     return data;
   }
 
@@ -354,6 +434,10 @@ export class MembershipService {
     reverseExtensions?: boolean;
     startWeek?: string;
     endWeekInclusive?: string;
+    startDateYmd?: string;
+    endDateYmd?: string;
+    /** `all` removes every pause week row for the membership (admin cancel). */
+    cancelScope?: "single" | "range" | "all";
   }) {
     const reverseExtensions = input.reverseExtensions !== false;
     const { data: membership, error: membershipErr } = await supabaseAdmin
@@ -364,97 +448,78 @@ export class MembershipService {
     if (membershipErr) throw new HttpError(500, "Failed to load membership", membershipErr);
     if (!membership) throw new HttpError(404, "Membership not found");
 
-    let pauseRowIds: string[] = [];
-    if (input.startWeek && input.endWeekInclusive) {
-      const startWeek = currentWeekStartFromInstant(input.startWeek);
-      const endWeek = currentWeekStartFromInstant(input.endWeekInclusive);
-      const { data: rangeRows, error: rangeErr } = await supabaseAdmin
-        .from("membership_pause_weeks")
-        .select("id")
-        .eq("membership_id", input.membershipId)
-        .gte("week_start", startWeek)
-        .lte("week_start", endWeek);
-      if (rangeErr) throw new HttpError(500, "Failed to load pauses in date range", rangeErr);
-      pauseRowIds = (rangeRows ?? []).map((row) => String((row as { id: string }).id));
-    } else if (input.pauseId) {
-      const { data: pauseRow, error: pauseErr } = await supabaseAdmin
-        .from("membership_pause_weeks")
-        .select("id")
-        .eq("membership_id", input.membershipId)
-        .eq("id", input.pauseId)
-        .maybeSingle();
-      if (pauseErr) throw new HttpError(500, "Failed to load membership pause", pauseErr);
-      if (pauseRow?.id) pauseRowIds = [String(pauseRow.id)];
-    } else {
-      const { data: latestPauseRows, error: latestPauseErr } = await supabaseAdmin
-        .from("membership_pause_weeks")
-        .select("id")
-        .eq("membership_id", input.membershipId)
-        .order("week_start", { ascending: false })
-        .limit(1);
-      if (latestPauseErr) {
-        throw new HttpError(500, "Failed to resolve latest membership pause", latestPauseErr);
+    let pauseWeekIds: string[] | null = null;
+    if (input.cancelScope !== "all") {
+      pauseWeekIds = [];
+      const startWeek =
+        input.startWeek ??
+        (input.startDateYmd ? weekStartFromDateYmd(input.startDateYmd) : undefined);
+      const endWeek =
+        input.endWeekInclusive ??
+        (input.endDateYmd ? weekStartFromDateYmd(input.endDateYmd) : undefined);
+
+      if (startWeek && endWeek) {
+        const rangeStart = currentWeekStartFromInstant(startWeek);
+        const rangeEnd = currentWeekStartFromInstant(endWeek);
+        const { data: rangeRows, error: rangeErr } = await supabaseAdmin
+          .from("membership_pause_weeks")
+          .select("id")
+          .eq("membership_id", input.membershipId)
+          .gte("week_start", rangeStart)
+          .lte("week_start", rangeEnd);
+        if (rangeErr) throw new HttpError(500, "Failed to load pauses in date range", rangeErr);
+        pauseWeekIds = (rangeRows ?? []).map((row) => String((row as { id: string }).id));
+      } else if (input.pauseId) {
+        const { data: pauseRow, error: pauseErr } = await supabaseAdmin
+          .from("membership_pause_weeks")
+          .select("id")
+          .eq("membership_id", input.membershipId)
+          .eq("id", input.pauseId)
+          .maybeSingle();
+        if (pauseErr) throw new HttpError(500, "Failed to load membership pause", pauseErr);
+        if (pauseRow?.id) pauseWeekIds = [String(pauseRow.id)];
       }
-      pauseRowIds = (latestPauseRows ?? []).map((row) => String((row as { id: string }).id));
+
+      if (!pauseWeekIds.length) {
+        const { data: allRows, error: allErr } = await supabaseAdmin
+          .from("membership_pause_weeks")
+          .select("id")
+          .eq("membership_id", input.membershipId);
+        if (allErr) throw new HttpError(500, "Failed to load membership pauses", allErr);
+        pauseWeekIds = (allRows ?? []).map((row) => String((row as { id: string }).id));
+      }
+
+      if (!pauseWeekIds.length) {
+        await supabaseAdmin
+          .from("member_memberships")
+          .update({ is_paused: false, updated_at: new Date().toISOString() })
+          .eq("id", input.membershipId);
+        return {
+          ok: true,
+          removedWeeks: 0,
+          reversedDays: 0,
+          isPaused: false,
+          endDate: String((membership as { end_date?: string | null }).end_date ?? "") || null,
+        };
+      }
     }
 
-    if (!pauseRowIds.length) {
-      return {
-        ok: true,
-        removedWeeks: 0,
-        reversedDays: 0,
-      };
-    }
-
-    const { error: deleteErr } = await supabaseAdmin
-      .from("membership_pause_weeks")
-      .delete()
-      .in("id", pauseRowIds);
-    if (deleteErr) throw new HttpError(500, "Failed to cancel membership pause", deleteErr);
-
-    const removedWeeks = pauseRowIds.length;
-    const reversedDays = reverseExtensions ? removedWeeks * 7 : 0;
-    const currentEndDate = String((membership as { end_date?: string | null }).end_date ?? "");
-    const currentEndMs = currentEndDate ? new Date(currentEndDate).getTime() : NaN;
-    const nextEndDate =
-      reverseExtensions && Number.isFinite(currentEndMs)
-        ? new Date(currentEndMs - reversedDays * 86400000).toISOString()
-        : currentEndDate || null;
-
-    const { data: remainingPauseRows, error: remainingErr } = await supabaseAdmin
-      .from("membership_pause_weeks")
-      .select("id")
-      .eq("membership_id", input.membershipId)
-      .limit(1);
-    if (remainingErr) throw new HttpError(500, "Failed to check remaining pauses", remainingErr);
-    const hasRemainingPause = (remainingPauseRows ?? []).length > 0;
-
-    const membershipPatch: {
-      updated_at: string;
-      is_paused: boolean;
-      end_date?: string | null;
-    } = {
-      updated_at: new Date().toISOString(),
-      is_paused: hasRemainingPause,
-    };
-    if (reverseExtensions && nextEndDate) {
-      membershipPatch.end_date = nextEndDate;
-    }
-
-    const { error: membershipUpdateErr } = await supabaseAdmin
-      .from("member_memberships")
-      .update(membershipPatch)
-      .eq("id", input.membershipId);
-    if (membershipUpdateErr) {
-      throw new HttpError(500, "Failed to update membership after pause cancel", membershipUpdateErr);
-    }
+    const rpcResult = await cancelMembershipPauseRpc(input.membershipId, {
+      pauseWeekIds,
+      reverseExtensions,
+    });
+    const removedWeeks = Math.max(0, Number(rpcResult.removedWeeks ?? 0));
+    const reversedDays = Math.max(0, Number(rpcResult.reversedDays ?? removedWeeks * 7));
+    const endDate = rpcResult.endDate
+      ? String(rpcResult.endDate)
+      : String((membership as { end_date?: string | null }).end_date ?? "") || null;
 
     return {
       ok: true,
       removedWeeks,
       reversedDays,
-      isPaused: hasRemainingPause,
-      endDate: nextEndDate || currentEndDate || null,
+      isPaused: Boolean(rpcResult.isPaused),
+      endDate,
     };
   }
 
@@ -515,16 +580,32 @@ export class MembershipService {
       (typeof body.endDate === "string" && body.endDate) ||
       "";
 
-    const startWeek = startWeekRaw
-      ? currentWeekStartFromInstant(startWeekRaw)
-      : startDateYmd
-        ? weekStartFromDateYmd(startDateYmd)
-        : "";
-    const endWeekInclusive = endWeekRaw
-      ? currentWeekStartFromInstant(endWeekRaw)
-      : endDateYmd
-        ? weekStartFromDateYmd(endDateYmd)
-        : "";
+    const weeksFromBody = Math.max(
+      0,
+      Math.round(
+        Number(
+          body.weeks ??
+            body.pauseWeeks ??
+            body.pause_weeks ??
+            0,
+        ),
+      ),
+    );
+
+    let startWeek = "";
+    let endWeekInclusive = "";
+    if (startDateYmd && endDateYmd) {
+      const resolved = resolvePauseWeekRangeFromDates(
+        startDateYmd,
+        endDateYmd,
+        weeksFromBody > 0 ? weeksFromBody : undefined,
+      );
+      startWeek = resolved.startWeek;
+      endWeekInclusive = resolved.endWeekInclusive;
+    } else if (startWeekRaw && endWeekRaw) {
+      startWeek = currentWeekStartFromInstant(startWeekRaw);
+      endWeekInclusive = currentWeekStartFromInstant(endWeekRaw);
+    }
     if (!startWeek || !endWeekInclusive) {
       throw new HttpError(400, "Pause requires start and end dates");
     }
@@ -627,16 +708,30 @@ export class MembershipService {
       pauseId: validPauseId,
       reverseExtensions:
         body.reverse_extensions !== false && body.reverseExtensions !== false,
+      startDateYmd: startDateYmd || undefined,
+      endDateYmd: endDateYmd || undefined,
       startWeek: startDateYmd ? weekStartFromDateYmd(startDateYmd) : undefined,
       endWeekInclusive: endDateYmd ? weekStartFromDateYmd(endDateYmd) : undefined,
+      cancelScope: "all",
     });
+
+    const endYmd = result.endDate ? toDateOnly(String(result.endDate)) : "";
 
     return {
       ...result,
+      pause: {
+        history: [],
+        pauseHistory: [],
+        planPaused: false,
+        is_paused: false,
+        current: null,
+      },
       membership: {
         id: membership.id,
-        isPaused: result.isPaused,
-        is_paused: result.isPaused,
+        isPaused: false,
+        is_paused: false,
+        endDate: endYmd,
+        end_date: endYmd,
       },
     };
   }
@@ -667,6 +762,19 @@ export class MembershipService {
       .single();
     if (error) throw new HttpError(500, "Failed to terminate membership", error);
     return data;
+  }
+
+  async applyTrainingAllocationsFromPlan(
+    membershipId: string,
+    allocations: Array<{ allocation_key: string; allocation_value: number }>,
+  ) {
+    const alloc = this.#extractSessionAllocFromTrainingBody({
+      allocations: allocations.map((row) => ({
+        allocation_key: row.allocation_key,
+        allocation_value: row.allocation_value,
+      })),
+    });
+    await this.#syncMembershipSessionAllowances(membershipId, alloc);
   }
 
   async addSessionAllowance(input: {
@@ -729,6 +837,7 @@ export class MembershipService {
     const rows = (membershipRows ?? []) as MembershipRow[];
     const membership =
       rows.find((r) => r.mode === mode) ?? rows.find((r) => r.status === "active") ?? rows[0] ?? null;
+
     let transactionalMembershipId = "";
     if (membership) {
       const membershipRecord = membership as MembershipRow & {
@@ -814,64 +923,89 @@ export class MembershipService {
       }
     }
 
+    const trainingPlanShape = {
+      planType: "fixed" as const,
+      plan_type: "fixed" as const,
+      startDate: membershipPayload?.startDate ?? "",
+      start_date: membershipPayload?.start_date ?? "",
+      endDate: membershipPayload?.endDate ?? "",
+      end_date: membershipPayload?.end_date ?? "",
+      allocations: { ...allocations },
+      alloc: { ...allocations },
+    };
+
     const trainingCurrent =
-      membership && membershipPayload
-        ? {
-            planType: "fixed" as const,
-            plan_type: "fixed" as const,
-            startDate: membershipPayload.startDate,
-            start_date: membershipPayload.start_date,
-            endDate: membershipPayload.endDate,
-            end_date: membershipPayload.end_date,
-            allocations: { ...allocations },
-            alloc: { ...allocations },
-          }
+      membership && membershipPayload && membershipHasActivePlanWindow(membership)
+        ? trainingPlanShape
         : null;
 
     let pauseHistory: Array<Record<string, unknown>> = [];
     let activePause: Record<string, unknown> | null = null;
+    const membershipIsPaused = Boolean(membership?.is_paused);
     if (membership) {
+      if (!membershipIsPaused) {
+        const { data: staleRows, error: staleLoadErr } = await supabaseAdmin
+          .from("membership_pause_weeks")
+          .select("id")
+          .eq("membership_id", membership.id);
+        if (staleLoadErr) {
+          throw new HttpError(500, "Failed to load stale membership pause weeks", staleLoadErr);
+        }
+        const staleCount = (staleRows ?? []).length;
+        if (staleCount > 0) {
+          const { error: staleErr } = await supabaseAdmin
+            .from("membership_pause_weeks")
+            .delete()
+            .eq("membership_id", membership.id);
+          if (staleErr) {
+            throw new HttpError(500, "Failed to clear stale membership pause weeks", staleErr);
+          }
+        }
+      }
+
       const { data: pauseWeeks, error: pErr } = await supabaseAdmin
         .from("membership_pause_weeks")
         .select("id, week_start")
         .eq("membership_id", membership.id)
         .order("week_start", { ascending: true });
       if (pErr) throw new HttpError(500, "Failed to load membership pauses", pErr);
-      const weekRows = (pauseWeeks ?? []) as Array<{ id: string; week_start: string }>;
-      pauseHistory = weekRows.map((pw) => {
-        const start = toDateOnly(pw.week_start);
-        const endMs = new Date(pw.week_start).getTime() + 6 * 86400000;
-        const endStr = toDateOnly(new Date(endMs).toISOString());
-        return {
-          id: pw.id,
-          pauseId: pw.id,
-          pause_id: pw.id,
-          startDate: start,
-          start_date: start,
-          endDate: endStr,
-          end_date: endStr,
-          weeks: 1,
-          netExtendedDays: 0,
-          net_extended_days: 0,
+      const weekRows = membershipIsPaused
+        ? ((pauseWeeks ?? []) as Array<{ id: string; week_start: string }>)
+        : [];
+      if (membershipIsPaused && weekRows.length > 0) {
+        const first = weekRows[0];
+        const last = weekRows[weekRows.length - 1];
+        const rangeStart = toDateOnly(first.week_start);
+        const rangeEndMs = new Date(last.week_start).getTime() + 6 * 86400000;
+        const rangeEnd = toDateOnly(new Date(rangeEndMs).toISOString());
+        const pausedWeekCount = weekRows.length;
+        const consolidatedPause = {
+          id: first.id,
+          pauseId: first.id,
+          pause_id: first.id,
+          pauseIds: weekRows.map((pw) => pw.id),
+          startDate: rangeStart,
+          start_date: rangeStart,
+          endDate: rangeEnd,
+          end_date: rangeEnd,
+          weeks: pausedWeekCount,
+          netExtendedDays: pausedWeekCount * 7,
+          net_extended_days: pausedWeekCount * 7,
           sessionsPaused: true,
           sessions_paused: true,
           nutritionPaused: true,
           nutrition_paused: true,
         };
-      });
-      if (weekRows.length > 0) {
-        const first = weekRows[0];
-        const last = weekRows[weekRows.length - 1];
-        const rangeEndMs = new Date(last.week_start).getTime() + 6 * 86400000;
+        pauseHistory = [consolidatedPause];
         activePause = {
           id: first.id,
           pauseId: first.id,
           pause_id: first.id,
-          startDate: toDateOnly(first.week_start),
-          start_date: toDateOnly(first.week_start),
-          endDate: toDateOnly(new Date(rangeEndMs).toISOString()),
-          end_date: toDateOnly(new Date(rangeEndMs).toISOString()),
-          weeks: weekRows.length,
+          startDate: rangeStart,
+          start_date: rangeStart,
+          endDate: rangeEnd,
+          end_date: rangeEnd,
+          weeks: pausedWeekCount,
         };
       }
     }
@@ -1003,8 +1137,47 @@ export class MembershipService {
       ? await loadMembershipPlanQueues(String(membership.id), membershipPackage)
       : { trainingQueue: [], nutritionQueue: [] };
 
+    const todayYmd = toDateOnly(new Date().toISOString());
+    let trainingUpcoming: Record<string, unknown> | null = null;
+    const nextQueuedTraining = [...planQueues.trainingQueue]
+      .filter((row) => {
+        const start = toDateOnly(
+          String(row.startDate ?? row.start_date ?? row.start ?? ""),
+        );
+        return start > todayYmd;
+      })
+      .sort((a, b) =>
+        String(a.startDate ?? a.start_date ?? a.start ?? "").localeCompare(
+          String(b.startDate ?? b.start_date ?? b.start ?? ""),
+        ),
+      )[0];
+    if (nextQueuedTraining) {
+      const alloc =
+        (nextQueuedTraining.alloc as Record<string, number> | undefined) ??
+        (nextQueuedTraining.allocations as Record<string, number> | undefined) ??
+        {};
+      trainingUpcoming = {
+        planType: nextQueuedTraining.planType ?? "fixed",
+        plan_type: nextQueuedTraining.plan_type ?? "fixed",
+        startDate: nextQueuedTraining.startDate ?? nextQueuedTraining.start,
+        start_date: nextQueuedTraining.start_date ?? nextQueuedTraining.start,
+        endDate: nextQueuedTraining.endDate ?? nextQueuedTraining.end,
+        end_date: nextQueuedTraining.end_date ?? nextQueuedTraining.end,
+        allocations: { ...alloc },
+        alloc: { ...alloc },
+      };
+    } else if (
+      membership &&
+      membershipPayload &&
+      !trainingCurrent &&
+      String(membership.status ?? "").toLowerCase() === "active" &&
+      trainingPlanShape.startDate > todayYmd
+    ) {
+      trainingUpcoming = trainingPlanShape;
+    }
+
     let nutritionCurrent: Record<string, unknown> | null = null;
-    if (membership) {
+    if (membership && membershipHasActivePlanWindow(membership)) {
       const activeNutrition = await getActiveNutritionPlanForMembership(String(membership.id));
       if (activeNutrition) {
         nutritionCurrent = mapNutritionPlanForDashboard(activeNutrition);
@@ -1015,6 +1188,7 @@ export class MembershipService {
       membership: membershipPayload,
       training: {
         current: trainingCurrent,
+        upcoming: trainingUpcoming,
         queue: planQueues.trainingQueue,
       },
       nutrition: {
@@ -1024,10 +1198,9 @@ export class MembershipService {
       pause: {
         history: pauseHistory,
         pauseHistory,
-        planPaused: Boolean(membership?.is_paused),
-        is_paused: Boolean(membership?.is_paused),
+        planPaused: membershipIsPaused && pauseHistory.length > 0,
+        is_paused: membershipIsPaused,
         current: activePause,
-        active: activePause,
       },
       gifts: giftList,
       access: {
