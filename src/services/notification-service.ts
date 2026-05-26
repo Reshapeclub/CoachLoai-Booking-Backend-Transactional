@@ -44,6 +44,60 @@ function resolveAddToCalendarUrl(
   return calendarIcsUrl(fallback.kind, fallback.id);
 }
 
+async function enrichBookingSessionPayload(
+  payload: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const hasLocation =
+    typeof payload.locationName === "string" && payload.locationName.trim().length > 0;
+  const needsEnrichment = payload.sessionStartAt == null || !hasLocation;
+  if (!needsEnrichment) return payload;
+
+  let sessionId =
+    typeof payload.sessionId === "string" && payload.sessionId.trim()
+      ? payload.sessionId.trim()
+      : "";
+
+  if (!sessionId) {
+    const bookingId =
+      typeof payload.bookingId === "string" && payload.bookingId.trim()
+        ? payload.bookingId.trim()
+        : "";
+    if (bookingId) {
+      const { data: booking } = await supabaseAdmin
+        .from("bookings")
+        .select("session_id")
+        .eq("id", bookingId)
+        .maybeSingle();
+      sessionId = String((booking as { session_id?: string } | null)?.session_id ?? "").trim();
+    }
+  }
+
+  if (!sessionId) return payload;
+
+  const { data: session } = await supabaseAdmin
+    .from("sessions")
+    .select("start_at, end_at, locations(name)")
+    .eq("id", sessionId)
+    .maybeSingle();
+  if (!session) return { ...payload, sessionId };
+
+  const locationsRaw = (session as { locations?: { name?: string } | { name?: string }[] | null })
+    .locations;
+  const locationRow = Array.isArray(locationsRaw) ? locationsRaw[0] : locationsRaw;
+  const resolvedLocationName =
+    typeof locationRow?.name === "string" && locationRow.name.trim()
+      ? locationRow.name.trim()
+      : "";
+
+  return {
+    ...payload,
+    sessionId,
+    sessionStartAt: payload.sessionStartAt ?? session.start_at,
+    sessionEndAt: payload.sessionEndAt ?? session.end_at,
+    ...(resolvedLocationName ? { locationName: resolvedLocationName } : {}),
+  };
+}
+
 function buildEmailContent(
   type: NotificationType,
   payload: Record<string, unknown>,
@@ -74,9 +128,19 @@ function buildEmailContent(
       }`;
       break;
     }
-    case "booking_cancelled":
-      body = `Your booking has been cancelled.\n\nBooking ID: ${payload.bookingId ?? "—"}\nRefund applied: ${payload.refundApplied === true ? "Yes" : "No"}${payload.reason ? `\nReason: ${payload.reason}` : ""}`;
+    case "booking_cancelled": {
+      const when = formatMeetingWhenLondon(payload.sessionStartAt, payload.sessionEndAt);
+      const locationName =
+        typeof payload.locationName === "string" && payload.locationName.trim()
+          ? payload.locationName.trim()
+          : "";
+      body = `Your booking has been cancelled.\n\nWhen: ${when}${
+        locationName ? `\nLocation: ${locationName}` : ""
+      }\n\nBooking ID: ${payload.bookingId ?? "—"}\nRefund applied: ${
+        payload.refundApplied === true ? "Yes" : "No"
+      }${payload.reason ? `\nReason: ${payload.reason}` : ""}`;
       break;
+    }
     case "waitlist_space_available":
       body = `A space has opened up for a session you were waiting for.\n\nSession ID: ${payload.sessionId ?? "—"}\n\nLog in to book your spot.`;
       break;
@@ -156,32 +220,8 @@ export async function processUnsentEmailNotifications(): Promise<number> {
     }
 
     let payload = ((n.payload as Record<string, unknown>) ?? {}) as Record<string, unknown>;
-    if (n.type === "booking_confirmed" && typeof payload.sessionId === "string" && payload.sessionId.trim()) {
-      const hasLocation =
-        typeof payload.locationName === "string" && payload.locationName.trim().length > 0;
-      const needsEnrichment = payload.sessionStartAt == null || !hasLocation;
-      if (needsEnrichment) {
-        const { data: session } = await supabaseAdmin
-          .from("sessions")
-          .select("start_at, end_at, locations(name)")
-          .eq("id", payload.sessionId.trim())
-          .maybeSingle();
-        if (session) {
-          const locationsRaw = (session as { locations?: { name?: string } | { name?: string }[] | null })
-            .locations;
-          const locationRow = Array.isArray(locationsRaw) ? locationsRaw[0] : locationsRaw;
-          const resolvedLocationName =
-            typeof locationRow?.name === "string" && locationRow.name.trim()
-              ? locationRow.name.trim()
-              : "";
-          payload = {
-            ...payload,
-            sessionStartAt: payload.sessionStartAt ?? session.start_at,
-            sessionEndAt: payload.sessionEndAt ?? session.end_at,
-            ...(resolvedLocationName ? { locationName: resolvedLocationName } : {}),
-          };
-        }
-      }
+    if (n.type === "booking_confirmed" || n.type === "booking_cancelled") {
+      payload = await enrichBookingSessionPayload(payload);
     }
 
     const { subject, text } = buildEmailContent(

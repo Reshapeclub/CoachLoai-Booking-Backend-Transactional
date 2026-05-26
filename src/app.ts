@@ -32,8 +32,8 @@ cron.schedule("0 2 * * 1", async () => {
   }
 }, { timezone: "Europe/London" });
 
-// Queued membership plans: daily at 01:05 UK time
-cron.schedule("5 1 * * *", async () => {
+// Queued membership plans: daily at 01:30 UK time
+cron.schedule("30 1 * * *", async () => {
   try {
     const result = await runActivateDueQueuedPlans();
     console.log(

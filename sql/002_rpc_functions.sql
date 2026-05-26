@@ -368,8 +368,8 @@ begin
 
   insert into notifications(member_id, channel, type, payload)
   values
-    (p_member_id, 'in_app', 'booking_cancelled', jsonb_build_object('bookingId', v_booking.id, 'refundApplied', v_refund)),
-    (p_member_id, 'email', 'booking_cancelled', jsonb_build_object('bookingId', v_booking.id, 'refundApplied', v_refund));
+    (p_member_id, 'in_app', 'booking_cancelled', jsonb_build_object('bookingId', v_booking.id, 'refundApplied', v_refund, 'sessionId', v_session.id, 'sessionStartAt', v_session.start_at, 'sessionEndAt', v_session.end_at, 'locationName', (select l.name from locations l where l.id = v_session.location_id))),
+    (p_member_id, 'email', 'booking_cancelled', jsonb_build_object('bookingId', v_booking.id, 'refundApplied', v_refund, 'sessionId', v_session.id, 'sessionStartAt', v_session.start_at, 'sessionEndAt', v_session.end_at, 'locationName', (select l.name from locations l where l.id = v_session.location_id)));
 
   v_waitlist_result := clm_process_waitlist_after_opening(v_session.id, p_now);
   return jsonb_build_object('ok', true, 'bookingId', v_booking.id, 'refundApplied', v_refund, 'waitlist', v_waitlist_result);
@@ -682,7 +682,13 @@ begin
 
   -- Cancel bookings in paused weeks before touching tokens (deduction rows keep token_id FK).
   for v_booking in
-    select b.id as booking_id, b.member_id, b.session_id
+    select
+      b.id as booking_id,
+      b.member_id,
+      b.session_id,
+      s.start_at as session_start_at,
+      s.end_at as session_end_at,
+      (select l.name from locations l where l.id = s.location_id) as location_name
     from bookings b
     join sessions s on s.id = b.session_id
     where b.member_id = v_membership.member_id
@@ -698,8 +704,8 @@ begin
     values ('system', null, 'booking.cancelled_by_pause', jsonb_build_object('bookingId', v_booking.booking_id, 'membershipId', p_membership_id, 'refundApplied', false));
     insert into notifications(member_id, channel, type, payload)
     values
-      (v_booking.member_id, 'in_app', 'booking_cancelled', jsonb_build_object('bookingId', v_booking.booking_id, 'refundApplied', false, 'reason', 'membership_paused')),
-      (v_booking.member_id, 'email', 'booking_cancelled', jsonb_build_object('bookingId', v_booking.booking_id, 'refundApplied', false, 'reason', 'membership_paused'));
+      (v_booking.member_id, 'in_app', 'booking_cancelled', jsonb_build_object('bookingId', v_booking.booking_id, 'refundApplied', false, 'reason', 'membership_paused', 'sessionId', v_booking.session_id, 'sessionStartAt', v_booking.session_start_at, 'sessionEndAt', v_booking.session_end_at, 'locationName', v_booking.location_name)),
+      (v_booking.member_id, 'email', 'booking_cancelled', jsonb_build_object('bookingId', v_booking.booking_id, 'refundApplied', false, 'reason', 'membership_paused', 'sessionId', v_booking.session_id, 'sessionStartAt', v_booking.session_start_at, 'sessionEndAt', v_booking.session_end_at, 'locationName', v_booking.location_name));
   end loop;
 
   -- Zero weekly tokens for paused weeks; only delete rows not referenced by booking_token_deductions.
