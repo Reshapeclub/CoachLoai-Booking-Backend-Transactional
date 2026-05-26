@@ -291,6 +291,68 @@ async function resolveNutritionPlanForCancel(
   return data as Record<string, unknown>;
 }
 
+async function findQueuedTrainingPlanByStart(
+  membershipId: string,
+  startDate: string,
+  planType: PlanType,
+) {
+  const { data, error } = await supabaseAdmin
+    .from("membership_training_plans")
+    .select("*")
+    .eq("membership_id", membershipId)
+    .eq("status", "queued")
+    .eq("start_date", startDate)
+    .eq("plan_type", planType)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw new HttpError(500, "Failed to look up queued training plan by start", error);
+  return data as Record<string, unknown> | null;
+}
+
+function queuedPlanDateRangesOverlap(
+  startA: string,
+  endA: string | null,
+  startB: string,
+  endB: string | null,
+): boolean {
+  const endAYmd = endA ?? "9999-12-31";
+  const endBYmd = endB ?? "9999-12-31";
+  return startA <= endBYmd && startB <= endAYmd;
+}
+
+async function assertQueuedTrainingPlanNoOverlap(
+  membershipId: string,
+  startDate: string,
+  endDate: string | null,
+  excludePlanId?: string,
+) {
+  const { data: rows, error } = await supabaseAdmin
+    .from("membership_training_plans")
+    .select("id, start_date, end_date")
+    .eq("membership_id", membershipId)
+    .eq("status", "queued");
+  if (error) throw new HttpError(500, "Failed to validate queued training plans", error);
+  for (const row of rows ?? []) {
+    const plan = row as { id: string; start_date: string; end_date: string | null };
+    if (excludePlanId && String(plan.id) === excludePlanId) continue;
+    if (
+      queuedPlanDateRangesOverlap(
+        startDate,
+        endDate,
+        String(plan.start_date ?? ""),
+        plan.end_date ? String(plan.end_date) : null,
+      )
+    ) {
+      const existingEnd = plan.end_date ? String(plan.end_date) : "rolling";
+      throw new HttpError(
+        409,
+        `Queued plan ${startDate}–${endDate ?? "rolling"} overlaps existing queued plan ${plan.start_date}–${existingEnd}`,
+      );
+    }
+  }
+}
+
 async function findExistingQueuedTrainingPlan(
   membershipId: string,
   startDate: string,
@@ -1100,14 +1162,24 @@ export async function queueAdminTrainingPlan(memberId: string, body: Record<stri
 
   let planId = String(body.id ?? body.queue_id ?? body.queueId ?? "").trim();
   if (!planId) {
-    const duplicate = await findExistingQueuedTrainingPlan(
-      membershipId,
-      startDate,
-      planType,
-      endDate,
-    );
-    if (duplicate?.id) planId = String(duplicate.id);
+    const byStart = await findQueuedTrainingPlanByStart(membershipId, startDate, planType);
+    if (byStart?.id) planId = String(byStart.id);
+    else {
+      const duplicate = await findExistingQueuedTrainingPlan(
+        membershipId,
+        startDate,
+        planType,
+        endDate,
+      );
+      if (duplicate?.id) planId = String(duplicate.id);
+    }
   }
+  await assertQueuedTrainingPlanNoOverlap(
+    membershipId,
+    startDate,
+    endDate,
+    planId || undefined,
+  );
   const now = new Date().toISOString();
   let plan: Record<string, unknown>;
 

@@ -58,3 +58,52 @@ export function assertBookableStartNotPast(startAtIso: string, nowIso?: string):
     );
   }
 }
+
+const MS_PER_DAY = 86_400_000;
+
+/** Weeks in each `getSessionUsage` window (Monday–Sunday, UTC — matches `clm_current_week_start`). */
+export const SESSION_USAGE_PAST_WEEKS = 4;
+export const SESSION_USAGE_UPCOMING_WEEKS = 4;
+
+/** Monday 00:00:00.000 UTC for the week containing `iso`. */
+export function utcWeekStartMs(iso: string): number {
+  const t = new Date(iso);
+  if (Number.isNaN(t.getTime())) throw new HttpError(400, "Invalid datetime");
+  const dow = t.getUTCDay();
+  const mondayOffset = dow === 0 ? -6 : 1 - dow;
+  return Date.UTC(
+    t.getUTCFullYear(),
+    t.getUTCMonth(),
+    t.getUTCDate() + mondayOffset,
+    0,
+    0,
+    0,
+    0,
+  );
+}
+
+/**
+ * Session usage query window:
+ * - upcoming: current week Monday → Sunday at end of the 4th week (e.g. 25 May–21 Jun)
+ * - past: Monday 4 weeks before current → Sunday before current week (e.g. 27 Apr–24 May)
+ */
+export function sessionUsageWeekRange(
+  view: "past" | "upcoming",
+  nowIso?: string,
+): { rangeStart: Date; rangeEnd: Date } {
+  const currentMondayMs = utcWeekStartMs(nowIso ?? ukBookingNowIso());
+  const spanMs = SESSION_USAGE_UPCOMING_WEEKS * 7 * MS_PER_DAY;
+
+  if (view === "past") {
+    const pastSpanMs = SESSION_USAGE_PAST_WEEKS * 7 * MS_PER_DAY;
+    return {
+      rangeStart: new Date(currentMondayMs - pastSpanMs),
+      rangeEnd: new Date(currentMondayMs - 1),
+    };
+  }
+
+  return {
+    rangeStart: new Date(currentMondayMs),
+    rangeEnd: new Date(currentMondayMs + spanMs - 1),
+  };
+}

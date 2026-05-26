@@ -642,6 +642,18 @@ export class MembershipService {
       Number((rpcResult as { insertedWeeks?: number }).insertedWeeks ?? pauseIds.length),
     );
 
+    const { data: refreshedMembership, error: refreshMmErr } = await supabaseAdmin
+      .from("member_memberships")
+      .select("end_date, is_paused")
+      .eq("id", membership.id)
+      .maybeSingle();
+    if (refreshMmErr) {
+      throw new HttpError(500, "Failed to load membership after pause", refreshMmErr);
+    }
+    const membershipEndYmd = refreshedMembership?.end_date
+      ? toDateOnly(String(refreshedMembership.end_date))
+      : "";
+
     return {
       ok: true,
       pause: {
@@ -673,6 +685,8 @@ export class MembershipService {
         id: membership.id,
         isPaused: true,
         is_paused: true,
+        endDate: membershipEndYmd,
+        end_date: membershipEndYmd,
       },
     };
   }
@@ -953,13 +967,7 @@ export class MembershipService {
         }
         const staleCount = (staleRows ?? []).length;
         if (staleCount > 0) {
-          const { error: staleErr } = await supabaseAdmin
-            .from("membership_pause_weeks")
-            .delete()
-            .eq("membership_id", membership.id);
-          if (staleErr) {
-            throw new HttpError(500, "Failed to clear stale membership pause weeks", staleErr);
-          }
+          await cancelMembershipPauseRpc(membership.id, { reverseExtensions: true });
         }
       }
 
@@ -1428,15 +1436,6 @@ export class MembershipService {
     if (!startStr) throw new HttpError(400, "start_date is required");
     const startIso = parseCalendarDateToStartIso(startStr);
 
-    let endIso: string;
-    if (isFixed) {
-      const endStr = String(body.end_date ?? body.endDate ?? "").trim();
-      if (!endStr) throw new HttpError(400, "end_date is required for fixed training plans");
-      endIso = parseCalendarDateToEndIso(endStr);
-    } else {
-      endIso = new Date(new Date(startIso).getTime() + 365 * 24 * 60 * 60 * 1000).toISOString();
-    }
-
     const allocMode = String(body.allocation_mode ?? body.allocationMode ?? "sessions")
       .trim()
       .toLowerCase();
@@ -1448,6 +1447,18 @@ export class MembershipService {
       .eq("mode", mode)
       .maybeSingle();
     if (exErr) throw new HttpError(500, "Failed to load membership", exErr);
+
+    let endIso: string;
+    if (isFixed) {
+      let endStr = String(body.end_date ?? body.endDate ?? "").trim();
+      if (!endStr && existing?.end_date) {
+        endStr = toDateOnly(String(existing.end_date));
+      }
+      if (!endStr) throw new HttpError(400, "end_date is required for fixed training plans");
+      endIso = parseCalendarDateToEndIso(endStr);
+    } else {
+      endIso = new Date(new Date(startIso).getTime() + 365 * 24 * 60 * 60 * 1000).toISOString();
+    }
 
     let membershipId: string;
     if (!existing) {

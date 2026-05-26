@@ -116,6 +116,18 @@ begin
     from membership_session_allowances msa
     where msa.membership_id = v_mm.id and msa.weekly_allowance > 0
   loop
+    -- Pause zeroes weekly tokens in place; restore allowance when the week is active again.
+    update tokens t
+    set
+      quantity = v_row.weekly_allowance,
+      expiry_at = greatest(t.expiry_at, p_week_start + interval '14 days')
+    where t.member_id = v_mm.member_id
+      and t.token_type_id = v_row.token_type_id
+      and t.week_start is not null
+      and clm_current_week_start(t.week_start) = clm_current_week_start(p_week_start)
+      and t.source = 'weekly'
+      and t.quantity < v_row.weekly_allowance;
+
     if not exists (
       select 1 from tokens t
       where t.member_id = v_mm.member_id
@@ -206,7 +218,6 @@ declare
   v_session sessions%rowtype;
   v_member profiles%rowtype;
   v_booked_count int;
-  v_current_week timestamptz;
   v_session_week timestamptz;
   v_duplicate_count int;
   v_booking_id uuid;
@@ -223,15 +234,14 @@ begin
   select * into v_member from profiles where id = p_member_id;
   if not found then raise exception 'Member not found'; end if;
 
-  v_current_week := clm_current_week_start(p_now);
   v_session_week := clm_current_week_start(v_session.start_at);
   v_horizon := p_now + interval '28 days';
 
   if v_session.start_at < v_membership.start_date then raise exception 'Membership not active yet for this session'; end if;
   if v_session.start_at >= v_membership.end_date then raise exception 'Cannot book beyond membership end date'; end if;
   if v_membership.termination_date is not null and v_session.start_at >= v_membership.termination_date then raise exception 'Cannot book beyond termination date'; end if;
+  -- Block only when the session falls in a paused week (not merely because today is in a paused week).
   if exists (select 1 from membership_pause_weeks mpw where mpw.membership_id = v_membership.id and clm_current_week_start(mpw.week_start) = v_session_week) then raise exception 'Cannot book in paused week'; end if;
-  if exists (select 1 from membership_pause_weeks mpw where mpw.membership_id = v_membership.id and clm_current_week_start(mpw.week_start) = v_current_week) then raise exception 'Membership paused'; end if;
   if v_session.start_at > v_horizon then raise exception 'Session beyond booking horizon'; end if;
   if v_session.start_at <= p_now then raise exception 'Session has already started/completed'; end if;
   if not coalesce(v_session.is_online, false) and v_session.location_id is not null then
@@ -381,7 +391,6 @@ declare
   v_session sessions%rowtype;
   v_member profiles%rowtype;
   v_booked_count int;
-  v_current_week timestamptz;
   v_session_week timestamptz;
   v_duplicate_count int;
   v_token_id uuid;
@@ -407,7 +416,6 @@ begin
     raise exception 'Already booked for this session';
   end if;
 
-  v_current_week := clm_current_week_start(p_now);
   v_session_week := clm_current_week_start(v_session.start_at);
   v_horizon := p_now + interval '28 days';
 
@@ -415,7 +423,6 @@ begin
   if v_session.start_at >= v_membership.end_date then raise exception 'Cannot book beyond membership end date'; end if;
   if v_membership.termination_date is not null and v_session.start_at >= v_membership.termination_date then raise exception 'Cannot book beyond termination date'; end if;
   if exists (select 1 from membership_pause_weeks mpw where mpw.membership_id = v_membership.id and clm_current_week_start(mpw.week_start) = v_session_week) then raise exception 'Cannot book in paused week'; end if;
-  if exists (select 1 from membership_pause_weeks mpw where mpw.membership_id = v_membership.id and clm_current_week_start(mpw.week_start) = v_current_week) then raise exception 'Membership paused'; end if;
   if v_session.start_at > v_horizon then raise exception 'Session beyond booking horizon'; end if;
   if v_session.start_at <= p_now then raise exception 'Session has already started/completed'; end if;
   if coalesce(v_session.is_cancelled, false) then raise exception 'Session has been cancelled'; end if;
@@ -776,20 +783,38 @@ declare
   v_removed_weeks int;
   v_new_end timestamptz;
   v_has_remaining boolean;
+  v_week timestamptz;
+  v_week_starts timestamptz[];
 begin
   perform 1 from member_memberships where id = p_membership_id for update;
   if not found then raise exception 'Membership not found'; end if;
 
-  with deleted as (
-    delete from membership_pause_weeks mpw
-    where mpw.membership_id = p_membership_id
-      and (
-        p_pause_week_ids is null
-        or mpw.id = any(p_pause_week_ids)
-      )
-    returning 1
+  select coalesce(
+    array_agg(distinct clm_current_week_start(mpw.week_start)),
+    '{}'::timestamptz[]
   )
-  select count(*)::int into v_removed_weeks from deleted;
+  into v_week_starts
+  from membership_pause_weeks mpw
+  where mpw.membership_id = p_membership_id
+    and (
+      p_pause_week_ids is null
+      or mpw.id = any(p_pause_week_ids)
+    );
+
+  v_removed_weeks := coalesce(array_length(v_week_starts, 1), 0);
+
+  delete from membership_pause_weeks mpw
+  where mpw.membership_id = p_membership_id
+    and (
+      p_pause_week_ids is null
+      or mpw.id = any(p_pause_week_ids)
+    );
+
+  if v_removed_weeks > 0 then
+    foreach v_week in array v_week_starts loop
+      perform clm_ensure_weekly_tokens_for_membership_week(p_membership_id, v_week, p_now);
+    end loop;
+  end if;
 
   if p_reverse_extensions and v_removed_weeks > 0 then
     update member_memberships

@@ -2,6 +2,9 @@ import { supabaseAdmin } from "../db/supabase.js";
 import { HttpError } from "../lib/http-error.js";
 import {
   assertBookableStartNotPast,
+  SESSION_USAGE_PAST_WEEKS,
+  SESSION_USAGE_UPCOMING_WEEKS,
+  sessionUsageWeekRange,
   ukBookingNowIso,
   ukDayBoundsUtcIso,
 } from "../lib/uk-booking-time.js";
@@ -926,17 +929,9 @@ export class BookingService {
   }
 
   async getSessionUsage(memberId: string, view: "past" | "upcoming") {
-    const now = new Date();
-    let rangeStart: Date;
-    let rangeEnd: Date;
-
-    if (view === "past") {
-      rangeStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-      rangeEnd = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59, 999);
-    } else {
-      rangeStart = new Date(now.getFullYear(), now.getMonth(), 1);
-      rangeEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
-    }
+    const nowIso = ukBookingNowIso();
+    const now = new Date(nowIso);
+    const { rangeStart, rangeEnd } = sessionUsageWeekRange(view, nowIso);
 
     // Fetch bookings within the date range (join sessions for start_at)
     const { data: bookings, error: bookingsErr } = await supabaseAdmin
@@ -1021,7 +1016,7 @@ export class BookingService {
     // Fetch allowed sessions from membership allowances
     const { data: activeMembershipId } = await supabaseAdmin.rpc("clm_find_active_membership", {
       p_member_id: memberId,
-      p_now: now.toISOString(),
+      p_now: nowIso,
     });
 
     let allowedPerWeek = 0;
@@ -1033,7 +1028,9 @@ export class BookingService {
       allowedPerWeek = (allowances ?? []).reduce((sum, a) => sum + (a.weekly_allowance ?? 0), 0);
     }
 
-    const allowed = allowedPerWeek * 4;
+    const allowedWeeks =
+      view === "past" ? SESSION_USAGE_PAST_WEEKS : SESSION_USAGE_UPCOMING_WEEKS;
+    const allowed = allowedPerWeek * allowedWeeks;
 
     if (view === "past") {
       const usedVal = attended + lost;
