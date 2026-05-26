@@ -41,8 +41,8 @@ begin
   where mm.member_id = p_member_id
     and mm.status = 'active'
     and mm.mode = 'inperson'
-    and p_now >= mm.start_date
-    and p_now < mm.end_date
+    and mm.start_date <= p_now
+    and mm.end_date > p_now
     and (mm.termination_date is null or p_now < mm.termination_date)
     and not exists (
       select 1 from membership_pause_weeks mpw

@@ -889,11 +889,11 @@ export async function resolveMembershipIdForBookingWindow(
   const membershipId = String(membership.id ?? "");
   if (!membershipId) return null;
 
-  if (
-    data &&
-    membershipFullyCoversBookingWindow(membership, windowStartIso, windowEndIso)
-  ) {
-    return String(data);
+  // RPC overlap is enough for booking (do not require MM to span the full 28-day window).
+  if (data) return String(data);
+
+  if (membershipOverlapsBookingWindow(membership, windowStartIso, windowEndIso)) {
+    return membershipId;
   }
 
   const windowStartYmd = windowStartIso.slice(0, 10);
@@ -949,6 +949,44 @@ export async function resolveMembershipIdForBookingWindow(
     throw new HttpError(500, "Failed to resolve membership after queued plan apply", retryErr);
   }
   return retry ? String(retry) : membershipId;
+}
+
+/**
+ * Membership id for GET /member/booking-context (current member, not a specific session).
+ * Tries overlap window, then active-membership RPC, then a direct row lookup (includes paused weeks).
+ */
+export async function resolveMembershipIdForBookingContext(
+  memberId: string,
+  nowIso: string,
+): Promise<string | null> {
+  const horizonEnd = new Date(new Date(nowIso).getTime() + 28 * 86400000).toISOString();
+  const fromWindow = await resolveMembershipIdForBookingWindow(memberId, nowIso, horizonEnd);
+  if (fromWindow) return fromWindow;
+
+  const { data: activeId, error: activeErr } = await supabaseAdmin.rpc(
+    "clm_find_active_membership",
+    { p_member_id: memberId, p_now: nowIso },
+  );
+  if (activeErr) {
+    throw new HttpError(500, "Failed to find active membership for booking context", activeErr);
+  }
+  if (activeId) return String(activeId);
+
+  const { data: row, error: rowErr } = await supabaseAdmin
+    .from("member_memberships")
+    .select("id")
+    .eq("member_id", memberId)
+    .eq("mode", "inperson")
+    .eq("status", "active")
+    .lte("start_date", nowIso)
+    .gt("end_date", nowIso)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (rowErr) {
+    throw new HttpError(500, "Failed to load member membership for booking context", rowErr);
+  }
+  return row?.id ? String(row.id) : null;
 }
 
 function membershipRowHasActivePlanWindow(membership: Record<string, unknown>): boolean {

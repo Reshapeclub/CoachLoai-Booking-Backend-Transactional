@@ -10,6 +10,7 @@ import {
 } from "../lib/uk-booking-time.js";
 import {
   resolveMembershipBrowseContext,
+  resolveMembershipIdForBookingContext,
   resolveMembershipIdForBookingWindow,
 } from "./membership-plan-service.js";
 
@@ -426,8 +427,7 @@ export class BookingService {
 
   async getBookingContext(memberId: string) {
     const nowIso = ukBookingNowIso();
-    const windowEnd = new Date(Date.now() + 28 * 86400000).toISOString();
-    const activeMembershipId = await this.findMembershipForWindow(memberId, nowIso, windowEnd);
+    const activeMembershipId = await resolveMembershipIdForBookingContext(memberId, nowIso);
     const [{ data: membership }, { data: bookings }, { data: tokens }, { data: profile }] =
       await Promise.all([
         activeMembershipId
@@ -435,7 +435,7 @@ export class BookingService {
             .from("member_memberships")
             .select("*")
             .eq("id", activeMembershipId)
-            .single()
+            .maybeSingle()
           : Promise.resolve({ data: null }),
         supabaseAdmin
           .from("bookings")
