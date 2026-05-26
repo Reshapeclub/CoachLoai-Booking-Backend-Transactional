@@ -412,6 +412,7 @@ export class MembershipService {
       ok: boolean;
       pauseId: string;
       cancelledBookings: number;
+      removedWaitlist?: number;
       startDate: string;
       endDate: string;
     };
@@ -669,6 +670,9 @@ export class MembershipService {
         insertedWeeks,
         cancelledBookings: Number(
           (rpcResult as { cancelledBookings?: number }).cancelledBookings ?? 0,
+        ),
+        removedWaitlist: Number(
+          (rpcResult as { removedWaitlist?: number }).removedWaitlist ?? 0,
         ),
         newEndDate: (rpcResult as { newEndDate?: string }).newEndDate ?? null,
       },

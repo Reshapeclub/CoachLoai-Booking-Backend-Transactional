@@ -525,6 +525,9 @@ begin
   if (select count(*) from bookings where session_id=p_session_id and status='booked') < v_session.capacity then raise exception 'Session has available space'; end if;
 
   v_session_week := clm_current_week_start(v_session.start_at);
+  if exists (select 1 from membership_pause_weeks mpw where mpw.membership_id = v_membership.id and clm_current_week_start(mpw.week_start) = v_session_week) then
+    raise exception 'Cannot join waitlist in paused week';
+  end if;
   perform clm_ensure_weekly_tokens_for_membership_week(p_membership_id, v_session_week, p_now);
   v_has_token := clm_pick_token_id(p_member_id, v_session.token_type_id, p_now, v_session_week) is not null;
   if not v_has_token then raise exception 'No valid token available'; end if;
@@ -661,10 +664,12 @@ declare
   v_membership member_memberships%rowtype;
   v_inserted_weeks int;
   v_booking record;
+  v_waitlist_entry record;
   v_cancelled_count int := 0;
+  v_removed_waitlist int := 0;
   v_session_ids uuid[] := '{}';
   v_sid uuid;
-  v_waitlist jsonb;
+  v_waitlist_proc jsonb;
   v_new_end_date timestamptz;
 begin
   select * into v_membership from member_memberships where id = p_membership_id for update;
@@ -708,6 +713,26 @@ begin
       (v_booking.member_id, 'email', 'booking_cancelled', jsonb_build_object('bookingId', v_booking.booking_id, 'refundApplied', false, 'reason', 'membership_paused', 'sessionId', v_booking.session_id, 'sessionStartAt', v_booking.session_start_at, 'sessionEndAt', v_booking.session_end_at, 'locationName', v_booking.location_name));
   end loop;
 
+  for v_waitlist_entry in
+    select w.id as entry_id, w.session_id
+    from waiting_list_entries w
+    join sessions s on s.id = w.session_id
+    where w.member_id = v_membership.member_id
+      and clm_current_week_start(s.start_at) >= p_start_week
+      and clm_current_week_start(s.start_at) <= p_end_week_inclusive
+    for update of w
+  loop
+    delete from waiting_list_entries where id = v_waitlist_entry.entry_id;
+    v_removed_waitlist := v_removed_waitlist + 1;
+    insert into audit_logs(actor_type, actor_id, action, meta)
+    values ('system', null, 'waitlist.removed_by_pause', jsonb_build_object(
+      'memberId', v_membership.member_id,
+      'membershipId', p_membership_id,
+      'sessionId', v_waitlist_entry.session_id,
+      'entryId', v_waitlist_entry.entry_id
+    ));
+  end loop;
+
   -- Zero weekly tokens for paused weeks; only delete rows not referenced by booking_token_deductions.
   update tokens t
   set quantity = 0
@@ -731,7 +756,7 @@ begin
       '{}'::uuid[]
     )
     loop
-      v_waitlist := clm_process_waitlist_after_opening(v_sid, p_now);
+      v_waitlist_proc := clm_process_waitlist_after_opening(v_sid, p_now);
     end loop;
   end if;
 
@@ -742,6 +767,7 @@ begin
     'ok', true,
     'insertedWeeks', v_inserted_weeks,
     'cancelledBookings', v_cancelled_count,
+    'removedWaitlist', v_removed_waitlist,
     'newEndDate', v_new_end_date
   );
 end;
