@@ -85,7 +85,16 @@ export class BookingService {
       this.normalizeAccessCode(session.training_level),
       this.normalizeAccessCode(sessionType?.name),
     ].filter(Boolean);
+    const categoryCode = this.normalizeAccessCode(sessionType?.category);
+    const levelCode = this.normalizeAccessCode(session.training_level);
+    if (categoryCode === "octave") {
+      if (levelCode === "women") return "women";
+      if (levelCode === "men") return "men";
+    }
+
     for (const hay of haystacks) {
+      if (hay.includes("octave") && hay.includes("women")) return "women";
+      if (hay.includes("octave") && hay.includes("men")) return "men";
       if (hay === "elitewomen" || (hay.includes("elite") && hay.includes("women"))) return "women";
       if (hay === "elitemen" || (hay.includes("elite") && hay.includes("men"))) return "men";
     }
@@ -340,7 +349,7 @@ export class BookingService {
 
       if (sexMatchedElite) {
         const subLevelCodes = [...sessionLevelCodes].filter(
-          (code) => code !== "elitemen" && code !== "elitewomen",
+          (code) => code !== "elitemen" && code !== "elitewomen" && code !== "men" && code !== "women",
         );
         if (subLevelCodes.length > 0) {
           const levelAllowed = subLevelCodes.some((code) => access.trainingLevels.has(code));
