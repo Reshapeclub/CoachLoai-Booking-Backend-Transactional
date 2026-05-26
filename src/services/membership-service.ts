@@ -948,10 +948,16 @@ export class MembershipService {
       alloc: { ...allocations },
     };
 
+    // Admin "current" plan is always member_memberships dates (not the next queued plan).
     const trainingCurrent =
-      membership && membershipPayload && membershipHasActivePlanWindow(membership)
+      membership &&
+      membershipPayload &&
+      String(membership.status ?? "").trim().toLowerCase() === "active"
         ? trainingPlanShape
         : null;
+    const trainingCoversToday = Boolean(
+      membership && membershipHasActivePlanWindow(membership),
+    );
 
     let pauseHistory: Array<Record<string, unknown>> = [];
     let activePause: Record<string, unknown> | null = null;
@@ -1196,6 +1202,8 @@ export class MembershipService {
       membership: membershipPayload,
       training: {
         current: trainingCurrent,
+        coversToday: trainingCoversToday,
+        covers_today: trainingCoversToday,
         upcoming: trainingUpcoming,
         queue: planQueues.trainingQueue,
       },
@@ -1484,7 +1492,43 @@ export class MembershipService {
       await this.#syncMembershipSessionAllowances(membershipId, alloc);
     }
 
-    return this.getMembershipById(membershipId);
+    const membership = await this.getMembershipById(membershipId);
+    const startYmd = toDateOnly(String(membership.start_date ?? ""));
+    const endYmd = membership.end_date ? toDateOnly(String(membership.end_date)) : "";
+    const alloc = this.#extractSessionAllocFromTrainingBody(body);
+    const trainingCurrent = {
+      planType: isFixed ? "fixed" : "rolling",
+      plan_type: isFixed ? "fixed" : "rolling",
+      startDate: startYmd,
+      start_date: startYmd,
+      endDate: endYmd,
+      end_date: endYmd,
+      allocations: { ...alloc },
+      alloc: { ...alloc },
+    };
+
+    return {
+      membership: {
+        id: membership.id,
+        memberId: membership.member_id,
+        member_id: membership.member_id,
+        mode: membership.mode,
+        currentPackage: membership.current_package,
+        current_package: membership.current_package,
+        status: membership.status,
+        startDate: startYmd,
+        start_date: startYmd,
+        endDate: endYmd,
+        end_date: endYmd,
+        updatedAt: membership.updated_at,
+        updated_at: membership.updated_at,
+      },
+      training: {
+        current: trainingCurrent,
+        coversToday: membershipHasActivePlanWindow(membership as MembershipRow),
+        covers_today: membershipHasActivePlanWindow(membership as MembershipRow),
+      },
+    };
   }
 
   async queueAdminMemberTrainingPlan(memberId: string, body: Record<string, unknown>) {

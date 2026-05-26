@@ -2,13 +2,18 @@ import { supabaseAdmin } from "../db/supabase.js";
 import { HttpError } from "../lib/http-error.js";
 import {
   calendarTodayYmd,
+  membershipAdminRetainsPastCurrentPlan,
+  membershipCoversToday,
   shouldPromoteQueuedTrainingPlanToday,
   shouldSyncQueuedPlanToMembership,
 } from "../lib/membership-plan-sync-rules.js";
 
 export {
+  calendarDayAfter,
   membershipCoversToday,
+  queuedPlanIsImmediateSuccessor,
   shouldPromoteQueuedTrainingPlanToday,
+  membershipAdminRetainsPastCurrentPlan,
   shouldSyncQueuedPlanToMembership,
 } from "../lib/membership-plan-sync-rules.js";
 
@@ -918,7 +923,13 @@ export async function resolveMembershipIdForBookingWindow(
     plan,
     planAllocations,
   );
-  if (!applied) {
+  const queuedStartForRetain = String(plan.start_date ?? "").slice(0, 10);
+  if (
+    !applied &&
+    !membershipAdminRetainsPastCurrentPlan(membership, {
+      queuedStartYmd: queuedStartForRetain,
+    })
+  ) {
     await forceApplyQueuedTrainingPlanToMembershipForBooking(
       membership,
       plan,
@@ -969,6 +980,46 @@ function planWindowToIso(plan: Record<string, unknown>): { startIso: string; end
 }
 
 /**
+ * Promote a due queued plan onto `member_memberships` when the current window has ended.
+ */
+export async function promoteQueuedTrainingPlanToMembershipIfDue(
+  membership: Record<string, unknown>,
+  plan: Record<string, unknown>,
+  allocations: AllocationRow[],
+): Promise<boolean> {
+  const membershipId = String(membership.id ?? "");
+  if (!membershipId) return false;
+
+  const queuedStart = String(plan.start_date ?? "").slice(0, 10);
+  if (!shouldPromoteQueuedTrainingPlanToday(queuedStart)) return false;
+  if (membershipCoversToday(membership)) return false;
+  if (
+    membershipAdminRetainsPastCurrentPlan(membership, { queuedStartYmd: queuedStart })
+  ) {
+    return false;
+  }
+  if (membershipRowHasActivePlanWindow(membership)) return false;
+
+  const planId = String(plan.id ?? "");
+  const alreadyOnMembership = membershipDatesMatchQueuedPlan(membership, plan);
+
+  if (!alreadyOnMembership) {
+    await writeQueuedTrainingPlanToMembership(membershipId, plan, allocations);
+  } else if (allocations.length > 0) {
+    const allocationMode = String(plan.allocation_mode ?? "sessions");
+    if (allocationMode !== "location") {
+      await syncMembershipSessionAllowancesFromPlan(membershipId, allocations);
+    }
+  }
+
+  if (planId) {
+    await markQueuedTrainingPlanActive(membershipId, planId);
+  }
+
+  return true;
+}
+
+/**
  * When the membership window has ended (cancelled, terminated, or past end_date) and a
  * queued training plan's start_date is today or earlier, copy it onto `member_memberships`.
  */
@@ -998,22 +1049,13 @@ export async function activateDueQueuedTrainingPlansIfNeeded(
   if (!dueQueued.length) return null;
 
   const plan = dueQueued[0] as Record<string, unknown>;
-  const planId = String(plan.id ?? "");
   const planAllocations = (plan.allocations as AllocationRow[] | undefined) ?? [];
-  const now = new Date().toISOString();
-  const alreadyOnMembership = membershipDatesMatchQueuedPlan(membership, plan);
-
-  if (!alreadyOnMembership) {
-    if (membershipRowHasActivePlanWindow(membership)) return null;
-    await applyQueuedTrainingPlanToMembershipForBooking(membership, plan, planAllocations);
-  } else if (planAllocations.length > 0) {
-    const allocationMode = String(plan.allocation_mode ?? "sessions");
-    if (allocationMode !== "location") {
-      await syncMembershipSessionAllowancesFromPlan(membershipId, planAllocations);
-    }
-  }
-
-  await markQueuedTrainingPlanActive(membershipId, planId);
+  const promoted = await promoteQueuedTrainingPlanToMembershipIfDue(
+    membership,
+    plan,
+    planAllocations,
+  );
+  if (!promoted) return null;
 
   return {
     allocationMode: String(plan.allocation_mode ?? "sessions"),
@@ -1242,14 +1284,6 @@ export async function queueAdminTrainingPlan(memberId: string, body: Record<stri
       })) ?? [];
 
   const planWithAlloc = { ...plan, allocations: allocationsSaved };
-  await applyQueuedTrainingPlanToMembershipForBooking(
-    membership,
-    planWithAlloc,
-    allocationsSaved.map((row) => ({
-      allocation_key: row.allocation_key,
-      allocation_value: row.allocation_value,
-    })),
-  );
 
   const { data: refreshedPlan } = await supabaseAdmin
     .from("membership_training_plans")
@@ -1259,6 +1293,12 @@ export async function queueAdminTrainingPlan(memberId: string, body: Record<stri
   const planForResponse = refreshedPlan
     ? { ...(refreshedPlan as Record<string, unknown>), allocations: allocationsSaved }
     : planWithAlloc;
+
+  await promoteQueuedTrainingPlanToMembershipIfDue(
+    membership as Record<string, unknown>,
+    planForResponse,
+    allocationsSaved,
+  );
 
   const queued = (await getTrainingPlansWithAllocations(membershipId))
     .filter((p) => String((p as Record<string, unknown>).status) === "queued")
