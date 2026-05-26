@@ -86,8 +86,8 @@ export class BookingService {
       this.normalizeAccessCode(sessionType?.name),
     ].filter(Boolean);
     for (const hay of haystacks) {
-      if (hay === "elitemen" || (hay.includes("elite") && hay.includes("men"))) return "men";
       if (hay === "elitewomen" || (hay.includes("elite") && hay.includes("women"))) return "women";
+      if (hay === "elitemen" || (hay.includes("elite") && hay.includes("men"))) return "men";
     }
     return null;
   }
