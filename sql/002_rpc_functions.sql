@@ -361,17 +361,6 @@ begin
     if coalesce(v_row.weekly_allowance, 0) <= 0 then
       continue;
     end if;
-    -- Pause zeroes weekly tokens in place; restore allowance when the week is active again.
-    update tokens t
-    set
-      quantity = v_row.weekly_allowance,
-      expiry_at = greatest(t.expiry_at, p_week_start + interval '14 days')
-    where t.member_id = v_mm.member_id
-      and t.token_type_id = v_row.token_type_id
-      and t.week_start is not null
-      and clm_current_week_start(t.week_start) = clm_current_week_start(p_week_start)
-      and t.source = 'weekly'
-      and t.quantity < v_row.weekly_allowance;
 
     if not exists (
       select 1 from tokens t
@@ -1215,6 +1204,25 @@ begin
   if v_removed_weeks > 0 then
     foreach v_week in array v_week_starts loop
       perform clm_ensure_weekly_tokens_for_membership_week(p_membership_id, v_week, p_now);
+      -- Refill zeroed weekly tokens for unpaused weeks back up to the effective weekly allowance.
+      update tokens t
+      set quantity = clm_effective_weekly_allowance(
+        p_membership_id,
+        t.token_type_id,
+        v_week + interval '3 days'
+      )
+      where t.member_id = (
+        select member_id from member_memberships where id = p_membership_id
+      )
+        and t.source = 'weekly'
+        and t.week_start is not null
+        and clm_current_week_start(t.week_start) = clm_current_week_start(v_week)
+        and t.quantity = 0
+        and clm_effective_weekly_allowance(
+          p_membership_id,
+          t.token_type_id,
+          v_week + interval '3 days'
+        ) > 0;
     end loop;
   end if;
 
