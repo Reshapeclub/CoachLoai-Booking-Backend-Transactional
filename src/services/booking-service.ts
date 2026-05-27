@@ -35,6 +35,16 @@ function isLateCancellationBooking(
   return hoursUntilStart < BOOKING_REFUND_WINDOW_HOURS;
 }
 
+function isRebookBlockedByNoTokensError(error: unknown): boolean {
+  const msg = String((error as { message?: string })?.message ?? error ?? "").toLowerCase();
+  return (
+    msg.includes("no valid token available") || msg.includes("weekly session limit reached")
+  );
+}
+
+const REBOOK_SESSION_CREDIT_LOST_MESSAGE =
+  "Your token has been lost since you cancelled within 24 hours of the session start time.";
+
 export class BookingService {
   private readonly knownSessionAccessCodes = new Set([
     "reshape30",
@@ -839,12 +849,26 @@ export class BookingService {
   async rebookBooking(input: { bookingId: string; memberId: string; membershipId?: string }) {
     const { data: bookingRow, error: bookingErr } = await supabaseAdmin
       .from("bookings")
-      .select("session_id")
+      .select("id, status, cancelled_at, session_id, sessions(start_at)")
       .eq("id", input.bookingId)
       .eq("member_id", input.memberId)
       .maybeSingle();
     if (bookingErr) throw new HttpError(500, "Failed to load booking", bookingErr);
     if (!bookingRow?.session_id) throw new HttpError(404, "Booking not found");
+    if (String(bookingRow.status ?? "") !== "cancelled") {
+      throw new HttpError(422, "Only cancelled bookings can be rebooked");
+    }
+
+    const sessionRaw = (bookingRow as { sessions?: { start_at?: string } | Array<{ start_at?: string }> })
+      .sessions;
+    const sessionStartAt = String(
+      (Array.isArray(sessionRaw) ? sessionRaw[0]?.start_at : sessionRaw?.start_at) ?? "",
+    );
+    const sessionCreditLost = isLateCancellationBooking(
+      String(bookingRow.status ?? ""),
+      bookingRow.cancelled_at != null ? String(bookingRow.cancelled_at) : null,
+      sessionStartAt,
+    );
 
     const [memberAccess, profileRes, sessionRes] = await Promise.all([
       this.getMemberAccessProfile(input.memberId),
@@ -863,10 +887,10 @@ export class BookingService {
       throw new HttpError(403, "Member is not allowed to book this session");
     }
 
-    const sessionStartAt = String((sessionRes.data as { start_at: string }).start_at ?? "");
+    const sessionStartAtResolved = String((sessionRes.data as { start_at: string }).start_at ?? "");
     const membershipId = await this.resolveMembershipIdForSession(
       input.memberId,
-      sessionStartAt,
+      sessionStartAtResolved,
     );
 
     const { data, error } = await supabaseAdmin.rpc("clm_rebook_booking", {
@@ -875,7 +899,16 @@ export class BookingService {
       p_membership_id: membershipId,
       p_now: ukBookingNowIso(),
     });
-    if (error) throw new HttpError(422, "Rebook failed", error);
+    if (error) {
+      if (sessionCreditLost && isRebookBlockedByNoTokensError(error)) {
+        throw new HttpError(422, REBOOK_SESSION_CREDIT_LOST_MESSAGE, {
+          code: "SESSION_CREDIT_LOST",
+          sessionCreditLost: true,
+          rpc: error,
+        });
+      }
+      throw new HttpError(422, "Rebook failed", error);
+    }
 
     const payload =
       data && typeof data === "object" && !Array.isArray(data)
