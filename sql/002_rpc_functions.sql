@@ -87,95 +87,6 @@ begin
 end;
 $$;
 
-create or replace function clm_ensure_weekly_tokens_for_membership_week(
-  p_membership_id uuid,
-  p_week_start timestamptz,
-  p_now timestamptz default now()
-)
-returns void
-language plpgsql
-as $$
-declare
-  v_mm member_memberships%rowtype;
-  v_row record;
-begin
-  select * into v_mm from member_memberships where id = p_membership_id;
-  if not found then return; end if;
-
-  if v_mm.status <> 'active' then return; end if;
-  -- Issue tokens for weeks that overlap the membership (not only when p_now is already inside).
-  if not (p_week_start < v_mm.end_date and p_week_start + interval '7 days' > v_mm.start_date) then return; end if;
-  if v_mm.termination_date is not null and p_week_start >= v_mm.termination_date then return; end if;
-  if exists (
-    select 1 from membership_pause_weeks mpw
-    where mpw.membership_id = v_mm.id and clm_current_week_start(mpw.week_start) = clm_current_week_start(p_week_start)
-  ) then return; end if;
-
-  for v_row in
-    select
-      x.token_type_id,
-      clm_effective_weekly_allowance(
-        v_mm.id,
-        x.token_type_id,
-        p_week_start + interval '3 days'
-      ) as weekly_allowance
-    from (
-      select msa.token_type_id
-      from membership_session_allowances msa
-      where msa.membership_id = v_mm.id
-      union
-      select st.token_type_id
-      from membership_training_plans mtp
-      join membership_training_plan_allocations mtpa
-        on mtpa.training_plan_id = mtp.id
-      join session_types st
-        on lower(trim(st.category)) = lower(trim(clm_allocation_key_category(mtpa.allocation_key)))
-      where mtp.membership_id = v_mm.id
-        and mtp.status = 'queued'
-        and mtp.allocation_mode = 'sessions'
-        and mtpa.allocation_value > 0
-        and mtp.start_date < (p_week_start + interval '7 days')::date
-        and (mtp.end_date is null or mtp.end_date >= (p_week_start at time zone 'utc')::date)
-    ) x
-  loop
-    if coalesce(v_row.weekly_allowance, 0) <= 0 then
-      continue;
-    end if;
-    -- Pause zeroes weekly tokens in place; restore allowance when the week is active again.
-    update tokens t
-    set
-      quantity = v_row.weekly_allowance,
-      expiry_at = greatest(t.expiry_at, p_week_start + interval '14 days')
-    where t.member_id = v_mm.member_id
-      and t.token_type_id = v_row.token_type_id
-      and t.week_start is not null
-      and clm_current_week_start(t.week_start) = clm_current_week_start(p_week_start)
-      and t.source = 'weekly'
-      and t.quantity < v_row.weekly_allowance;
-
-    if not exists (
-      select 1 from tokens t
-      where t.member_id = v_mm.member_id
-        and t.token_type_id = v_row.token_type_id
-        and t.week_start is not null
-        and clm_current_week_start(t.week_start) = clm_current_week_start(p_week_start)
-        and t.source = 'weekly'
-    ) then
-      insert into tokens(member_id, token_type_id, quantity, week_start, expiry_at, source, source_meta)
-      values (
-        v_mm.member_id,
-        v_row.token_type_id,
-        v_row.weekly_allowance,
-        p_week_start,
-        p_week_start + interval '14 days',
-        'weekly',
-        jsonb_build_object('weekStart', p_week_start)
-      );
-    end if;
-  end loop;
-end;
-$$;
-
 create or replace function clm_pick_token_id(
   p_member_id uuid,
   p_token_type_id uuid,
@@ -354,6 +265,134 @@ begin
       and mtp.start_date <= (p_session_at at time zone 'utc')::date
       and (mtp.end_date is null or mtp.end_date >= (p_session_at at time zone 'utc')::date)
   );
+end;
+$$;
+
+-- Calendar week overlaps member_memberships window and/or a queued training plan.
+create or replace function clm_week_covered_by_membership_or_queued(
+  p_membership_id uuid,
+  p_week_start timestamptz
+)
+returns boolean
+language plpgsql
+stable
+as $$
+declare
+  v_mm member_memberships%rowtype;
+  v_week_end date;
+  v_week_start_ymd date;
+begin
+  select * into v_mm from member_memberships where id = p_membership_id;
+  if not found then return false; end if;
+
+  v_week_start_ymd := (p_week_start at time zone 'utc')::date;
+  v_week_end := (p_week_start + interval '7 days')::date;
+
+  if p_week_start < v_mm.end_date and p_week_start + interval '7 days' > v_mm.start_date then
+    return true;
+  end if;
+
+  return exists (
+    select 1
+    from membership_training_plans mtp
+    where mtp.membership_id = p_membership_id
+      and mtp.status = 'queued'
+      and mtp.start_date < v_week_end
+      and (mtp.end_date is null or mtp.end_date >= v_week_start_ymd)
+  );
+end;
+$$;
+
+create or replace function clm_ensure_weekly_tokens_for_membership_week(
+  p_membership_id uuid,
+  p_week_start timestamptz,
+  p_now timestamptz default now()
+)
+returns void
+language plpgsql
+as $$
+declare
+  v_mm member_memberships%rowtype;
+  v_row record;
+begin
+  select * into v_mm from member_memberships where id = p_membership_id;
+  if not found then return; end if;
+
+  if v_mm.status <> 'active' then return; end if;
+  -- Issue tokens for weeks overlapping MM and/or a queued plan (future queued-only weeks included).
+  if not clm_week_covered_by_membership_or_queued(p_membership_id, p_week_start) then return; end if;
+  if clm_session_within_membership_window(v_mm, p_week_start + interval '3 days')
+     and v_mm.termination_date is not null
+     and p_week_start >= v_mm.termination_date then
+    return;
+  end if;
+  if exists (
+    select 1 from membership_pause_weeks mpw
+    where mpw.membership_id = v_mm.id and clm_current_week_start(mpw.week_start) = clm_current_week_start(p_week_start)
+  ) then return; end if;
+
+  for v_row in
+    select
+      x.token_type_id,
+      clm_effective_weekly_allowance(
+        v_mm.id,
+        x.token_type_id,
+        p_week_start + interval '3 days'
+      ) as weekly_allowance
+    from (
+      select msa.token_type_id
+      from membership_session_allowances msa
+      where msa.membership_id = v_mm.id
+      union
+      select st.token_type_id
+      from membership_training_plans mtp
+      join membership_training_plan_allocations mtpa
+        on mtpa.training_plan_id = mtp.id
+      join session_types st
+        on lower(trim(st.category)) = lower(trim(clm_allocation_key_category(mtpa.allocation_key)))
+      where mtp.membership_id = v_mm.id
+        and mtp.status = 'queued'
+        and mtp.allocation_mode = 'sessions'
+        and mtpa.allocation_value > 0
+        and mtp.start_date < (p_week_start + interval '7 days')::date
+        and (mtp.end_date is null or mtp.end_date >= (p_week_start at time zone 'utc')::date)
+    ) x
+  loop
+    if coalesce(v_row.weekly_allowance, 0) <= 0 then
+      continue;
+    end if;
+    -- Pause zeroes weekly tokens in place; restore allowance when the week is active again.
+    update tokens t
+    set
+      quantity = v_row.weekly_allowance,
+      expiry_at = greatest(t.expiry_at, p_week_start + interval '14 days')
+    where t.member_id = v_mm.member_id
+      and t.token_type_id = v_row.token_type_id
+      and t.week_start is not null
+      and clm_current_week_start(t.week_start) = clm_current_week_start(p_week_start)
+      and t.source = 'weekly'
+      and t.quantity < v_row.weekly_allowance;
+
+    if not exists (
+      select 1 from tokens t
+      where t.member_id = v_mm.member_id
+        and t.token_type_id = v_row.token_type_id
+        and t.week_start is not null
+        and clm_current_week_start(t.week_start) = clm_current_week_start(p_week_start)
+        and t.source = 'weekly'
+    ) then
+      insert into tokens(member_id, token_type_id, quantity, week_start, expiry_at, source, source_meta)
+      values (
+        v_mm.member_id,
+        v_row.token_type_id,
+        v_row.weekly_allowance,
+        p_week_start,
+        p_week_start + interval '14 days',
+        'weekly',
+        jsonb_build_object('weekStart', p_week_start)
+      );
+    end if;
+  end loop;
 end;
 $$;
 
