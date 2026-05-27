@@ -481,6 +481,8 @@ export class BookingService {
     isOnline?: boolean
   ) {
     const isDateOnly = (v: string) => /^\d{4}-\d{2}-\d{2}$/.test(v);
+    const isUtcMidnightIso = (v: string) =>
+      /^\d{4}-\d{2}-\d{2}T00:00:00(?:\.000)?Z$/.test(v);
     const toEndOfDayUtc = (v: string) => {
       const bounds = ukDayBoundsUtcIso(v);
       if (bounds) {
@@ -499,6 +501,9 @@ export class BookingService {
       effectiveFrom = bounds?.from ?? `${from}T00:00:00.000Z`;
     }
     if (to && isDateOnly(to)) effectiveTo = toEndOfDayUtc(to);
+    if (to && isUtcMidnightIso(to)) {
+      effectiveTo = toEndOfDayUtc(to.slice(0, 10));
+    }
 
     const membershipWindowEnd =
       effectiveTo ??
@@ -513,7 +518,6 @@ export class BookingService {
       resolveMembershipBrowseContext(memberId, effectiveFrom, membershipWindowEnd),
       this.getMemberAccessProfile(memberId),
     ]);
-
     if (userError || !user) throw new HttpError(404, "Member not found");
     if (!browseContext) return [];
 
@@ -579,9 +583,13 @@ export class BookingService {
     type SessionRow = Record<string, unknown> & {
       id: string;
       start_at?: string;
+      token_type_id?: string | null;
       capacity: number;
       coaches?: { admins?: CoachAdmin | CoachAdmin[] };
-      session_types?: { token_type_id?: string; audience?: string | null; name?: string | null; category?: string | null } | null;
+      session_types?:
+        | { token_type_id?: string; audience?: string | null; name?: string | null; category?: string | null }
+        | Array<{ token_type_id?: string; audience?: string | null; name?: string | null; category?: string | null }>
+        | null;
       locations?: { name?: string | null; slug?: string | null } | null;
       is_online?: boolean | null;
       location_id?: string | null;
@@ -617,8 +625,9 @@ export class BookingService {
     }> = [];
     const eligibleList = allowedTokenTypeIds.size
       ? list.filter((s) => {
-          const tokenTypeId = s.session_types?.token_type_id;
-          const audience = String(s.session_types?.audience ?? "mixed")
+          const sessionType = Array.isArray(s.session_types) ? s.session_types[0] : s.session_types;
+          const tokenTypeId = sessionType?.token_type_id ?? s.token_type_id;
+          const audience = String(sessionType?.audience ?? "mixed")
             .trim()
             .toLowerCase();
           const audienceAllowed = allowedAudiences.has(audience || "mixed");

@@ -619,6 +619,20 @@ async function markQueuedNutritionPlanActive(membershipId: string, planId: strin
 }
 
 /** Mirrors `clm_find_membership_overlapping_window` for a membership row. */
+function parseMembershipBoundaryMs(value: unknown, boundary: "start" | "end"): number {
+  const raw = String(value ?? "").trim();
+  if (!raw) return NaN;
+  const ymd = raw.slice(0, 10);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(ymd)) {
+    return new Date(
+      `${ymd}T${boundary === "start" ? "00:00:00.000" : "23:59:59.999"}Z`,
+    ).getTime();
+  }
+  const ms = new Date(raw).getTime();
+  if (!Number.isFinite(ms)) return NaN;
+  return ms;
+}
+
 function membershipOverlapsBookingWindow(
   membership: Record<string, unknown>,
   windowStartIso: string,
@@ -629,8 +643,8 @@ function membershipOverlapsBookingWindow(
 
   const windowStartMs = new Date(windowStartIso).getTime();
   const windowEndMs = new Date(windowEndIso).getTime();
-  const mmStartMs = new Date(String(membership.start_date ?? "")).getTime();
-  const mmEndMs = new Date(String(membership.end_date ?? "")).getTime();
+  const mmStartMs = parseMembershipBoundaryMs(membership.start_date, "start");
+  const mmEndMs = parseMembershipBoundaryMs(membership.end_date, "end");
   if (
     !Number.isFinite(windowStartMs) ||
     !Number.isFinite(windowEndMs) ||
@@ -657,8 +671,10 @@ function queuedPlanOverlapsBookingWindow(
   if (String(plan.status ?? "") !== "queued") return false;
   const planStart = String(plan.start_date ?? "").slice(0, 10);
   const planEnd = plan.end_date ? String(plan.end_date).slice(0, 10) : null;
-  if (!planStart || planStart >= windowEndYmd) return false;
-  if (planEnd && planEnd <= windowStartYmd) return false;
+  // Compare as inclusive calendar dates so single-day windows (from=to) still
+  // include queued plans that start on that day.
+  if (!planStart || planStart > windowEndYmd) return false;
+  if (planEnd && planEnd < windowStartYmd) return false;
   return true;
 }
 
@@ -673,8 +689,8 @@ function membershipFullyCoversBookingWindow(
   }
   const windowStartMs = new Date(windowStartIso).getTime();
   const windowEndMs = new Date(windowEndIso).getTime();
-  const mmStartMs = new Date(String(membership.start_date ?? "")).getTime();
-  const mmEndMs = new Date(String(membership.end_date ?? "")).getTime();
+  const mmStartMs = parseMembershipBoundaryMs(membership.start_date, "start");
+  const mmEndMs = parseMembershipBoundaryMs(membership.end_date, "end");
   if (
     !Number.isFinite(windowStartMs) ||
     !Number.isFinite(windowEndMs) ||
@@ -746,8 +762,8 @@ export async function resolveMembershipBrowseContext(
   };
 
   if (membershipOverlapsBookingWindow(membership, windowStartIso, windowEndIso)) {
-    const mmStartMs = new Date(String(membership.start_date ?? "")).getTime();
-    const mmEndMs = new Date(String(membership.end_date ?? "")).getTime();
+    const mmStartMs = parseMembershipBoundaryMs(membership.start_date, "start");
+    const mmEndMs = parseMembershipBoundaryMs(membership.end_date, "end");
     if (Number.isFinite(mmStartMs) && Number.isFinite(mmEndMs)) {
       includeInterval(mmStartMs, mmEndMs);
     }
