@@ -2,12 +2,19 @@ import Stripe from "stripe";
 import { env } from "../config/env.js";
 import { HttpError } from "../lib/http-error.js";
 import { supabaseAdmin } from "../db/supabase.js";
+import { TokenService } from "./token-service.js";
 
 export class StripeService {
   private stripe = env.STRIPE_SECRET_KEY ? new Stripe(env.STRIPE_SECRET_KEY) : null;
+  private tokenService = new TokenService();
 
   async createCheckoutSession(input: { memberId: string; membershipId: string; tokenTypeId: string; quantity: number; }) {
     if (!this.stripe) throw new HttpError(500, 'Stripe is not configured');
+    await this.tokenService.assertMembershipAllowsTokenPurchase({
+      memberId: input.memberId,
+      membershipId: input.membershipId,
+      tokenTypeId: input.tokenTypeId,
+    });
     const { data: sessionType, error: sessionTypeError } = await supabaseAdmin
       .from("session_types")
       .select("name, category")

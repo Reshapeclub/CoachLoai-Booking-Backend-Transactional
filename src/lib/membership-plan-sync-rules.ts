@@ -109,6 +109,24 @@ export function membershipAdminRetainsPastCurrentPlan(
   return updatedMs > endMs;
 }
 
+/**
+ * Do not copy a future queued plan onto `member_memberships` while the current plan still covers today
+ * (e.g. MM May 25–31, queued Jun 1–7 — booking Jun 2 must not rewrite MM to Jun 1–7).
+ */
+export function shouldWriteQueuedPlanOntoMembershipRow(
+  membership: Record<string, unknown>,
+  queuedStartYmd: string,
+  options?: { todayYmd?: string; nowMs?: number },
+): boolean {
+  const queuedStart = String(queuedStartYmd ?? "").slice(0, 10);
+  if (!queuedStart) return false;
+  const today = (options?.todayYmd ?? calendarTodayYmd()).slice(0, 10);
+  if (membershipCoversToday(membership, options) && queuedStart > today) {
+    return false;
+  }
+  return true;
+}
+
 /** After applying to MM, mark training plan row active when start is today or in the past. */
 export function shouldPromoteQueuedTrainingPlanToday(
   queuedStartYmd: string,

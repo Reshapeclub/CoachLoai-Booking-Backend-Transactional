@@ -1,5 +1,7 @@
 import { supabaseAdmin } from "../db/supabase.js";
 import { HttpError } from "../lib/http-error.js";
+import { ukBookingNowIso } from "../lib/uk-booking-time.js";
+import { resolveMembershipIdForBookingWindow } from "./membership-plan-service.js";
 
 export class TokenService {
   private readonly unitAmountMinorCentsByName: Record<string, number> = {
@@ -9,12 +11,58 @@ export class TokenService {
     "1:1": 9000,
   };
 
-  async listPurchaseOptions() {
+  private async getAllowedTokenTypeIdsForMembership(membershipId: string): Promise<Set<string>> {
+    const { data, error } = await supabaseAdmin
+      .from("membership_session_allowances")
+      .select("token_type_id")
+      .eq("membership_id", membershipId)
+      .gt("weekly_allowance", 0);
+    if (error) throw new HttpError(500, "Failed to fetch membership allowances", error);
+    return new Set(
+      (data ?? [])
+        .map((r) => String((r as { token_type_id?: string }).token_type_id ?? ""))
+        .filter(Boolean),
+    );
+  }
+
+  /** Same gate as `clm_create_booking` session allowance check. */
+  async assertMembershipAllowsTokenPurchase(input: {
+    memberId: string;
+    membershipId: string;
+    tokenTypeId: string;
+  }): Promise<void> {
+    const { data: membership, error: membershipError } = await supabaseAdmin
+      .from("member_memberships")
+      .select("id")
+      .eq("id", input.membershipId)
+      .eq("member_id", input.memberId)
+      .maybeSingle();
+    if (membershipError) {
+      throw new HttpError(500, "Failed to verify membership for token purchase", membershipError);
+    }
+    if (!membership?.id) throw new HttpError(404, "Membership not found");
+
+    const allowed = await this.getAllowedTokenTypeIdsForMembership(input.membershipId);
+    if (!allowed.has(input.tokenTypeId)) {
+      throw new HttpError(422, "Session type not covered by your membership plan");
+    }
+  }
+
+  async listPurchaseOptions(memberId: string) {
+    const nowIso = ukBookingNowIso();
+    const windowEnd = new Date(Date.now() + 28 * 86400000).toISOString();
+    const membershipId = await resolveMembershipIdForBookingWindow(memberId, nowIso, windowEnd);
+    if (!membershipId) return [];
+
+    const allowedTokenTypeIds = await this.getAllowedTokenTypeIdsForMembership(membershipId);
+    if (allowedTokenTypeIds.size === 0) return [];
+
     const expiryPolicy = this.getPurchaseExpiryPolicy();
     const { data, error } = await supabaseAdmin
       .from("session_types")
       .select("id, name, category, token_type_id, color, icon, display_order, is_active, category_icon")
       .eq("is_active", true)
+      .in("token_type_id", [...allowedTokenTypeIds])
       .order("display_order", { ascending: true })
       .order("created_at", { ascending: true });
 
@@ -24,7 +72,8 @@ export class TokenService {
     const byCategory = new Map<string, (typeof data)[number]>();
     for (const row of data ?? []) {
       const category = (row as { category?: string | null }).category ?? null;
-      if (!category) continue;
+      const tokenTypeId = String((row as { token_type_id?: string }).token_type_id ?? "");
+      if (!category || !tokenTypeId || !allowedTokenTypeIds.has(tokenTypeId)) continue;
       if (!this.unitAmountMinorCentsByName[category]) continue;
       if (!byCategory.has(category)) byCategory.set(category, row);
     }

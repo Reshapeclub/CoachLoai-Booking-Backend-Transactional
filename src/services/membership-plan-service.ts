@@ -6,6 +6,7 @@ import {
   membershipCoversToday,
   shouldPromoteQueuedTrainingPlanToday,
   shouldSyncQueuedPlanToMembership,
+  shouldWriteQueuedPlanOntoMembershipRow,
 } from "../lib/membership-plan-sync-rules.js";
 
 export {
@@ -15,6 +16,7 @@ export {
   shouldPromoteQueuedTrainingPlanToday,
   membershipAdminRetainsPastCurrentPlan,
   shouldSyncQueuedPlanToMembership,
+  shouldWriteQueuedPlanOntoMembershipRow,
 } from "../lib/membership-plan-sync-rules.js";
 
 type PlanType = "fixed" | "rolling";
@@ -917,24 +919,26 @@ export async function resolveMembershipIdForBookingWindow(
 
   const plan = overlappingQueued[0] as Record<string, unknown>;
   const planAllocations = (plan.allocations as AllocationRow[] | undefined) ?? [];
-
-  const applied = await applyQueuedTrainingPlanToMembershipForBooking(
-    membership,
-    plan,
-    planAllocations,
-  );
   const queuedStartForRetain = String(plan.start_date ?? "").slice(0, 10);
-  if (
-    !applied &&
-    !membershipAdminRetainsPastCurrentPlan(membership, {
-      queuedStartYmd: queuedStartForRetain,
-    })
-  ) {
-    await forceApplyQueuedTrainingPlanToMembershipForBooking(
+
+  if (shouldWriteQueuedPlanOntoMembershipRow(membership, queuedStartForRetain)) {
+    const applied = await applyQueuedTrainingPlanToMembershipForBooking(
       membership,
       plan,
       planAllocations,
     );
+    if (
+      !applied &&
+      !membershipAdminRetainsPastCurrentPlan(membership, {
+        queuedStartYmd: queuedStartForRetain,
+      })
+    ) {
+      await forceApplyQueuedTrainingPlanToMembershipForBooking(
+        membership,
+        plan,
+        planAllocations,
+      );
+    }
   }
 
   const { data: retry, error: retryErr } = await supabaseAdmin.rpc(

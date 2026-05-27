@@ -59,7 +59,7 @@ router.get('/tokens/usage-tracker', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 router.get('/tokens/additional-summary', async (req, res, next) => { try { res.json({ ok: true, data: await tokenService.getAdditionalSessionsSummary(req.user!.id) }); } catch (e) { next(e); } });
-router.get('/tokens/purchase/options', async (req, res, next) => { try { res.json({ ok: true, data: await tokenService.listPurchaseOptions() }); } catch (e) { next(e); } });
+router.get('/tokens/purchase/options', async (req, res, next) => { try { res.json({ ok: true, data: await tokenService.listPurchaseOptions(req.user!.id) }); } catch (e) { next(e); } });
 router.post('/tokens/purchase/checkout', async (req, res, next) => { try { const body = validate(purchaseTokensCheckoutSchema, req.body); const session = await stripeService.createCheckoutSession({ memberId: req.user!.id, membershipId: body.membershipId, tokenTypeId: body.tokenTypeId, quantity: body.quantity }); res.json({ ok: true, checkoutUrl: session.url }); } catch (e) { next(e); } });
 router.get('/locations', async (req, res, next) => { try { res.json({ ok: true, data: await sessionService.listLocations() }); } catch (e) { next(e); } });
 router.get('/meetings/types', async (req, res, next) => { try { res.json({ ok: true, data: await meetingService.listMeetingTypesForMember() }); } catch (e) { next(e); } });

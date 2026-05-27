@@ -112,10 +112,35 @@ begin
   ) then return; end if;
 
   for v_row in
-    select msa.token_type_id, msa.weekly_allowance
-    from membership_session_allowances msa
-    where msa.membership_id = v_mm.id and msa.weekly_allowance > 0
+    select
+      x.token_type_id,
+      clm_effective_weekly_allowance(
+        v_mm.id,
+        x.token_type_id,
+        p_week_start + interval '3 days'
+      ) as weekly_allowance
+    from (
+      select msa.token_type_id
+      from membership_session_allowances msa
+      where msa.membership_id = v_mm.id
+      union
+      select st.token_type_id
+      from membership_training_plans mtp
+      join membership_training_plan_allocations mtpa
+        on mtpa.training_plan_id = mtp.id
+      join session_types st
+        on lower(trim(st.category)) = lower(trim(clm_allocation_key_category(mtpa.allocation_key)))
+      where mtp.membership_id = v_mm.id
+        and mtp.status = 'queued'
+        and mtp.allocation_mode = 'sessions'
+        and mtpa.allocation_value > 0
+        and mtp.start_date < (p_week_start + interval '7 days')::date
+        and (mtp.end_date is null or mtp.end_date >= (p_week_start at time zone 'utc')::date)
+    ) x
   loop
+    if coalesce(v_row.weekly_allowance, 0) <= 0 then
+      continue;
+    end if;
     -- Pause zeroes weekly tokens in place; restore allowance when the week is active again.
     update tokens t
     set
@@ -204,6 +229,291 @@ begin
 end;
 $$;
 
+-- Map training-plan allocation_key to session_types.category label.
+create or replace function clm_allocation_key_category(p_key text)
+returns text
+language sql
+immutable
+as $$
+  select case p_key
+    when 'oneToOne' then '1:1'
+    when 'elite' then 'Elite'
+    when 'octave' then 'Octave'
+    when 'group' then 'Group'
+    else null
+  end;
+$$;
+
+-- Session falls within member_memberships dates (respecting termination).
+create or replace function clm_session_within_membership_window(
+  p_membership member_memberships,
+  p_session_at timestamptz
+)
+returns boolean
+language plpgsql
+stable
+as $$
+begin
+  if p_session_at < p_membership.start_date then return false; end if;
+  if p_session_at >= p_membership.end_date then return false; end if;
+  if p_membership.termination_date is not null and p_session_at >= p_membership.termination_date then
+    return false;
+  end if;
+  return true;
+end;
+$$;
+
+-- Queued training plan covering session date (earliest start wins).
+create or replace function clm_queued_plan_weekly_allowance(
+  p_membership_id uuid,
+  p_token_type_id uuid,
+  p_session_at timestamptz
+)
+returns int
+language plpgsql
+stable
+as $$
+declare
+  v_session_ymd date;
+  v_allowance int;
+begin
+  v_session_ymd := (p_session_at at time zone 'utc')::date;
+
+  select mtpa.allocation_value into v_allowance
+  from membership_training_plans mtp
+  join membership_training_plan_allocations mtpa
+    on mtpa.training_plan_id = mtp.id
+  join session_types st
+    on st.token_type_id = p_token_type_id
+    and lower(trim(st.category)) = lower(trim(clm_allocation_key_category(mtpa.allocation_key)))
+  where mtp.membership_id = p_membership_id
+    and mtp.status = 'queued'
+    and mtp.allocation_mode = 'sessions'
+    and mtpa.allocation_value > 0
+    and mtp.start_date <= v_session_ymd
+    and (mtp.end_date is null or mtp.end_date >= v_session_ymd)
+  order by mtp.start_date asc
+  limit 1;
+
+  return coalesce(v_allowance, 0);
+end;
+$$;
+
+-- Allowance for cap/tokens: live MM row when session is in that window, else queued plan.
+create or replace function clm_effective_weekly_allowance(
+  p_membership_id uuid,
+  p_token_type_id uuid,
+  p_session_at timestamptz
+)
+returns int
+language plpgsql
+stable
+as $$
+declare
+  v_mm member_memberships%rowtype;
+  v_mm_allowance int;
+begin
+  select * into v_mm from member_memberships where id = p_membership_id;
+  if not found then return 0; end if;
+
+  if clm_session_within_membership_window(v_mm, p_session_at) then
+    select coalesce(msa.weekly_allowance, 0) into v_mm_allowance
+    from membership_session_allowances msa
+    where msa.membership_id = p_membership_id
+      and msa.token_type_id = p_token_type_id;
+    return coalesce(v_mm_allowance, 0);
+  end if;
+
+  return clm_queued_plan_weekly_allowance(p_membership_id, p_token_type_id, p_session_at);
+end;
+$$;
+
+create or replace function clm_session_allowed_for_membership(
+  p_membership_id uuid,
+  p_session_at timestamptz
+)
+returns boolean
+language plpgsql
+stable
+as $$
+declare
+  v_mm member_memberships%rowtype;
+begin
+  select * into v_mm from member_memberships where id = p_membership_id;
+  if not found then return false; end if;
+
+  if clm_session_within_membership_window(v_mm, p_session_at) then
+    return true;
+  end if;
+
+  return exists (
+    select 1
+    from membership_training_plans mtp
+    where mtp.membership_id = p_membership_id
+      and mtp.status = 'queued'
+      and mtp.start_date <= (p_session_at at time zone 'utc')::date
+      and (mtp.end_date is null or mtp.end_date >= (p_session_at at time zone 'utc')::date)
+  );
+end;
+$$;
+
+-- Active bookings in the session's calendar week for a token type (optional booking to exclude on rebook).
+create or replace function clm_count_member_week_bookings(
+  p_member_id uuid,
+  p_token_type_id uuid,
+  p_session_week timestamptz,
+  p_exclude_booking_id uuid default null
+)
+returns int
+language plpgsql
+stable
+as $$
+declare
+  v_count int;
+begin
+  select count(*)::int into v_count
+  from bookings b
+  join sessions s on s.id = b.session_id
+  where b.member_id = p_member_id
+    and b.status = 'booked'
+    and s.token_type_id = p_token_type_id
+    and clm_current_week_start(s.start_at) = clm_current_week_start(p_session_week)
+    and (p_exclude_booking_id is null or b.id <> p_exclude_booking_id);
+
+  return coalesce(v_count, 0);
+end;
+$$;
+
+-- Pick token for booking: weekly allowance capped per session week; extras use purchase/admin/gift only.
+create or replace function clm_pick_token_for_booking(
+  p_member_id uuid,
+  p_membership_id uuid,
+  p_token_type_id uuid,
+  p_session_week timestamptz,
+  p_now timestamptz,
+  p_exclude_booking_id uuid default null
+)
+returns uuid
+language plpgsql
+as $$
+declare
+  v_weekly_allowance int;
+  v_week_bookings int;
+  v_token_id uuid;
+begin
+  v_weekly_allowance := clm_effective_weekly_allowance(
+    p_membership_id,
+    p_token_type_id,
+    p_session_week + interval '3 days'
+  );
+
+  v_week_bookings := clm_count_member_week_bookings(
+    p_member_id,
+    p_token_type_id,
+    p_session_week,
+    p_exclude_booking_id
+  );
+
+  if v_week_bookings < v_weekly_allowance then
+    select t.id into v_token_id
+    from tokens t
+    where t.member_id = p_member_id
+      and t.token_type_id = p_token_type_id
+      and t.quantity > 0
+      and p_now < t.expiry_at
+      and t.source = 'weekly'
+      and t.week_start is not null
+      and clm_current_week_start(t.week_start) = clm_current_week_start(p_session_week)
+    order by t.created_at asc
+    limit 1
+    for update;
+
+    if v_token_id is not null then
+      return v_token_id;
+    end if;
+  end if;
+
+  select t.id into v_token_id
+  from tokens t
+  where t.member_id = p_member_id
+    and t.token_type_id = p_token_type_id
+    and t.quantity > 0
+    and p_now < t.expiry_at
+    and t.source in ('purchase', 'admin', 'gift')
+  order by t.created_at asc
+  limit 1
+  for update;
+
+  if v_token_id is not null then
+    return v_token_id;
+  end if;
+
+  if v_week_bookings >= v_weekly_allowance then
+    raise exception 'Weekly session limit reached for this session type';
+  end if;
+
+  raise exception 'No valid token available';
+end;
+$$;
+
+-- Non-locking availability check (waitlist join).
+create or replace function clm_has_token_for_booking(
+  p_member_id uuid,
+  p_membership_id uuid,
+  p_token_type_id uuid,
+  p_session_week timestamptz,
+  p_now timestamptz,
+  p_exclude_booking_id uuid default null
+)
+returns boolean
+language plpgsql
+stable
+as $$
+declare
+  v_weekly_allowance int;
+  v_week_bookings int;
+begin
+  v_weekly_allowance := clm_effective_weekly_allowance(
+    p_membership_id,
+    p_token_type_id,
+    p_session_week + interval '3 days'
+  );
+
+  v_week_bookings := clm_count_member_week_bookings(
+    p_member_id,
+    p_token_type_id,
+    p_session_week,
+    p_exclude_booking_id
+  );
+
+  if v_week_bookings < v_weekly_allowance then
+    if exists (
+      select 1
+      from tokens t
+      where t.member_id = p_member_id
+        and t.token_type_id = p_token_type_id
+        and t.quantity > 0
+        and p_now < t.expiry_at
+        and t.source = 'weekly'
+        and t.week_start is not null
+        and clm_current_week_start(t.week_start) = clm_current_week_start(p_session_week)
+    ) then
+      return true;
+    end if;
+  end if;
+
+  return exists (
+    select 1
+    from tokens t
+    where t.member_id = p_member_id
+      and t.token_type_id = p_token_type_id
+      and t.quantity > 0
+      and p_now < t.expiry_at
+      and t.source in ('purchase', 'admin', 'gift')
+  );
+end;
+$$;
+
 create or replace function clm_create_booking(
   p_member_id uuid,
   p_membership_id uuid,
@@ -237,9 +547,9 @@ begin
   v_session_week := clm_current_week_start(v_session.start_at);
   v_horizon := p_now + interval '28 days';
 
-  if v_session.start_at < v_membership.start_date then raise exception 'Membership not active yet for this session'; end if;
-  if v_session.start_at >= v_membership.end_date then raise exception 'Cannot book beyond membership end date'; end if;
-  if v_membership.termination_date is not null and v_session.start_at >= v_membership.termination_date then raise exception 'Cannot book beyond termination date'; end if;
+  if not clm_session_allowed_for_membership(v_membership.id, v_session.start_at) then
+    raise exception 'Membership not active for this session';
+  end if;
   -- Block only when the session falls in a paused week (not merely because today is in a paused week).
   if exists (select 1 from membership_pause_weeks mpw where mpw.membership_id = v_membership.id and clm_current_week_start(mpw.week_start) = v_session_week) then raise exception 'Cannot book in paused week'; end if;
   if v_session.start_at > v_horizon then raise exception 'Session beyond booking horizon'; end if;
@@ -262,7 +572,9 @@ begin
       raise exception 'Location mismatch';
     end if;
   end if;
-  if not exists (select 1 from membership_session_allowances msa where msa.membership_id = v_membership.id and msa.token_type_id = v_session.token_type_id) then raise exception 'Session not covered by membership allowance'; end if;
+  if clm_effective_weekly_allowance(v_membership.id, v_session.token_type_id, v_session.start_at) <= 0 then
+    raise exception 'Session not covered by membership allowance';
+  end if;
   --if not exists (select 1 from member_session_tags mst where mst.member_id = p_member_id and mst.session_type_id = v_session.session_type_id) then raise exception 'Session type not allowed by user tags'; end if;
 
   select count(*) into v_duplicate_count
@@ -274,8 +586,13 @@ begin
   if v_booked_count >= v_session.capacity then raise exception 'Session full'; end if;
 
   perform clm_ensure_weekly_tokens_for_membership_week(v_membership.id, v_session_week, p_now);
-  v_token_id := clm_pick_token_id(p_member_id, v_session.token_type_id, p_now, v_session_week);
-  if v_token_id is null then raise exception 'No valid token available'; end if;
+  v_token_id := clm_pick_token_for_booking(
+    p_member_id,
+    v_membership.id,
+    v_session.token_type_id,
+    v_session_week,
+    p_now
+  );
 
   update tokens set quantity = quantity - 1 where id = v_token_id and quantity > 0;
   if not found then raise exception 'Token deduction failed'; end if;
@@ -419,9 +736,9 @@ begin
   v_session_week := clm_current_week_start(v_session.start_at);
   v_horizon := p_now + interval '28 days';
 
-  if v_session.start_at < v_membership.start_date then raise exception 'Membership not active yet for this session'; end if;
-  if v_session.start_at >= v_membership.end_date then raise exception 'Cannot book beyond membership end date'; end if;
-  if v_membership.termination_date is not null and v_session.start_at >= v_membership.termination_date then raise exception 'Cannot book beyond termination date'; end if;
+  if not clm_session_allowed_for_membership(v_membership.id, v_session.start_at) then
+    raise exception 'Membership not active for this session';
+  end if;
   if exists (select 1 from membership_pause_weeks mpw where mpw.membership_id = v_membership.id and clm_current_week_start(mpw.week_start) = v_session_week) then raise exception 'Cannot book in paused week'; end if;
   if v_session.start_at > v_horizon then raise exception 'Session beyond booking horizon'; end if;
   if v_session.start_at <= p_now then raise exception 'Session has already started/completed'; end if;
@@ -445,7 +762,9 @@ begin
       raise exception 'Location mismatch';
     end if;
   end if;
-  if not exists (select 1 from membership_session_allowances msa where msa.membership_id = v_membership.id and msa.token_type_id = v_session.token_type_id) then raise exception 'Session not covered by membership allowance'; end if;
+  if clm_effective_weekly_allowance(v_membership.id, v_session.token_type_id, v_session.start_at) <= 0 then
+    raise exception 'Session not covered by membership allowance';
+  end if;
 
   select count(*) into v_duplicate_count
   from bookings b join sessions s on s.id = b.session_id
@@ -456,8 +775,14 @@ begin
   if v_booked_count >= v_session.capacity then raise exception 'Session full'; end if;
 
   perform clm_ensure_weekly_tokens_for_membership_week(v_membership.id, v_session_week, p_now);
-  v_token_id := clm_pick_token_id(p_member_id, v_session.token_type_id, p_now, v_session_week);
-  if v_token_id is null then raise exception 'No valid token available'; end if;
+  v_token_id := clm_pick_token_for_booking(
+    p_member_id,
+    v_membership.id,
+    v_session.token_type_id,
+    v_session_week,
+    p_now,
+    v_booking.id
+  );
 
   update tokens set quantity = quantity - 1 where id = v_token_id and quantity > 0;
   if not found then raise exception 'Token deduction failed'; end if;
@@ -529,7 +854,13 @@ begin
     raise exception 'Cannot join waitlist in paused week';
   end if;
   perform clm_ensure_weekly_tokens_for_membership_week(p_membership_id, v_session_week, p_now);
-  v_has_token := clm_pick_token_id(p_member_id, v_session.token_type_id, p_now, v_session_week) is not null;
+  v_has_token := clm_has_token_for_booking(
+    p_member_id,
+    p_membership_id,
+    v_session.token_type_id,
+    v_session_week,
+    p_now
+  );
   if not v_has_token then raise exception 'No valid token available'; end if;
 
   insert into waiting_list_entries(session_id, member_id, joined_at)
