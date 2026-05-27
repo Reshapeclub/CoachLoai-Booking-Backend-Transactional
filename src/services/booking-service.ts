@@ -5,8 +5,10 @@ import {
   SESSION_USAGE_PAST_WEEKS,
   SESSION_USAGE_UPCOMING_WEEKS,
   sessionUsageWeekRange,
+  parseUkDateYmd,
   ukBookingNowIso,
   ukDayBoundsUtcIso,
+  utcWeekStartMs,
 } from "../lib/uk-booking-time.js";
 import {
   resolveMembershipBrowseContext,
@@ -129,7 +131,75 @@ export class BookingService {
     return resolveMembershipIdForBookingWindow(memberId, windowStartIso, windowEnd);
   }
 
-  /** Same window rules as `clm_create_booking` (session week + 28-day horizon). */
+  /** Monday 00:00 UTC week starts for paused weeks (matches `clm_current_week_start`). */
+  private async loadPausedWeekStartMsSet(membershipId: string): Promise<Set<number>> {
+    const { data, error } = await supabaseAdmin
+      .from("membership_pause_weeks")
+      .select("week_start")
+      .eq("membership_id", membershipId);
+    if (error) throw new HttpError(500, "Failed to load membership pause weeks", error);
+    const paused = new Set<number>();
+    for (const row of data ?? []) {
+      const weekStart = String((row as { week_start?: string }).week_start ?? "");
+      if (!weekStart) continue;
+      try {
+        paused.add(utcWeekStartMs(weekStart));
+      } catch {
+        // ignore malformed rows
+      }
+    }
+    return paused;
+  }
+
+  /**
+   * UTC Monday week starts touched by the browse window.
+   * Uses UK calendar days when from/to are YYYY-MM-DD (avoids BST midnight spanning two UTC weeks).
+   */
+  private browseWindowWeekStartMsSet(
+    effectiveFrom: string,
+    effectiveTo: string | undefined,
+    fromInput?: string,
+    toInput?: string,
+  ): Set<number> {
+    const isYmd = (v: string) => /^\d{4}-\d{2}-\d{2}$/.test(v);
+    const weeks = new Set<number>();
+
+    if (fromInput && toInput && isYmd(fromInput) && isYmd(toInput)) {
+      const startDay = parseUkDateYmd(fromInput);
+      const endDay = parseUkDateYmd(toInput);
+      if (startDay && endDay) {
+        let cursor = startDay.startOf("day");
+        const end = endDay.startOf("day");
+        while (cursor <= end) {
+          const mid = cursor.plus({ hours: 12 }).toUTC().toISO();
+          if (mid) weeks.add(utcWeekStartMs(mid));
+          cursor = cursor.plus({ days: 1 });
+        }
+        return weeks;
+      }
+    }
+
+    weeks.add(utcWeekStartMs(effectiveFrom));
+    weeks.add(utcWeekStartMs(effectiveTo ?? effectiveFrom));
+    return weeks;
+  }
+
+  private assertBrowseWindowNotFullyPaused(
+    pausedWeekStartMs: Set<number>,
+    effectiveFrom: string,
+    effectiveTo: string | undefined,
+    fromInput?: string,
+    toInput?: string,
+  ): void {
+    if (pausedWeekStartMs.size === 0) return;
+    const touched = this.browseWindowWeekStartMsSet(effectiveFrom, effectiveTo, fromInput, toInput);
+    if (touched.size === 0) return;
+    const allPaused = [...touched].every((w) => pausedWeekStartMs.has(w));
+    if (allPaused) {
+      throw new HttpError(422, "Membership paused for this week");
+    }
+  }
+
   private async resolveMembershipIdForSession(
     memberId: string,
     sessionStartAt: string,
@@ -526,6 +596,15 @@ export class BookingService {
     const membershipFilterEndMs = browseContext.filterEndMs;
     const allowedTokenTypeIds = browseContext.allowedTokenTypeIds;
 
+    const pausedWeekStartMs = await this.loadPausedWeekStartMsSet(activeMembershipId);
+    this.assertBrowseWindowNotFullyPaused(
+      pausedWeekStartMs,
+      effectiveFrom,
+      effectiveTo,
+      from,
+      to,
+    );
+
     const inPersonLocationIds =
       isOnline === true
         ? null
@@ -600,7 +679,7 @@ export class BookingService {
       ? new Date(String(membershipRow.termination_date)).getTime()
       : null;
 
-    const list = ((sessions ?? []) as SessionRow[]).filter((s) => {
+    const beforePauseFilter = ((sessions ?? []) as SessionRow[]).filter((s) => {
       const startMs = new Date(String(s.start_at ?? "")).getTime();
       if (!Number.isFinite(startMs)) return false;
       if (startMs < membershipFilterStartMs || startMs >= membershipFilterEndMs) {
@@ -611,6 +690,28 @@ export class BookingService {
       }
       return true;
     });
+
+    const list = beforePauseFilter.filter((s) => {
+      if (pausedWeekStartMs.size === 0) return true;
+      try {
+        return !pausedWeekStartMs.has(utcWeekStartMs(String(s.start_at ?? "")));
+      } catch {
+        return false;
+      }
+    });
+
+    if (list.length === 0 && beforePauseFilter.length > 0 && pausedWeekStartMs.size > 0) {
+      const onlyPaused = beforePauseFilter.every((s) => {
+        try {
+          return pausedWeekStartMs.has(utcWeekStartMs(String(s.start_at ?? "")));
+        } catch {
+          return false;
+        }
+      });
+      if (onlyPaused) {
+        throw new HttpError(422, "Membership paused for this week");
+      }
+    }
     if (list.length === 0) return [];
 
     // Enforce allowance gating at token level and audience level.
