@@ -435,7 +435,87 @@ begin
 end;
 $$;
 
--- Weekly token available for booking (session week → current → older → next week), non-locking.
+-- Resolve the membership that should mint weekly tokens for a specific token type/week.
+-- Prefers active in-person memberships that actually provide allowance for that week.
+create or replace function clm_resolve_membership_for_token_week(
+  p_member_id uuid,
+  p_token_type_id uuid,
+  p_week_start timestamptz,
+  p_now timestamptz default now()
+)
+returns uuid
+language plpgsql
+stable
+as $$
+declare
+  v_membership_id uuid;
+begin
+  select mm.id
+  into v_membership_id
+  from member_memberships mm
+  where mm.member_id = p_member_id
+    and mm.status = 'active'
+    and mm.mode = 'inperson'
+    and clm_week_covered_by_membership_or_queued(mm.id, clm_current_week_start(p_week_start))
+    and not exists (
+      select 1
+      from membership_pause_weeks mpw
+      where mpw.membership_id = mm.id
+        and clm_current_week_start(mpw.week_start) = clm_current_week_start(p_week_start)
+    )
+    and clm_effective_weekly_allowance(
+      mm.id,
+      p_token_type_id,
+      clm_current_week_start(p_week_start) + interval '3 days'
+    ) > 0
+  order by mm.created_at desc
+  limit 1;
+
+  return v_membership_id;
+end;
+$$;
+
+-- Mint weekly tokens for booking using the entitlement-bearing membership per target week
+-- (current week, session week, and following session week) so next-week borrow is always mintable.
+create or replace function clm_ensure_weekly_tokens_for_booking_token(
+  p_member_id uuid,
+  p_token_type_id uuid,
+  p_fallback_membership_id uuid,
+  p_session_week timestamptz,
+  p_now timestamptz default now()
+)
+returns void
+language plpgsql
+as $$
+declare
+  v_current_week timestamptz;
+  v_target_week timestamptz;
+  v_membership_id uuid;
+begin
+  v_current_week := clm_current_week_start(p_now);
+
+  foreach v_target_week in array array[
+    v_current_week,
+    clm_current_week_start(p_session_week),
+    clm_current_week_start(p_session_week) + interval '7 days'
+  ] loop
+    v_membership_id := clm_resolve_membership_for_token_week(
+      p_member_id,
+      p_token_type_id,
+      v_target_week,
+      p_now
+    );
+    if v_membership_id is null then
+      v_membership_id := p_fallback_membership_id;
+    end if;
+    if v_membership_id is not null then
+      perform clm_ensure_weekly_tokens_for_membership_week(v_membership_id, v_target_week, p_now);
+    end if;
+  end loop;
+end;
+$$;
+
+-- Weekly token available for booking (session week → older → next session-week), non-locking.
 create or replace function clm_has_weekly_token_advance(
   p_member_id uuid,
   p_token_type_id uuid,
@@ -447,13 +527,11 @@ language plpgsql
 stable
 as $$
 declare
-  v_current_week timestamptz;
   v_next_week timestamptz;
   v_session_week_norm timestamptz;
 begin
-  v_current_week := clm_current_week_start(p_now);
-  v_next_week := v_current_week + interval '7 days';
   v_session_week_norm := clm_current_week_start(p_session_week);
+  v_next_week := v_session_week_norm + interval '7 days';
 
   if exists (
     select 1 from tokens t
@@ -468,19 +546,6 @@ begin
     return true;
   end if;
 
-  if v_session_week_norm <> v_current_week and exists (
-    select 1 from tokens t
-    where t.member_id = p_member_id
-      and t.token_type_id = p_token_type_id
-      and t.quantity > 0
-      and p_now < t.expiry_at
-      and t.source = 'weekly'
-      and t.week_start is not null
-      and clm_current_week_start(t.week_start) = v_current_week
-  ) then
-    return true;
-  end if;
-
   if exists (
     select 1 from tokens t
     where t.member_id = p_member_id
@@ -489,7 +554,7 @@ begin
       and p_now < t.expiry_at
       and t.source = 'weekly'
       and t.week_start is not null
-      and clm_current_week_start(t.week_start) < v_current_week
+      and clm_current_week_start(t.week_start) < v_session_week_norm
   ) then
     return true;
   end if;
@@ -511,7 +576,7 @@ begin
 end;
 $$;
 
--- Pick weekly token: session week → current → older → next week (max 1 week ahead of today).
+-- Pick weekly token: session week → older → next session-week.
 create or replace function clm_pick_weekly_token_advance(
   p_member_id uuid,
   p_token_type_id uuid,
@@ -522,14 +587,12 @@ returns uuid
 language plpgsql
 as $$
 declare
-  v_current_week timestamptz;
   v_next_week timestamptz;
   v_session_week_norm timestamptz;
   v_token_id uuid;
 begin
-  v_current_week := clm_current_week_start(p_now);
-  v_next_week := v_current_week + interval '7 days';
   v_session_week_norm := clm_current_week_start(p_session_week);
+  v_next_week := v_session_week_norm + interval '7 days';
 
   select t.id into v_token_id
   from tokens t
@@ -545,22 +608,6 @@ begin
   for update;
   if v_token_id is not null then return v_token_id; end if;
 
-  if v_session_week_norm <> v_current_week then
-    select t.id into v_token_id
-    from tokens t
-    where t.member_id = p_member_id
-      and t.token_type_id = p_token_type_id
-      and t.quantity > 0
-      and p_now < t.expiry_at
-      and t.source = 'weekly'
-      and t.week_start is not null
-      and clm_current_week_start(t.week_start) = v_current_week
-    order by t.created_at asc
-    limit 1
-    for update;
-    if v_token_id is not null then return v_token_id; end if;
-  end if;
-
   select t.id into v_token_id
   from tokens t
   where t.member_id = p_member_id
@@ -569,7 +616,7 @@ begin
     and p_now < t.expiry_at
     and t.source = 'weekly'
     and t.week_start is not null
-    and clm_current_week_start(t.week_start) < v_current_week
+    and clm_current_week_start(t.week_start) < v_session_week_norm
   order by coalesce(t.week_start, t.created_at) asc, t.created_at asc
   limit 1
   for update;
@@ -594,7 +641,8 @@ begin
 end;
 $$;
 
--- Past-week weekly tokens (rollover): usable beyond the per-week booking allocation.
+-- Overflow weekly tokens usable beyond the session-week allocation:
+-- older than session week, or the following week relative to `p_session_week`.
 create or replace function clm_has_older_weekly_token(
   p_member_id uuid,
   p_token_type_id uuid,
@@ -607,8 +655,10 @@ stable
 as $$
 declare
   v_session_week_norm timestamptz;
+  v_next_week timestamptz;
 begin
   v_session_week_norm := clm_current_week_start(p_session_week);
+  v_next_week := v_session_week_norm + interval '7 days';
   return exists (
     select 1
     from tokens t
@@ -618,7 +668,13 @@ begin
       and p_now < t.expiry_at
       and t.source = 'weekly'
       and t.week_start is not null
-      and clm_current_week_start(t.week_start) < v_session_week_norm
+      and (
+        clm_current_week_start(t.week_start) < v_session_week_norm
+        or (
+          clm_current_week_start(t.week_start) = v_next_week
+          and clm_current_week_start(t.week_start) <> v_session_week_norm
+        )
+      )
   );
 end;
 $$;
@@ -634,9 +690,11 @@ language plpgsql
 as $$
 declare
   v_session_week_norm timestamptz;
+  v_next_week timestamptz;
   v_token_id uuid;
 begin
   v_session_week_norm := clm_current_week_start(p_session_week);
+  v_next_week := v_session_week_norm + interval '7 days';
   select t.id into v_token_id
   from tokens t
   where t.member_id = p_member_id
@@ -645,7 +703,13 @@ begin
     and p_now < t.expiry_at
     and t.source = 'weekly'
     and t.week_start is not null
-    and clm_current_week_start(t.week_start) < v_session_week_norm
+    and (
+      clm_current_week_start(t.week_start) < v_session_week_norm
+      or (
+        clm_current_week_start(t.week_start) = v_next_week
+        and clm_current_week_start(t.week_start) <> v_session_week_norm
+      )
+    )
   order by coalesce(t.week_start, t.created_at) asc, t.created_at asc
   limit 1
   for update;
@@ -654,7 +718,7 @@ end;
 $$;
 
 -- Pick token for booking: weekly allowance capped per session week; weekly spend uses
--- session week → current → older → next week (1 week ahead); rollover past-week tokens
+-- session week → older → next session-week; overflow past-week/following-week tokens
 -- after allocation is full; extras use purchase/admin/gift.
 create or replace function clm_pick_token_for_booking(
   p_member_id uuid,
@@ -697,7 +761,8 @@ begin
     end if;
   end if;
 
-  -- Rollover: past-week weekly tokens after this session week's allocation is used up.
+  -- Overflow weekly tokens after this session week's allocation is used up:
+  -- past-week rollover first, plus next-week borrow (max 1 week ahead from now).
   if v_week_bookings >= v_weekly_allowance then
     v_token_id := clm_pick_older_weekly_token(p_member_id, p_token_type_id, p_session_week, p_now);
     if v_token_id is not null then
@@ -813,6 +878,33 @@ begin
   v_session_week := clm_current_week_start(v_session.start_at);
   v_horizon := p_now + interval '28 days';
 
+  -- If caller passed a membership that cannot fund this token type/session, try another
+  -- membership for the same member that is valid for this session (including queued plans).
+  if (
+    not clm_session_allowed_for_membership(v_membership.id, v_session.start_at)
+    or clm_effective_weekly_allowance(v_membership.id, v_session.token_type_id, v_session.start_at) <= 0
+  ) then
+    select mm.*
+    into v_membership
+    from member_memberships mm
+    where mm.member_id = p_member_id
+      and mm.status = 'active'
+      and (
+        clm_session_within_membership_window(mm, v_session.start_at)
+        or exists (
+          select 1
+          from membership_training_plans mtp
+          where mtp.membership_id = mm.id
+            and mtp.status = 'queued'
+            and mtp.start_date <= (v_session.start_at at time zone 'utc')::date
+            and (mtp.end_date is null or mtp.end_date >= (v_session.start_at at time zone 'utc')::date)
+        )
+      )
+      and clm_effective_weekly_allowance(mm.id, v_session.token_type_id, v_session.start_at) > 0
+    order by mm.created_at desc
+    limit 1;
+  end if;
+
   if not clm_session_allowed_for_membership(v_membership.id, v_session.start_at) then
     raise exception 'Membership not active for this session';
   end if;
@@ -851,7 +943,13 @@ begin
   select count(*) into v_booked_count from bookings where session_id=v_session.id and status='booked';
   if v_booked_count >= v_session.capacity then raise exception 'Session full'; end if;
 
-  perform clm_ensure_weekly_tokens_for_booking(v_membership.id, v_session_week, p_now);
+  perform clm_ensure_weekly_tokens_for_booking_token(
+    p_member_id,
+    v_session.token_type_id,
+    v_membership.id,
+    v_session_week,
+    p_now
+  );
   v_token_id := clm_pick_token_for_booking(
     p_member_id,
     v_membership.id,
@@ -1002,6 +1100,32 @@ begin
   v_session_week := clm_current_week_start(v_session.start_at);
   v_horizon := p_now + interval '28 days';
 
+  -- Resolve to a membership that can fund this token type/session when possible.
+  if (
+    not clm_session_allowed_for_membership(v_membership.id, v_session.start_at)
+    or clm_effective_weekly_allowance(v_membership.id, v_session.token_type_id, v_session.start_at) <= 0
+  ) then
+    select mm.*
+    into v_membership
+    from member_memberships mm
+    where mm.member_id = p_member_id
+      and mm.status = 'active'
+      and (
+        clm_session_within_membership_window(mm, v_session.start_at)
+        or exists (
+          select 1
+          from membership_training_plans mtp
+          where mtp.membership_id = mm.id
+            and mtp.status = 'queued'
+            and mtp.start_date <= (v_session.start_at at time zone 'utc')::date
+            and (mtp.end_date is null or mtp.end_date >= (v_session.start_at at time zone 'utc')::date)
+        )
+      )
+      and clm_effective_weekly_allowance(mm.id, v_session.token_type_id, v_session.start_at) > 0
+    order by mm.created_at desc
+    limit 1;
+  end if;
+
   if not clm_session_allowed_for_membership(v_membership.id, v_session.start_at) then
     raise exception 'Membership not active for this session';
   end if;
@@ -1040,7 +1164,13 @@ begin
   select count(*) into v_booked_count from bookings where session_id = v_session.id and status = 'booked';
   if v_booked_count >= v_session.capacity then raise exception 'Session full'; end if;
 
-  perform clm_ensure_weekly_tokens_for_booking(v_membership.id, v_session_week, p_now);
+  perform clm_ensure_weekly_tokens_for_booking_token(
+    p_member_id,
+    v_session.token_type_id,
+    v_membership.id,
+    v_session_week,
+    p_now
+  );
   v_token_id := clm_pick_token_for_booking(
     p_member_id,
     v_membership.id,
@@ -1116,10 +1246,43 @@ begin
   if (select count(*) from bookings where session_id=p_session_id and status='booked') < v_session.capacity then raise exception 'Session has available space'; end if;
 
   v_session_week := clm_current_week_start(v_session.start_at);
+
+  -- Resolve to a membership that can fund this token type/session when possible.
+  if (
+    not clm_session_allowed_for_membership(v_membership.id, v_session.start_at)
+    or clm_effective_weekly_allowance(v_membership.id, v_session.token_type_id, v_session.start_at) <= 0
+  ) then
+    select mm.*
+    into v_membership
+    from member_memberships mm
+    where mm.member_id = p_member_id
+      and mm.status = 'active'
+      and (
+        clm_session_within_membership_window(mm, v_session.start_at)
+        or exists (
+          select 1
+          from membership_training_plans mtp
+          where mtp.membership_id = mm.id
+            and mtp.status = 'queued'
+            and mtp.start_date <= (v_session.start_at at time zone 'utc')::date
+            and (mtp.end_date is null or mtp.end_date >= (v_session.start_at at time zone 'utc')::date)
+        )
+      )
+      and clm_effective_weekly_allowance(mm.id, v_session.token_type_id, v_session.start_at) > 0
+    order by mm.created_at desc
+    limit 1;
+  end if;
+
   if exists (select 1 from membership_pause_weeks mpw where mpw.membership_id = v_membership.id and clm_current_week_start(mpw.week_start) = v_session_week) then
     raise exception 'Cannot join waitlist in paused week';
   end if;
-  perform clm_ensure_weekly_tokens_for_booking(p_membership_id, v_session_week, p_now);
+  perform clm_ensure_weekly_tokens_for_booking_token(
+    p_member_id,
+    v_session.token_type_id,
+    v_membership.id,
+    v_session_week,
+    p_now
+  );
   v_has_token := clm_has_token_for_booking(
     p_member_id,
     p_membership_id,
