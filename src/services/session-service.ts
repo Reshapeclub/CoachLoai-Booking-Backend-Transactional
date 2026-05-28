@@ -455,7 +455,7 @@ export class SessionService {
   async setCoach(
     sessionId: string,
     coachId: string,
-    opts?: { allowOvertime?: boolean }
+    opts?: { allowOvertime?: boolean; ignoreSessionIds?: string[] }
   ) {
     const { data: session, error: fetchErr } = await supabaseAdmin
       .from("sessions")
@@ -473,6 +473,7 @@ export class SessionService {
       endAt: session.end_at,
       excludeSessionId: sessionId,
       allowOvertime: opts?.allowOvertime,
+      ignoreSessionIds: opts?.ignoreSessionIds,
     });
     const { data, error } = await supabaseAdmin
       .from("sessions")

@@ -73,6 +73,7 @@ export const setCapacitySchema = z.object({ capacity: z.number().int().min(1) })
 export const setCoachSchema = z.object({
   newCoachId: z.string().min(1),
   allowOvertime: z.boolean().optional(),
+  ignoreSessionIds: z.array(z.string().uuid()).optional(),
 });
 export const setSessionTypeSchema = z.object({ newSessionTypeId: z.string().min(1) });
 export const refundModeSchema = z.object({ refund: z.enum(["refund", "charge"]) });

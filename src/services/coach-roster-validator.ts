@@ -13,6 +13,7 @@ export async function validateCoachForSession(opts: {
   endAt: string;
   excludeSessionId?: string;
   allowOvertime?: boolean;
+  ignoreSessionIds?: string[];
 }): Promise<void> {
   const start = new Date(opts.startAt);
   const end = new Date(opts.endAt);
@@ -28,6 +29,7 @@ export async function validateCoachForSession(opts: {
   const coachUserId = (coach as { user_id: string | number }).user_id;
   const weeklyLimit = (coach as { weekly_hour_limit_mins: number }).weekly_hour_limit_mins;
   const travelBufferMins = (coach as { travel_buffer_minutes: number }).travel_buffer_minutes;
+  const ignoredSessionIdSet = new Set((opts.ignoreSessionIds ?? []).map((x) => String(x)));
 
   // 2. Within availability windows (day_of_week 1=Mon..7=Sun, start_mins/end_mins).
   // Availability is configured in UK local business time (Europe/London), not UTC.
@@ -137,7 +139,8 @@ export async function validateCoachForSession(opts: {
     .gt("end_at", opts.startAt);
   if (opts.excludeSessionId) overlapQuery = overlapQuery.neq("id", opts.excludeSessionId);
   const { data: overlapping } = await overlapQuery;
-  if ((overlapping ?? []).length > 0)
+  const realOverlaps = (overlapping ?? []).filter((row: { id?: string }) => !ignoredSessionIdSet.has(String(row.id ?? "")));
+  if (realOverlaps.length > 0)
     throw new HttpError(400, "Session overlaps with another session for this coach");
 
   // 7. Travel buffer between different locations
@@ -148,7 +151,9 @@ export async function validateCoachForSession(opts: {
     .eq("is_cancelled", false)
     .is("deleted_at", null);
   if (opts.excludeSessionId) {
-    const filtered = (otherSessions ?? []).filter((s: { id: string }) => s.id !== opts.excludeSessionId);
+    const filtered = (otherSessions ?? []).filter(
+      (s: { id: string }) => s.id !== opts.excludeSessionId && !ignoredSessionIdSet.has(String(s.id)),
+    );
     for (const s of filtered) {
       const bufCheck = checkTravelBuffer(
         opts.startAt,
@@ -162,7 +167,7 @@ export async function validateCoachForSession(opts: {
       if (bufCheck) throw new HttpError(400, bufCheck);
     }
   } else {
-    for (const s of otherSessions ?? []) {
+    for (const s of (otherSessions ?? []).filter((row: { id: string }) => !ignoredSessionIdSet.has(String(row.id)))) {
       const bufCheck = checkTravelBuffer(
         opts.startAt,
         opts.endAt,
