@@ -1211,7 +1211,7 @@ router.post('/staff/:staffId/leaves', async (req, res, next) => {
     if (!coachId) throw new HttpError(404, "No coach profile found for this staff member. Only coach-role staff can have leave logged.");
     const { data, error } = await supabaseAdmin
       .from("coach_holidays")
-      .insert({ coach_id: coachId, start_at, end_at, type, notes: notes ?? null })
+      .insert({ coach_id: coachId, start_at, end_at, type, notes: notes ?? null, status: "pending" })
       .select("*")
       .single();
     if (error) throw new HttpError(500, "Failed to create leave", error);
@@ -1227,6 +1227,104 @@ router.delete('/staff/:staffId/leaves/:leaveId', async (req, res, next) => {
       .eq("id", req.params.leaveId);
     if (error) throw new HttpError(500, "Failed to delete leave", error);
     res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+// ── Leave approval workflow ───────────────────────────────────────────────────
+
+/** GET /admin/leaves — all leaves across all staff, optionally filtered by status */
+router.get('/leaves', async (req, res, next) => {
+  try {
+    const { status } = req.query as { status?: string };
+
+    // Step 1: fetch leaves (simple query, no nested join)
+    let leavesQuery = supabaseAdmin
+      .from("coach_holidays")
+      .select("id, coach_id, start_at, end_at, type, notes, status, approved_by_admin_id, actioned_at, rejection_note")
+      .order("start_at", { ascending: false });
+    if (status) leavesQuery = leavesQuery.eq("status", status);
+    const { data: leaves, error: leavesError } = await leavesQuery;
+    if (leavesError) throw new HttpError(500, "Failed to fetch leaves", leavesError);
+    if (!leaves || leaves.length === 0) return res.json({ ok: true, data: [] });
+
+    // Step 2: fetch staff info for the coach_ids found
+    const coachIds = [...new Set((leaves as { coach_id: string }[]).map(l => l.coach_id))];
+    const { data: coaches, error: coachesError } = await supabaseAdmin
+      .from("coaches")
+      .select("id, user_id")
+      .in("id", coachIds);
+    if (coachesError) throw new HttpError(500, "Failed to fetch coach info", coachesError);
+
+    const adminIds = (coaches ?? [])
+      .map((c: { user_id: number | null }) => c.user_id)
+      .filter((id): id is number => id !== null);
+
+    const { data: admins, error: adminsError } = adminIds.length > 0
+      ? await supabaseAdmin.from("admins").select("id, name, role").in("id", adminIds)
+      : { data: [], error: null };
+    if (adminsError) throw new HttpError(500, "Failed to fetch admin info", adminsError);
+
+    // Build lookup maps
+    const coachByCoachId = new Map(
+      (coaches ?? []).map((c: { id: string; user_id: number | null }) => [c.id, c])
+    );
+    const adminById = new Map(
+      (admins ?? []).map((a: { id: number; name: string; role: string }) => [a.id, a])
+    );
+
+    const rows = (leaves as Record<string, unknown>[]).map(row => {
+      const coach = coachByCoachId.get(row.coach_id as string);
+      const admin = coach?.user_id != null ? adminById.get(coach.user_id as number) : null;
+      return {
+        id: row.id,
+        coach_id: row.coach_id,
+        start_at: row.start_at,
+        end_at: row.end_at,
+        type: row.type,
+        notes: row.notes,
+        status: row.status,
+        approved_by_admin_id: row.approved_by_admin_id,
+        actioned_at: row.actioned_at,
+        rejection_note: row.rejection_note,
+        staff_admin_id: admin?.id ?? null,
+        staff_name: admin?.name ?? null,
+        staff_role: admin?.role ?? null,
+      };
+    });
+    res.json({ ok: true, data: rows });
+  } catch (e) { next(e); }
+});
+
+/** PATCH /admin/leaves/:leaveId — approve or reject a leave request */
+router.patch('/leaves/:leaveId', async (req, res, next) => {
+  try {
+    const { status, rejection_note } = req.body as {
+      status?: string;
+      rejection_note?: string;
+    };
+    if (!status || !["approved", "rejected"].includes(status)) {
+      throw new HttpError(400, "status must be 'approved' or 'rejected'");
+    }
+    const actingAdminId = parseInt(req.user!.id, 10);
+    if (isNaN(actingAdminId)) throw new HttpError(401, "Invalid admin identity");
+
+    const update: Record<string, unknown> = {
+      status,
+      approved_by_admin_id: actingAdminId,
+      actioned_at: new Date().toISOString(),
+    };
+    if (status === "rejected" && rejection_note) {
+      update.rejection_note = rejection_note;
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from("coach_holidays")
+      .update(update)
+      .eq("id", req.params.leaveId)
+      .select("*")
+      .single();
+    if (error) throw new HttpError(500, "Failed to update leave", error);
+    res.json({ ok: true, data });
   } catch (e) { next(e); }
 });
 
