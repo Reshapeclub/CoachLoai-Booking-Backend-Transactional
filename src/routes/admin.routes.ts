@@ -506,11 +506,15 @@ router.get('/coaches/rota-snapshot', async (req, res, next) => {
     const q = validate(
       z.object({
         weekStartDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
-        includeHolidays: z.coerce.boolean().optional(),
+        includeHolidays: z
+          .union([z.boolean(), z.literal("true"), z.literal("false"), z.literal("1"), z.literal("0")])
+          .optional(),
       }),
       req.query,
     );
-    const data = await coachService.getRotaSnapshot(q.weekStartDate, q.includeHolidays ?? false);
+    const includeHolidays =
+      q.includeHolidays === true || q.includeHolidays === "true" || q.includeHolidays === "1";
+    const data = await coachService.getRotaSnapshot(q.weekStartDate, includeHolidays);
     res.json({ ok: true, data });
   } catch (e) { next(e); }
 });
