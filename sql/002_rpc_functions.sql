@@ -1342,11 +1342,21 @@ declare
   v_booking record;
   v_count int := 0;
   v_session_updated int;
+  v_session sessions%rowtype;
+  v_apply_refund boolean;
+  v_hours_until numeric;
 begin
   if p_refund not in ('refund','charge') then raise exception 'Invalid refund mode'; end if;
+  select * into v_session from sessions where id = p_session_id;
+  if not found then raise exception 'Session not found'; end if;
+
+  v_hours_until := extract(epoch from (v_session.start_at - p_now)) / 3600.0;
+
   for v_booking in select * from bookings where session_id = p_session_id and status = 'booked' for update loop
     update bookings set status = 'cancelled', cancelled_at = p_now where id = v_booking.id;
-    if p_refund = 'refund' then
+    -- refund: always return tokens; charge: same 24h window as member cancel (incl. future-week tokens).
+    v_apply_refund := (p_refund = 'refund') or (v_hours_until >= 24);
+    if v_apply_refund then
       update tokens t set quantity = t.quantity + d.quantity
       from booking_token_deductions d where d.booking_id = v_booking.id and d.token_id = t.id;
     end if;
@@ -1362,9 +1372,9 @@ begin
   end if;
 
   insert into audit_logs(actor_type, actor_id, action, meta)
-  values ('admin', p_admin_id, 'session.cancel', jsonb_build_object('sessionId', p_session_id, 'refundMode', p_refund, 'removedBookings', v_count));
+  values ('admin', p_admin_id, 'session.cancel', jsonb_build_object('sessionId', p_session_id, 'refundMode', p_refund, 'hoursUntilStart', v_hours_until, 'removedBookings', v_count));
 
-  return jsonb_build_object('ok', true, 'sessionId', p_session_id, 'refundMode', p_refund, 'removedBookings', v_count);
+  return jsonb_build_object('ok', true, 'sessionId', p_session_id, 'refundMode', p_refund, 'hoursUntilStart', v_hours_until, 'removedBookings', v_count);
 end;
 $$;
 

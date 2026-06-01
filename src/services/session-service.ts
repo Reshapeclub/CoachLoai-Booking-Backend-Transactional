@@ -225,10 +225,10 @@ export class SessionService {
       const n = Math.floor(Number(input.displayOrder));
       if (Number.isFinite(n) && n >= 0) updates.display_order = n;
     }
-    // if (input.defaultCapacity !== undefined) {
-    //   const n = Math.floor(Number(input.defaultCapacity));
-    //   if (Number.isFinite(n) && n >= 1) updates.default_capacity = n;
-    // }
+    if (input.defaultCapacity !== undefined) {
+      const n = Math.floor(Number(input.defaultCapacity));
+      if (Number.isFinite(n) && n >= 1) updates.default_capacity = n;
+    }
     if (input.maxPerDay !== undefined) {
       const n = Math.floor(Number(input.maxPerDay));
       if (Number.isFinite(n) && n >= 1) updates.max_per_day = n;

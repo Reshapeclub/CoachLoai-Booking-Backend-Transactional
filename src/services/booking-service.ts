@@ -85,7 +85,7 @@ export class BookingService {
     return null;
   }
 
-  /** Schedule stores Elite Men / Elite Women on `sessions.training_level` (not in `member_training_levels`). */
+  /** Elite Men/Women and Octave Men/Women on `sessions.training_level` (not in `member_training_levels`). */
   private resolveEliteSexSessionKind(session: {
     training_level?: string | null;
     session_types?: { name?: string | null; category?: string | null } | Array<{ name?: string | null; category?: string | null }> | null;
@@ -100,13 +100,13 @@ export class BookingService {
     const categoryCode = this.normalizeAccessCode(sessionType?.category);
     const levelCode = this.normalizeAccessCode(session.training_level);
     if (categoryCode === "octave") {
-      if (levelCode === "women") return "women";
-      if (levelCode === "men") return "men";
+      if (levelCode === "octavewomen" || levelCode === "women") return "women";
+      if (levelCode === "octavemen" || levelCode === "men") return "men";
     }
 
     for (const hay of haystacks) {
-      if (hay.includes("octave") && hay.includes("women")) return "women";
-      if (hay.includes("octave") && hay.includes("men")) return "men";
+      if (hay === "octavewomen" || (hay.includes("octave") && hay.includes("women"))) return "women";
+      if (hay === "octavemen" || (hay.includes("octave") && hay.includes("men"))) return "men";
       if (hay === "elitewomen" || (hay.includes("elite") && hay.includes("women"))) return "women";
       if (hay === "elitemen" || (hay.includes("elite") && hay.includes("men"))) return "men";
     }
@@ -429,7 +429,13 @@ export class BookingService {
 
       if (sexMatchedElite) {
         const subLevelCodes = [...sessionLevelCodes].filter(
-          (code) => code !== "elitemen" && code !== "elitewomen" && code !== "men" && code !== "women",
+          (code) =>
+            code !== "elitemen" &&
+            code !== "elitewomen" &&
+            code !== "octavemen" &&
+            code !== "octavewomen" &&
+            code !== "men" &&
+            code !== "women",
         );
         if (subLevelCodes.length > 0) {
           const levelAllowed = subLevelCodes.some((code) => access.trainingLevels.has(code));
