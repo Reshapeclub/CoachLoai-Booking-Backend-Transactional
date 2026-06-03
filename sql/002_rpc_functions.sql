@@ -499,6 +499,9 @@ begin
     clm_current_week_start(p_session_week),
     clm_current_week_start(p_session_week) + interval '7 days'
   ] loop
+    if v_target_week > (v_current_week + interval '21 days') then
+      continue;
+    end if;
     v_membership_id := clm_resolve_membership_for_token_week(
       p_member_id,
       p_token_type_id,
@@ -529,9 +532,11 @@ as $$
 declare
   v_next_week timestamptz;
   v_session_week_norm timestamptz;
+  v_max_borrow_week timestamptz;
 begin
   v_session_week_norm := clm_current_week_start(p_session_week);
   v_next_week := v_session_week_norm + interval '7 days';
+  v_max_borrow_week := clm_current_week_start(p_now) + interval '21 days';
 
   if exists (
     select 1 from tokens t
@@ -559,7 +564,7 @@ begin
     return true;
   end if;
 
-  if v_session_week_norm <> v_next_week and exists (
+  if v_session_week_norm <> v_next_week and v_next_week <= v_max_borrow_week and exists (
     select 1 from tokens t
     where t.member_id = p_member_id
       and t.token_type_id = p_token_type_id
@@ -589,10 +594,12 @@ as $$
 declare
   v_next_week timestamptz;
   v_session_week_norm timestamptz;
+  v_max_borrow_week timestamptz;
   v_token_id uuid;
 begin
   v_session_week_norm := clm_current_week_start(p_session_week);
   v_next_week := v_session_week_norm + interval '7 days';
+  v_max_borrow_week := clm_current_week_start(p_now) + interval '21 days';
 
   select t.id into v_token_id
   from tokens t
@@ -622,7 +629,7 @@ begin
   for update;
   if v_token_id is not null then return v_token_id; end if;
 
-  if v_session_week_norm <> v_next_week then
+  if v_session_week_norm <> v_next_week and v_next_week <= v_max_borrow_week then
     select t.id into v_token_id
     from tokens t
     where t.member_id = p_member_id
@@ -656,9 +663,11 @@ as $$
 declare
   v_session_week_norm timestamptz;
   v_next_week timestamptz;
+  v_max_borrow_week timestamptz;
 begin
   v_session_week_norm := clm_current_week_start(p_session_week);
   v_next_week := v_session_week_norm + interval '7 days';
+  v_max_borrow_week := clm_current_week_start(p_now) + interval '21 days';
   return exists (
     select 1
     from tokens t
@@ -672,6 +681,7 @@ begin
         clm_current_week_start(t.week_start) < v_session_week_norm
         or (
           clm_current_week_start(t.week_start) = v_next_week
+          and v_next_week <= v_max_borrow_week
           and clm_current_week_start(t.week_start) <> v_session_week_norm
         )
       )
@@ -691,10 +701,12 @@ as $$
 declare
   v_session_week_norm timestamptz;
   v_next_week timestamptz;
+  v_max_borrow_week timestamptz;
   v_token_id uuid;
 begin
   v_session_week_norm := clm_current_week_start(p_session_week);
   v_next_week := v_session_week_norm + interval '7 days';
+  v_max_borrow_week := clm_current_week_start(p_now) + interval '21 days';
   select t.id into v_token_id
   from tokens t
   where t.member_id = p_member_id
@@ -707,6 +719,7 @@ begin
       clm_current_week_start(t.week_start) < v_session_week_norm
       or (
         clm_current_week_start(t.week_start) = v_next_week
+        and v_next_week <= v_max_borrow_week
         and clm_current_week_start(t.week_start) <> v_session_week_norm
       )
     )
@@ -734,6 +747,8 @@ as $$
 declare
   v_weekly_allowance int;
   v_week_bookings int;
+  v_window_bookings int;
+  v_window_cap int;
   v_token_id uuid;
 begin
   v_weekly_allowance := clm_effective_weekly_allowance(
@@ -768,6 +783,23 @@ begin
     if v_token_id is not null then
       return v_token_id;
     end if;
+  end if;
+
+  -- Apply the same 4-week cap to purchase/admin/gift fallback.
+  v_window_cap := greatest(0, v_weekly_allowance) * 4;
+  select count(*)::int
+  into v_window_bookings
+  from bookings b
+  join sessions s on s.id = b.session_id
+  where b.member_id = p_member_id
+    and b.status = 'booked'
+    and s.token_type_id = p_token_type_id
+    and s.start_at >= clm_current_week_start(p_now)
+    and s.start_at < (clm_current_week_start(p_now) + interval '28 days')
+    and (p_exclude_booking_id is null or b.id <> p_exclude_booking_id);
+
+  if v_window_bookings >= v_window_cap then
+    raise exception '4-week booking limit reached for this session type';
   end if;
 
   select t.id into v_token_id
@@ -809,6 +841,8 @@ as $$
 declare
   v_weekly_allowance int;
   v_week_bookings int;
+  v_window_bookings int;
+  v_window_cap int;
 begin
   v_weekly_allowance := clm_effective_weekly_allowance(
     p_membership_id,
@@ -831,6 +865,22 @@ begin
 
   if v_week_bookings >= v_weekly_allowance and clm_has_older_weekly_token(p_member_id, p_token_type_id, p_session_week, p_now) then
     return true;
+  end if;
+
+  -- Apply the same 4-week cap to purchase/admin/gift fallback for waitlist checks.
+  v_window_cap := greatest(0, v_weekly_allowance) * 4;
+  select count(*)::int
+  into v_window_bookings
+  from bookings b
+  join sessions s on s.id = b.session_id
+  where b.member_id = p_member_id
+    and b.status = 'booked'
+    and s.token_type_id = p_token_type_id
+    and s.start_at >= clm_current_week_start(p_now)
+    and s.start_at < (clm_current_week_start(p_now) + interval '28 days')
+    and (p_exclude_booking_id is null or b.id <> p_exclude_booking_id);
+  if v_window_bookings >= v_window_cap then
+    return false;
   end if;
 
   return exists (
